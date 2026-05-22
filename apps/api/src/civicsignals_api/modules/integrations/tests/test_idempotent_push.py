@@ -4,7 +4,7 @@ Covers:
 - Stable, deterministic idempotency key derivation.
 - First push creates + records external_id.
 - Second push of the same key calls provider.update (PATCH), NOT create (POST).
-- Concurrent same-key pushes: unique-violation fallback to update (no dup).
+- Successful push upserts PushIdempotency so the next push routes as an update.
 - Different records → different keys → separate external objects.
 - Workspace / connection isolation (same source record in two workspaces or
   two connections produces different keys and different objects).
@@ -20,14 +20,15 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy.exc import IntegrityError
 
 from civicsignals_api.config import Settings
 from civicsignals_api.modules.integrations import providers, services
 from civicsignals_api.modules.integrations.models import (
     Connection,
     ConnectionStatus,
+    FieldMapping,
     IntegrationProviderKind,
+    PushIdempotency,
     PushLog,
     PushStatus,
 )
@@ -101,22 +102,27 @@ def _register_provider(
 
 
 # ---------------------------------------------------------------------------
-# Fake async session (tracks push_log rows added + controls when to raise)
+# Fake async session (tracks push_log + push_idempotency rows)
 # ---------------------------------------------------------------------------
+
+_PUSH_IDEMPOTENCY_TABLE = "integrations_push_idempotency"
 
 
 class _FakeSession:
     """Minimal async-session stub that tracks added models and flushes.
 
-    ``execute`` inspects the SELECT statement's entity to route the query to
-    the right in-memory rows, so both ``get_field_mapping`` (FieldMapping
-    entity) and ``_last_successful_push`` (PushLog entity) work correctly
-    without a real database.
+    ``execute`` inspects:
+    - SQLAlchemy ORM SELECT statements via ``column_descriptions`` to route
+      queries for ``PushIdempotency`` and ``FieldMapping`` to in-memory data.
+    - PostgreSQL INSERT … ON CONFLICT statements (from ``pg_insert``) for
+      ``_upsert_push_idempotency`` — stored in ``_idempotency`` dict.
     """
 
     def __init__(self) -> None:
         self._rows: list[Any] = []
         self._flush_count = 0
+        # Canonical external-id registry: (connection_id, idempotency_key) → row.
+        self._idempotency: dict[tuple[Any, str], PushIdempotency] = {}
 
     def add(self, obj: Any) -> None:
         self._rows.append(obj)
@@ -128,27 +134,43 @@ class _FakeSession:
         pass
 
     async def execute(self, stmt: Any) -> _FakeResult:
-        # Determine which entity the SELECT is targeting so we can route the
-        # query to the correct in-memory rows.  SQLAlchemy's Select stores the
-        # entity in ``columns_plus_names``; we introspect the first column's
-        # entity class.  Fall back to returning None for unknown queries.
+        # --- Handle INSERT statements (pg_insert upsert) ---------------------
+        # These don't have column_descriptions; detect by type name + table.
+        if type(stmt).__name__ == "Insert":
+            try:
+                if getattr(stmt.table, "name", "") == _PUSH_IDEMPOTENCY_TABLE:
+                    params = stmt.compile().params
+                    conn_id = params.get("connection_id")
+                    key = params.get("idempotency_key")
+                    ext_id = params.get("external_id")
+                    if conn_id is not None and key is not None and ext_id is not None:
+                        record = self._idempotency.get((conn_id, key))
+                        if record is None:
+                            record = PushIdempotency(
+                                connection_id=conn_id,
+                                idempotency_key=key,
+                                external_id=ext_id,
+                            )
+                            self._idempotency[(conn_id, key)] = record
+                        else:
+                            record.external_id = ext_id
+            except Exception:
+                pass
+            return _FakeResult(None)
+
+        # --- Handle ORM SELECT statements ------------------------------------
         try:
-            # SA Select: froms contains the table; for ORM selects we can get
-            # the entity class from the statement's column_descriptions.
             descs = stmt.column_descriptions
             if descs:
                 entity_cls = descs[0].get("entity")
-                if entity_cls is PushLog:
-                    # Return the most recently seeded SUCCESS PushLog.
-                    successful = [
-                        r
-                        for r in self._rows
-                        if isinstance(r, PushLog)
-                        and r.status == PushStatus.SUCCESS
-                        and r.external_id is not None
-                    ]
-                    return _FakeResult(successful[-1] if successful else None)
-                # For FieldMapping and other types: no rows seeded → None.
+                if entity_cls is PushIdempotency:
+                    # Return any seeded PushIdempotency row (tests seed exactly
+                    # the one they want looked up, so returning the last is fine).
+                    rows = list(self._idempotency.values())
+                    return _FakeResult(rows[-1] if rows else None)
+                if entity_cls is FieldMapping:
+                    return _FakeResult(None)
+                # Other types: return None.
                 return _FakeResult(None)
         except AttributeError:
             pass
@@ -310,18 +332,13 @@ def test_second_push_same_key_calls_update_not_create(
     conn = _connection(settings)
     session = _FakeSession()
 
-    # Seed the session with a prior successful push so the second push sees it.
-    prior_log = PushLog(
-        workspace_id=conn.workspace_id,
+    # Seed PushIdempotency so the re-push looks up the prior external_id.
+    prior_idem = PushIdempotency(
         connection_id=conn.id,
-        target="salesforce.Opportunity",
-        request={"Name": "Acme"},
-        status=PushStatus.SUCCESS,
         idempotency_key="stable-key",
         external_id="sf-001",
-        attempt_count=1,
     )
-    session._rows.append(prior_log)
+    session._idempotency[(conn.id, "stable-key")] = prior_idem
 
     async def _run() -> PushLog:
         async with _noop_http() as http:
@@ -390,91 +407,41 @@ def test_push_source_auto_derives_idempotency_key_from_signal_id(
 
 
 # ---------------------------------------------------------------------------
-# Race condition: unique-violation → fallback to update
+# Idempotency upsert: success records canonical external_id in PushIdempotency
 # ---------------------------------------------------------------------------
 
 
-def test_race_condition_unique_violation_falls_back_to_update(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Simulate concurrent same-key push: IntegrityError → retry as update."""
+def test_successful_push_upserts_push_idempotency(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a successful push, PushIdempotency is upserted with the external_id."""
     settings = _settings()
-    create_calls: list[str] = []
-    update_calls: list[str] = []
 
-    class _Race(_MockProvider):
+    class _OK(_MockProvider):
         async def push(self, *, access_token: str, request: PushRequest) -> PushResult:
-            if request.external_id:
-                update_calls.append(request.external_id)
-                return PushResult(external_id=request.external_id, created=False)
-            else:
-                create_calls.append("POST")
-                return PushResult(external_id="sf-race", created=True)
+            return PushResult(external_id="sf-idem", created=True)
 
-    _register_provider(monkeypatch, _Race)
+    _register_provider(monkeypatch, _OK)
     conn = _connection(settings)
-
-    # A session that raises IntegrityError on the first flush of a SUCCESS row,
-    # simulating the unique partial index violation.
-    class _RaceSession(_FakeSession):
-        _first_success_flush = True
-
-        async def flush(self) -> None:
-            self._flush_count += 1
-            # Detect when a SUCCESS PushLog is being flushed for the first time
-            # and raise IntegrityError to simulate the race constraint firing.
-            if self._first_success_flush:
-                success_rows = [
-                    r
-                    for r in self._rows
-                    if isinstance(r, PushLog) and r.status == PushStatus.SUCCESS
-                ]
-                if success_rows:
-                    self._first_success_flush = False
-                    # Seed the session with a "winning" push so the retry-as-
-                    # update path finds an external_id to use.
-                    winner = PushLog(
-                        workspace_id=conn.workspace_id,
-                        connection_id=conn.id,
-                        target="salesforce.Opportunity",
-                        request={},
-                        status=PushStatus.SUCCESS,
-                        idempotency_key="race-key",
-                        external_id="sf-race",
-                        attempt_count=1,
-                    )
-                    self._rows.append(winner)
-                    raise IntegrityError(
-                        statement=None,
-                        params=None,
-                        orig=Exception(
-                            "duplicate key value violates unique constraint "
-                            '"uq_integrations_push_log_idempotency_success"'
-                        ),
-                    )
-
-    session = _RaceSession()
+    session = _FakeSession()
 
     async def _run() -> PushLog:
         async with _noop_http() as http:
             return await services.push_source(
                 session,  # type: ignore[arg-type]
                 connection=conn,
-                source={"Name": "Race RFP"},
+                source={"Name": "Idem Test"},
                 target="Opportunity",
-                signal_id="sig-race",
-                idempotency_key="race-key",
+                signal_id="sig-idem",
+                idempotency_key="idem-key-1",
                 settings=settings,
                 http_client=http,
             )
 
     log = asyncio.run(_run())
     assert log.status == PushStatus.SUCCESS
-    assert log.external_id == "sf-race"
-    # Both create and update were called: create by the first attempt, update
-    # by the race-fallback retry.
-    assert len(create_calls) == 1
-    assert len(update_calls) == 1
+    assert log.external_id == "sf-idem"
+    # The PushIdempotency table should have been upserted.
+    assert (conn.id, "idem-key-1") in session._idempotency
+    assert session._idempotency[(conn.id, "idem-key-1")].external_id == "sf-idem"
 
 
 # ---------------------------------------------------------------------------

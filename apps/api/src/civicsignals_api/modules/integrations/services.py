@@ -53,7 +53,7 @@ from uuid import UUID
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.config import Settings, get_settings
@@ -67,6 +67,7 @@ from .models import (
     FieldMapping,
     IntegrationProviderKind,
     PushErrorCode,
+    PushIdempotency,
     PushLog,
     PushStatus,
     WebhookDelivery,
@@ -952,16 +953,14 @@ async def push_source(
     ``signal_id`` or ``pipeline_item_id`` is, one is derived deterministically
     via :func:`make_idempotency_key` so re-pushing the same logical record always
     resolves to the same key. Before pushing we look up any prior *successful*
-    push for that key; if found, its ``external_id`` is passed to the provider so
-    the push is a CRM update, not a duplicate create.
+    push for that key in :class:`PushIdempotency`; if found, its ``external_id``
+    is passed to the provider so the push is a CRM update, not a duplicate create.
 
-    **Race guard:** two concurrent pushes of the same key may both see no prior
-    success and both call the provider's create. The unique partial index on
-    ``(connection_id, idempotency_key)`` WHERE ``status = 'success'`` prevents
-    both rows from being committed as successes. When the second push encounters
-    the ``IntegrityError`` it rolls back its success update, looks up the
-    ``external_id`` persisted by the first push, and re-runs against the provider
-    as an update — recording its own success with the same external id.
+    On success, the ``(connection_id, idempotency_key) → external_id`` mapping is
+    upserted into :class:`PushIdempotency` via PostgreSQL
+    ``INSERT … ON CONFLICT DO UPDATE``. This makes both sequential re-pushes
+    (update the existing row) and concurrent duplicate pushes (race on the PK,
+    loser does harmless UPDATE) safe without any rollback or retry logic.
 
     Never raises on a provider failure — the outcome lives in the returned log.
     The caller commits.
@@ -1001,11 +1000,13 @@ async def push_source(
             pipeline_item_id=pipeline_item_id,
         )
 
-    # K4 seam: a prior successful push of the same source object (same
-    # idempotency key) re-pushes as an update against its external id.
+    # K4 seam: look up the canonical external-id for this idempotency key from
+    # the PushIdempotency table.  If a prior successful push exists, pass its
+    # external_id to the provider so the push routes through the update path
+    # (PATCH) instead of creating a duplicate CRM object (POST).
     prior_external_id: str | None = None
     if resolved_key:
-        prior = await _last_successful_push(
+        prior = await _get_push_idempotency(
             session, connection_id=connection.id, idempotency_key=resolved_key
         )
         if prior is not None:
@@ -1027,71 +1028,75 @@ async def push_source(
         idempotency_key=resolved_key,
         external_id=prior_external_id,
     )
-    try:
-        return await execute_push(
-            session,
-            connection=connection,
-            log=log,
-            request=request,
-            settings=settings,
-            http_client=http_client,
-        )
-    except IntegrityError:
-        # K4 race guard: the unique partial index on (connection_id,
-        # idempotency_key) WHERE status='success' fired — a concurrent push of
-        # the same key already committed a success with an external_id. Roll
-        # back the session to a clean state, fetch the winner's external_id, and
-        # re-run the push as an update so this attempt also records a success
-        # without creating a duplicate CRM object.
-        await session.rollback()
-        winner = await _last_successful_push(
+    result_log = await execute_push(
+        session,
+        connection=connection,
+        log=log,
+        request=request,
+        settings=settings,
+        http_client=http_client,
+    )
+    # K4: on success, upsert the canonical external-id into PushIdempotency so
+    # the next push of the same key routes as an update.  Uses PostgreSQL
+    # INSERT … ON CONFLICT DO UPDATE so concurrent duplicate pushes are safe:
+    # the loser hits the primary-key conflict and updates the row (harmless —
+    # both pushes resolve to the same external_id).
+    if result_log.status == PushStatus.SUCCESS and resolved_key and result_log.external_id:
+        await _upsert_push_idempotency(
             session,
             connection_id=connection.id,
-            idempotency_key=resolved_key or "",
-        )
-        winner_external_id = winner.external_id if winner is not None else None
-        log2 = await create_push_log(
-            session,
-            workspace_id=connection.workspace_id,
-            connection_id=connection.id,
-            target=qualified_target,
-            request=payload,
-            signal_id=signal_id,
-            pipeline_item_id=pipeline_item_id,
             idempotency_key=resolved_key,
+            external_id=result_log.external_id,
         )
-        retry_request = PushRequest(
-            target=qualified_target,
-            payload=payload,
-            idempotency_key=resolved_key,
-            external_id=winner_external_id,
-        )
-        return await execute_push(
-            session,
-            connection=connection,
-            log=log2,
-            request=retry_request,
-            settings=settings,
-            http_client=http_client,
-        )
+    return result_log
 
 
-async def _last_successful_push(
+async def _get_push_idempotency(
     session: AsyncSession, *, connection_id: UUID, idempotency_key: str
-) -> PushLog | None:
-    """Return the most recent successful push for an idempotency key (K4 seam)."""
+) -> PushIdempotency | None:
+    """Return the canonical external-id record for an idempotency key (K4 seam).
+
+    Returns ``None`` when this is the first push for the (connection,
+    idempotency_key) pair.  The presence of a row means a prior successful push
+    exists and the current push should route through the provider's update path.
+    """
     result = await session.execute(
-        select(PushLog)
-        .where(
-            PushLog.connection_id == connection_id,
-            PushLog.idempotency_key == idempotency_key,
-            PushLog.status == PushStatus.SUCCESS,
-            PushLog.external_id.is_not(None),
+        select(PushIdempotency).where(
+            PushIdempotency.connection_id == connection_id,
+            PushIdempotency.idempotency_key == idempotency_key,
         )
-        .order_by(PushLog.id.desc())
-        .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def _upsert_push_idempotency(
+    session: AsyncSession,
+    *,
+    connection_id: UUID,
+    idempotency_key: str,
+    external_id: str,
+) -> None:
+    """Upsert the canonical external-id for an idempotency key (K4).
+
+    Uses PostgreSQL ``INSERT … ON CONFLICT DO UPDATE`` so:
+    - First push: inserts the row.
+    - Sequential re-push: updates ``external_id`` + ``updated_at`` in place.
+    - Concurrent duplicate pushes: the loser hits the primary-key conflict and
+      updates the row with the same external_id — harmless.
+    """
+    stmt = (
+        pg_insert(PushIdempotency)
+        .values(
+            connection_id=connection_id,
+            idempotency_key=idempotency_key,
+            external_id=external_id,
+        )
+        .on_conflict_do_update(
+            index_elements=["connection_id", "idempotency_key"],
+            set_={"external_id": external_id},
+        )
+    )
+    await session.execute(stmt)
 
 
 # ---------------------------------------------------------------------------

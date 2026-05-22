@@ -35,7 +35,7 @@ import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -312,18 +312,6 @@ class PushLog(Base):
         Index("ix_integrations_push_log_retry", "status", "retry_at"),
         # K4: dedupe a re-push of the same source object per connection.
         Index("ix_integrations_push_log_idempotency", "connection_id", "idempotency_key"),
-        # K4: partial unique constraint — only one *successful* push per
-        # (connection, idempotency_key) can exist.  The WHERE clause is a
-        # PostgreSQL-specific partial index: Alembic renders it via
-        # ``postgresql_where``.  This is the race guard: a concurrent second
-        # create attempt raises IntegrityError and is retried as an update.
-        Index(
-            "uq_integrations_push_log_idempotency_success",
-            "connection_id",
-            "idempotency_key",
-            unique=True,
-            postgresql_where=text("status = 'success' AND idempotency_key IS NOT NULL"),
-        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
@@ -391,6 +379,53 @@ class PushLog(Base):
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PushIdempotency(Base):
+    """Canonical external-id registry for idempotent pushes (K4).
+
+    One row per ``(connection_id, idempotency_key)`` — the stable mapping from
+    a logical push identity to the provider's external id.  This table is
+    **upserted** on each successful push so that:
+
+    - Sequential re-pushes look up the existing ``external_id`` before calling
+      the provider and route through the provider's update path (no duplicate
+      CRM objects).
+    - Concurrent duplicate pushes race on the unique primary key: the winner's
+      INSERT succeeds; the loser's INSERT hits a conflict, raises
+      ``IntegrityError``, and is retried as an UPDATE.
+
+    ``push_log`` remains a pure append-only audit trail (no uniqueness
+    constraint on it) while this table is the single source of truth for
+    which external id belongs to each (connection, idempotency_key) pair.
+    """
+
+    __tablename__ = "integrations_push_idempotency"
+    # No extra indexes needed: (connection_id, idempotency_key) is the PK.
+
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("integrations_connection.id", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(255),
+        primary_key=True,
+        nullable=False,
+    )
+
+    # The provider-side id of the created CRM object.  Presence proves the
+    # push succeeded; the push service passes it back as ``external_id`` on
+    # re-push so the provider routes the call as an update.
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
