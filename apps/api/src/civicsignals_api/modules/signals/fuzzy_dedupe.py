@@ -427,6 +427,11 @@ async def run_fuzzy_dedupe(
         new_confidence=new_confidence,
         now=now,
     )
+    # Soft-delete the candidate: mark it ``merged`` so it no longer surfaces in
+    # list_signals / feed queries. The row is kept for the audit trail (its
+    # raw_document_ids have been folded into the surviving signal above).
+    candidate_signal.status = SIGNAL_STATUS_MERGED
+    candidate_signal.merged_into = matched_signal.id
     await session.flush()
     log.info(
         "signals.fuzzy_dedupe.auto_merged",
