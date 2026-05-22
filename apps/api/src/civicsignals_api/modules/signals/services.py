@@ -1000,6 +1000,9 @@ async def list_workspace_signals(
     workspace_id: uuid.UUID,
     signal_type: str | None = None,
     statuses: Sequence[str] | None = None,
+    min_score: float | None = None,
+    published_at_gte: datetime | None = None,
+    published_at_lt: datetime | None = None,
     cursor: str | None = None,
     limit: int = DEFAULT_LIMIT,
 ) -> WorkspaceFeedPage:
@@ -1010,7 +1013,9 @@ async def list_workspace_signals(
     ``score DESC, created_at DESC, id DESC`` — the hot composite index (doc 14 §5.3).
     Filters to the feed-visible statuses (new/reviewed/pinned) by default; pass
     ``statuses`` to override (e.g. include ``dismissed`` for a "show hidden" view).
-    Optional ``signal_type`` narrows to one type.
+    Optional ``signal_type`` narrows to one type; ``min_score`` (0-100) filters below
+    the given threshold; ``published_at_gte``/``published_at_lt`` bound the signal's
+    ``occurred_at`` date (doc 08 §1.6 date-range conventions).
 
     Cursor pagination is keyset on the score row id (UUID v7, time-ordered) so the
     opaque cursor is stable; we fetch ``limit + 1`` to decide ``next_cursor``. The id
@@ -1039,6 +1044,13 @@ async def list_workspace_signals(
     )
     if signal_type is not None:
         stmt = stmt.where(Signal.signal_type == signal_type)
+    if min_score is not None:
+        # ``score`` is Numeric(5, 2) on the 0..100 scale (doc 14 §5.3).
+        stmt = stmt.where(WorkspaceScore.score >= min_score)
+    if published_at_gte is not None:
+        stmt = stmt.where(Signal.occurred_at >= published_at_gte)
+    if published_at_lt is not None:
+        stmt = stmt.where(Signal.occurred_at < published_at_lt)
 
     if cursor is not None:
         cursor_id = decode_cursor(cursor)
