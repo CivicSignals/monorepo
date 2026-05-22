@@ -7,6 +7,7 @@ the per-workspace *score* (``signals_workspace_score``, F3), which the G1 feed
 joins on top. Writes happen only through the extraction funnel (E1 →
 ``services.promote_candidate_to_signal``), never via HTTP.
 
+  GET  /signals/feed                         — workspace feed: scored signals sorted by score desc (G1)
   GET  /signals                              — list global signals (cursor-paginated)
   GET  /signals/fuzzy-reviews                — list fuzzy-dedupe review rows (admin)
   GET  /signals/fuzzy-reviews/{id}           — get one review row
@@ -14,10 +15,11 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
   GET  /signals/{id}                         — get one signal
 
-Route ordering note: ``/fuzzy-reviews`` and its sub-paths MUST be registered before
-``/{signal_id}`` (the parameterised catch-all) so that FastAPI's routing evaluates
-the static prefix first. Moving ``/{signal_id}`` to the end of the file preserves
-this invariant regardless of how many fuzzy-review endpoints are added later.
+Route ordering note: ``/feed``, ``/fuzzy-reviews`` and their sub-paths MUST be
+registered before ``/{signal_id}`` (the parameterised catch-all) so that FastAPI's
+routing evaluates the static prefix first. Moving ``/{signal_id}`` to the end of
+the file preserves this invariant regardless of how many static-prefix endpoints
+are added later.
 
 Fuzzy-review endpoints are admin-gated (doc 19 §7.4 — the review queue is an
 internal tool to validate the 0.92 cosine threshold before enabling auto-merge).
@@ -37,10 +39,11 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
-from civicsignals_api.modules.auth.dependencies import RequireAdmin
+from civicsignals_api.modules.auth.dependencies import RequireAdmin, RequireViewer
 
 from . import services
 from .schemas import SignalPage, SignalRead
+from .services import WorkspaceFeedPage
 
 router = APIRouter(prefix="/signals", tags=["signals"])
 
@@ -56,6 +59,142 @@ def _problem(status: int, title: str, detail: str) -> JSONResponse:
         media_type="application/problem+json",
         content={"type": "about:blank", "title": title, "status": status, "detail": detail},
     )
+
+
+# ---------------------------------------------------------------------------
+# G1 feed schemas (the workspace-scored read shapes returned by /signals/feed)
+# ---------------------------------------------------------------------------
+
+
+class FeedItemRead(BaseModel):
+    """One scored signal in the workspace feed (G1; doc 14 §5.3).
+
+    Wraps :class:`~signals.services.WorkspaceFeedItem` with a Pydantic response
+    shape: the global signal core plus its per-workspace score, status, score
+    breakdown, and matched keywords so the feed UI (G1) and "Why this signal?"
+    panel (G2) render from one read without extra joins.
+    """
+
+    model_config = ConfigDict(from_attributes=False)
+
+    score_id: uuid.UUID
+    signal: SignalRead
+    score: float
+    status: str
+    score_breakdown: dict[str, object]
+    matched_keywords: list[str]
+    created_at: datetime
+
+
+class FeedPage(BaseModel):
+    """Cursor-paginated page of workspace feed items (G1; doc 06 §5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    data: list[FeedItemRead]
+    page: dict[str, object]
+
+
+def _feed_page(feed: WorkspaceFeedPage, limit: int) -> FeedPage:
+    """Convert a service-layer :class:`WorkspaceFeedPage` to the HTTP response shape.
+
+    Uses the doc 08 §1.5 envelope (``data`` + ``page`` dict) instead of the simpler
+    ``items``/``next_cursor`` used by older list endpoints so the feed matches the
+    spec's worked example exactly (doc 08 §3.1).
+    """
+    return FeedPage(
+        data=[
+            FeedItemRead(
+                score_id=item.score_id,
+                signal=item.signal,
+                score=item.score,
+                status=item.status,
+                score_breakdown=item.score_breakdown,
+                matched_keywords=item.matched_keywords,
+                created_at=item.created_at,
+            )
+            for item in feed.items
+        ],
+        page={
+            "next_cursor": feed.next_cursor,
+            "has_more": feed.next_cursor is not None,
+            "limit": limit,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# G1 feed endpoint — workspace-scoped, score-ranked, cursor-paginated
+#
+# IMPORTANT: registered before /{signal_id} so the static /feed prefix wins.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/feed", response_model=FeedPage, summary="Workspace signal feed (G1)")
+async def get_workspace_feed(
+    ctx: RequireViewer,
+    session: SessionDep,
+    signal_type: Annotated[
+        str | None,
+        Query(description="Filter by signal type slug (e.g. rfp_posted, news_mention)."),
+    ] = None,
+    status: Annotated[
+        list[str] | None,
+        Query(description="Filter by feed status (new, reviewed, pinned, pushed, dismissed)."),
+    ] = None,
+    min_score: Annotated[
+        float | None,
+        Query(ge=0.0, le=100.0, description="Minimum score (0-100)."),
+    ] = None,
+    published_at_gte: Annotated[
+        datetime | None,
+        Query(description="Only signals with occurred_at at/after this timestamp."),
+    ] = None,
+    published_at_lt: Annotated[
+        datetime | None,
+        Query(description="Only signals with occurred_at before this timestamp."),
+    ] = None,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = services.DEFAULT_LIMIT,
+) -> FeedPage | JSONResponse:
+    """Workspace signal feed: per-workspace-scored signals sorted by score desc (G1).
+
+    Returns the calling workspace's signals joined with their ``signals_workspace_score``
+    rows, ordered highest-score-first. Only threshold-gated signals (those with a
+    score row) appear; signals scored below the workspace ICP threshold are invisible
+    (doc 14 §5.2). Default status filter is ``new`` + ``reviewed`` + ``pinned``
+    (the feed-visible set, doc 14 §5.3).
+
+    Filters (doc 08 §1.6):
+    - ``signal_type`` — narrow to one type slug.
+    - ``status`` — repeatable; overrides the default visible-status set.
+    - ``min_score`` — floor on the 0-100 workspace score.
+    - ``published_at_gte``/``published_at_lt`` — bound the signal's ``occurred_at``.
+
+    Workspace isolation is enforced by ``require_workspace``/``RequireViewer`` (B5):
+    the workspace id comes from the resolved :class:`WorkspaceContext`, never from
+    a query param, so one workspace cannot read another's feed (doc 08 §1.4).
+
+    TODO G3: bulk actions (dismiss/pin batch) build on this feed.
+    TODO G4: status transitions (dismiss/pin/push single) will be PATCH endpoints.
+    TODO G5: polished loading/empty/error states (the UI leaves seams for these).
+    """
+    workspace_id = ctx.workspace.id
+    try:
+        feed = await services.list_workspace_signals(
+            session,
+            workspace_id=workspace_id,
+            signal_type=signal_type,
+            statuses=status,
+            min_score=min_score,
+            published_at_gte=published_at_gte,
+            published_at_lt=published_at_lt,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError:
+        return _problem(400, "Invalid cursor", "The supplied cursor is malformed.")
+    return _feed_page(feed, limit)
 
 
 # ---------------------------------------------------------------------------
