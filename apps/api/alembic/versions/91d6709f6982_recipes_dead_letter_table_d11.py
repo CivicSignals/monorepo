@@ -7,8 +7,12 @@ against the S3 raw-document snapshot keyed by ``content_hash`` (doc 18 §2.3,
 §3.4, §3.6). The ``id`` PK is generated application-side
 (``models._new_uuid``), so this migration needs no server-side UUID function.
 
+This module only creates ``recipes_*`` tables; chaining it after the extraction
+baseline keeps a single linear migration head (the tables are independent, so
+the order is immaterial).
+
 Revision ID: 91d6709f6982
-Revises:
+Revises: 72f1737aad7b
 Create Date: 2026-05-22 05:19:47.833473
 """
 
@@ -21,7 +25,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "91d6709f6982"
-down_revision: str | None = None
+down_revision: str | None = "72f1737aad7b"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
