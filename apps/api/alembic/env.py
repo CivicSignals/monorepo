@@ -8,6 +8,7 @@ PgBouncer transaction-mode pooling). See doc 06 §4, doc 18 §6.3.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import pkgutil
 from logging.config import fileConfig
@@ -16,9 +17,9 @@ from alembic import context
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy.pool import NullPool
 
+from civicsignals_api import modules as modules_pkg
 from civicsignals_api.config import get_settings
 from civicsignals_api.db import Base
-from civicsignals_api import modules as modules_pkg
 
 config = context.config
 if config.config_file_name is not None:
@@ -28,10 +29,8 @@ if config.config_file_name is not None:
 for _module in pkgutil.iter_modules(modules_pkg.__path__):
     if not _module.ispkg:
         continue
-    try:
+    with contextlib.suppress(ModuleNotFoundError):
         importlib.import_module(f"{modules_pkg.__name__}.{_module.name}.models")
-    except ModuleNotFoundError:
-        pass
 
 target_metadata = Base.metadata
 
