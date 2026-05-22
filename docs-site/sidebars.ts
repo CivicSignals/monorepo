@@ -21,13 +21,19 @@ const sidebars: SidebarsConfig = {
     },
   ],
 
-  // TODO Q3 — API docs (generated from OpenAPI + guides)
+  // Q3 — API docs (generated from OpenAPI + guides)
   apiSidebar: [
     {
       type: "category",
       label: "API Reference",
+      collapsible: false,
       items: [
         "api/intro",
+        "api/authentication",
+        "api/workspace-scoping",
+        "api/pagination",
+        "api/errors",
+        "api/rate-limits",
       ],
     },
   ],
