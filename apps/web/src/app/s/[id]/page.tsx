@@ -18,8 +18,10 @@
 //
 // generateMetadata provides per-page <title>, description, canonical, OG, Twitter.
 //
-// TODO P3: add JSON-LD structured data (e.g. schema.org/GovernmentService /
-//          Article) once SEO basics land.
+// P3: server-rendered schema.org/Article JSON-LD for the public notice — chosen
+//     over GovernmentService (an ongoing service) / SpecialAnnouncement (civic
+//     emergencies) as the most defensible mapping for a dated, publisher-attributed
+//     RFP / grant / news notice. See lib/jsonld.ts for the rationale.
 // TODO P4: add Crawl-delay / rate-limit guards to the fetchPublicSignal* helpers.
 
 import type { Metadata } from "next";
@@ -33,6 +35,8 @@ import {
   type PublicSignalSource,
 } from "@/lib/public-signals-api";
 import { SIGNAL_TYPE_LABELS, type SignalType } from "@/lib/signals-api";
+import { signalJsonLd } from "@/lib/jsonld";
+import { JsonLdScript } from "@/components/seo/json-ld";
 
 // ---- Revalidate at the page level (5 minutes). ----
 // Must be a literal — Next.js static analysis cannot resolve imported constants.
@@ -177,6 +181,9 @@ export default async function PublicSignalPage({ params }: PageProps) {
 
   return (
     <main className="container py-8">
+      {/* P3: Article structured data for the public notice (public-safe fields only). */}
+      <JsonLdScript data={signalJsonLd(signal, sources, SITE_URL, id)} />
+
       <div className="space-y-8">
         {/* Breadcrumb */}
         <nav aria-label="Breadcrumb">
@@ -269,8 +276,6 @@ export default async function PublicSignalPage({ params }: PageProps) {
             </Link>
           </div>
         </div>
-
-        {/* TODO P3: JSON-LD structured data for the signal. */}
       </div>
     </main>
   );

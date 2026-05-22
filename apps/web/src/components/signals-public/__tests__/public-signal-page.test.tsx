@@ -96,7 +96,7 @@ async function renderSignalPage(
     }) => Promise<React.ReactElement>
   )({ params: Promise.resolve({ id: "signal-abc" }) });
 
-  render(jsx);
+  return render(jsx);
 }
 
 // ---- Page render tests ----
@@ -181,6 +181,39 @@ describe("PublicSignalPage — render", () => {
     await renderSignalPage();
     const back = screen.getByRole("link", { name: /public directory/i });
     expect(back.getAttribute("href")).toBe("/directory");
+  });
+
+  it("renders Article JSON-LD referencing the issuing org + source citations (P3)", async () => {
+    const { container } = await renderSignalPage();
+
+    const script = container.querySelector('script[type="application/ld+json"]');
+    expect(script).not.toBeNull();
+    const raw = script!.textContent ?? "{}";
+    const data = JSON.parse(raw) as Record<string, unknown>;
+
+    expect(data["@type"]).toBe("Article");
+    expect(data.headline).toBe("RFP: School Transportation Fleet 2026");
+    expect((data.about as { name: string }).name).toBe("Northshore School District");
+    expect(data.isBasedOn).toContain("https://nsd.org/rfps/2026-transport");
+
+    // No internal-only signal fields leak into the structured data.
+    for (const bad of [
+      "content_hash",
+      "raw_document_ids",
+      "confidence",
+      "review_required",
+      "is_degraded",
+      "document_id",
+      "doc-001",
+      "recipe_id",
+      "wa_k12_rfps",
+    ]) {
+      expect(raw).not.toContain(bad);
+    }
+
+    // The signal id appears only inside the canonical /s/<id> URL, never as a
+    // bare identifier value.
+    expect(raw.split("/s/signal-abc").join("/s/")).not.toContain("signal-abc");
   });
 
   it("calls notFound() when the signal is null (404)", async () => {
