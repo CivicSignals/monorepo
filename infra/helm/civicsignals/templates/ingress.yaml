@@ -1,0 +1,58 @@
+# CivicSignals — Ingress for web and api
+# task O3 / doc 06 §5, §10
+# SPDX-License-Identifier: AGPL-3.0-only
+{{- if .Values.ingress.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "civicsignals.fullname" . }}
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- $tlsEnabled := or .Values.ingress.web.tls.enabled .Values.ingress.api.tls.enabled }}
+  {{- if $tlsEnabled }}
+  tls:
+    {{- if .Values.ingress.web.tls.enabled }}
+    - hosts:
+        - {{ .Values.ingress.web.host | quote }}
+      secretName: {{ .Values.ingress.web.tls.secretName }}
+    {{- end }}
+    {{- if .Values.ingress.api.tls.enabled }}
+    - hosts:
+        - {{ .Values.ingress.api.host | quote }}
+      secretName: {{ .Values.ingress.api.tls.secretName }}
+    {{- end }}
+  {{- end }}
+  rules:
+    {{- if .Values.web.enabled }}
+    - host: {{ .Values.ingress.web.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "civicsignals.fullname" . }}-web
+                port:
+                  number: {{ .Values.web.service.port }}
+    {{- end }}
+    {{- if .Values.api.enabled }}
+    - host: {{ .Values.ingress.api.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "civicsignals.fullname" . }}-api
+                port:
+                  number: {{ .Values.api.service.port }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,82 @@
+# CivicSignals — Alembic migration Job (Helm pre-install / pre-upgrade hook)
+#
+# Runs `alembic upgrade head` against the DIRECT Postgres connection
+# (bypassing PgBouncer, which doesn't support session-level DDL).
+# The job must complete before any api/worker pods start.
+#
+# task O3 / doc 06 §4, §10 — Alembic, DATABASE_DIRECT_URL
+# SPDX-License-Identifier: AGPL-3.0-only
+{{- if .Values.migrate.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Helm lifecycle hooks — run before deployments are applied
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": {{ .Values.migrate.hookWeight | quote }}
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # Retry once on transient DB unavailability
+  backoffLimit: 2
+  # Clean up completed jobs after 10 minutes
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "civicsignals.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "civicsignals.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "civicsignals.apiImage" . }}
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          # Run Alembic directly; use the direct connection URL (no PgBouncer)
+          # so DDL statements can use session-level locks safely.
+          command: ["alembic", "upgrade", "head"]
+          workingDir: /app
+          env:
+            # Alembic reads DATABASE_URL for migrations; we point it at the
+            # direct Postgres port, not PgBouncer (transaction mode blocks DDL).
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "civicsignals.fullname" . }}-secret
+                  key: DATABASE_DIRECT_URL
+            - name: DATABASE_DIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "civicsignals.fullname" . }}-secret
+                  key: DATABASE_DIRECT_URL
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "civicsignals.fullname" . }}-secret
+                  key: SECRET_KEY
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "civicsignals.fullname" . }}-config
+                  key: LOG_LEVEL
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

@@ -1,0 +1,78 @@
+# CivicSignals — worker_ingest Deployment (Celery, queue=ingest)
+# task O3 / doc 06 §1, §8, §10
+# SPDX-License-Identifier: AGPL-3.0-only
+{{- if .Values.workerIngest.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-worker-ingest
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-ingest
+spec:
+  replicas: {{ .Values.workerIngest.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "civicsignals.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker-ingest
+  template:
+    metadata:
+      labels:
+        {{- include "civicsignals.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker-ingest
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "civicsignals.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker-ingest
+          image: {{ include "civicsignals.apiImage" . }}
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          command:
+            {{- toYaml .Values.workerIngest.command | nindent 12 }}
+          args:
+            {{- toYaml .Values.workerIngest.args | nindent 12 }}
+          env:
+            {{- include "civicsignals.apiEnv" . | nindent 12 }}
+            - name: CELERY_CONCURRENCY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "civicsignals.fullname" . }}-config
+                  key: CELERY_INGEST_CONCURRENCY
+            {{- with .Values.workerIngest.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.workerIngest.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.workerIngest.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.workerIngest.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.workerIngest.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

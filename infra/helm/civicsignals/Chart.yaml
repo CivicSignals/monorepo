@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+apiVersion: v2
+name: civicsignals
+description: >
+  CivicSignals – a multi-tenant, self-hostable civic-intelligence platform.
+  One Helm release provisions all six process types (api, worker_ingest,
+  worker_extract, worker_score, worker_notify, scheduler) plus the Next.js
+  web frontend, Ingress, ConfigMap, Secret, and an Alembic migrate Job.
+
+  For evaluation/dev, bundled subcharts (PostgreSQL, Redis, MinIO) can be
+  enabled via values.yaml.  For production, point at RDS + ElastiCache + S3.
+
+type: application
+version: 0.1.0
+appVersion: "latest"
+
+# doc 06 §10 — Phase 2 Helm distribution
+# task O3
+
+keywords:
+  - civicsignals
+  - civic-tech
+  - saas
+  - self-host
+
+home: https://github.com/CivicSignals/monorepo
+sources:
+  - https://github.com/CivicSignals/monorepo
+
+maintainers:
+  - name: CivicSignals Engineering
+    url: https://github.com/CivicSignals
+
+dependencies:
+  # Bundled datastores — disabled by default; enable for evaluation/dev.
+  # See values.yaml  bundled.postgres / bundled.redis / bundled.minio
+  - name: postgresql
+    version: "15.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: bundled.postgres.enabled
+    alias: postgresql
+
+  - name: redis
+    version: "19.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: bundled.redis.enabled
+    alias: redis
+
+  - name: minio
+    version: "14.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: bundled.minio.enabled
+    alias: minio
