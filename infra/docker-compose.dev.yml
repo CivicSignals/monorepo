@@ -171,8 +171,21 @@ services:
       retries: 10
       start_period: 20s
 
+  # worker_ingest carries Playwright + Chromium for the headless-browser fetcher
+  # (D2): it builds the `worker` Dockerfile stage with the `ingestion` extra,
+  # unlike the other process types on the lean image. NB: the dev stack volume-
+  # mounts ../apps/api over /app, so to render pages locally also install the
+  # browser into the mounted venv:
+  #   docker compose -f infra/docker-compose.dev.yml exec worker_ingest \
+  #     uv run --extra ingestion playwright install chromium
   worker_ingest:
     <<: [*api-image, *api-deps]
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+      target: worker
+      args:
+        EXTRAS: ingestion
     command: ["worker_ingest"]
 
   worker_extract:

@@ -6,6 +6,16 @@
 #   EXTRAS  — comma-separated optional extras to install (default: "")
 #             Use "ingestion,extraction" for worker images that need heavy deps.
 #
+# Build targets (multi-stage):
+#   final   — the lean default. Core deps only; no Playwright, no Chromium.
+#             Used by api + worker_extract/score/notify.
+#   worker  — final + the ingestion/extraction extras' OS deps + a headless
+#             Chromium browser (D2). Used by worker_ingest, which renders
+#             JS-heavy pages with Playwright. Build it with:
+#               docker build --target worker --build-arg EXTRAS=ingestion .
+#             The Chromium install lives ONLY in this stage so the api image
+#             stays small.
+#
 # Multi-arch (linux/amd64 + linux/arm64) and cosign-signing are handled in CI
 # (.github/workflows/release-images.yml — task O1).
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -87,3 +97,29 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["api"]
+
+# ---- worker stage: final + a headless Chromium for the browser fetcher (D2) ----
+# Built only for worker_ingest (`--target worker --build-arg EXTRAS=ingestion`).
+# `playwright install --with-deps chromium` pulls Chromium + its OS libraries;
+# we keep it in this stage so the lean `final` (api) image carries none of it.
+# Requires the `ingestion` extra (which provides the `playwright` package) to be
+# installed in the builder — without it `playwright` isn't on PATH and the build
+# fails fast, which is the desired signal (don't build `worker` without EXTRAS).
+FROM final AS worker
+
+# Chromium + the system libraries Playwright needs run as root to install into
+# system paths, then we drop back to the non-root user for runtime.
+USER root
+
+# Place the browser inside the app tree so it's owned by appuser and survives as
+# a normal layer (default cache is under the build user's HOME).
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    playwright install --with-deps chromium && \
+    chown -R appuser:appgroup /app/.playwright
+
+USER appuser
+
+CMD ["worker_ingest"]

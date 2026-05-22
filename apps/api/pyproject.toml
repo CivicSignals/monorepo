@@ -132,6 +132,9 @@ module = [
     "pgvector.*",
     "feedparser.*",
     "pdfplumber.*",
+    # playwright lives in the `ingestion` extra and is imported lazily by the
+    # headless-browser fetcher (D2), so the core api type-checks without it.
+    "playwright.*",
     "celery.*",
     "anthropic.*",
     "openai.*",
