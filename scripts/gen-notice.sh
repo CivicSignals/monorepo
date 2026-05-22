@@ -33,6 +33,13 @@ fi
 
 cd "${API_DIR}"
 
+# Resolve into a throwaway, isolated environment so we never mutate the
+# developer's primary apps/api/.venv (which holds ruff/mypy/pytest). Without
+# this, `make notice` would leave the venv runtime-only and force a re-sync.
+ISOLATED_VENV="$(mktemp -d)"
+trap 'rm -rf "${ISOLATED_VENV}"' EXIT
+export UV_PROJECT_ENVIRONMENT="${ISOLATED_VENV}"
+
 # Scope the resolved environment to runtime dependencies only.
 uv sync --no-dev --frozen >/dev/null
 

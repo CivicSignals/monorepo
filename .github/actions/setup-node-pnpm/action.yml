@@ -18,6 +18,10 @@ runs:
         node-version-file: .nvmrc
         cache: pnpm
 
+    # Turborepo cache (A3 deliverable). Today's jobs run package-scoped commands
+    # (pnpm --filter ...), so this is largely a no-op; it pays off the moment a
+    # job switches to Turbo-driven tasks (pnpm lint/typecheck/test). Restore/save
+    # is cheap, so we keep it wired per the A3 spec.
     - name: Cache Turborepo
       uses: actions/cache@v4
       with:
