@@ -410,6 +410,33 @@ def test_xpath_fallback_selector() -> None:
     assert doc.extraction_method == ExtractionMethod.FALLBACK
 
 
+def test_multiple_xpath_fields_share_one_parse() -> None:
+    # Two XPath-using fields in one document: the lxml tree is parsed once and
+    # reused (ParsedDocument). Just assert both resolve correctly.
+    pytest.importorskip("lxml")
+    recipe = _recipe(
+        {
+            "title": {"selectors": [{"selector": "//h1", "type": "xpath"}]},
+            "subtitle": {"selectors": [{"selector": "//h2", "type": "xpath"}]},
+        }
+    )
+    html = "<html><body><h1>Title X</h1><h2>Sub Y</h2></body></html>"
+    doc = _extract(recipe, html)
+    assert doc.fields["title"] == "Title X"
+    assert doc.fields["subtitle"] == "Sub Y"
+
+
+def test_xpath_attr_selector() -> None:
+    # XPath fallback reading an attribute (object form + attr).
+    pytest.importorskip("lxml")
+    recipe = _recipe(
+        {"link": {"selectors": [{"selector": "//a", "type": "xpath"}], "attr": "href"}}
+    )
+    html = '<html><body><a href="https://x.gov/rfp">RFP</a></body></html>'
+    doc = _extract(recipe, html)
+    assert doc.fields["link"] == "https://x.gov/rfp"
+
+
 def test_llm_assisted_hit_flags_degraded_and_ticks_llm_drift() -> None:
     recipe = _recipe({"title": {"selectors": ["h1.title", ".fallback h2"], "llm_assisted": True}})
     html = "<html><body><p>no selector matches here</p></body></html>"

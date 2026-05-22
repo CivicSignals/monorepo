@@ -4,7 +4,8 @@ Owned by the ``recipes`` module (doc 06 §3, §4) — touches only ``recipes_*``
 Records fields/documents the ordered fallback chain (primary → fallback →
 LLM-assisted) could not extract, so a miss is durably visible and replayable
 against the S3 raw-document snapshot keyed by ``content_hash`` (doc 18 §2.3,
-§3.4, §3.6). ``gen_random_uuid()`` is built into Postgres 13+.
+§3.4, §3.6). The ``id`` PK is generated application-side
+(``models._new_uuid``), so this migration needs no server-side UUID function.
 
 Revision ID: 91d6709f6982
 Revises:
@@ -28,7 +29,9 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.create_table(
         "recipes_dead_letter",
-        sa.Column("id", sa.UUID(), server_default=sa.text("gen_random_uuid()"), nullable=False),
+        # PK is populated application-side (models._new_uuid) so the migration
+        # needs no server-side UUID function / pgcrypto extension.
+        sa.Column("id", sa.UUID(), nullable=False),
         sa.Column("recipe_id", sa.String(length=255), nullable=False),
         sa.Column("recipe_version", sa.Integer(), nullable=False),
         sa.Column("source_url", sa.String(), nullable=False),

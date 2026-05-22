@@ -17,6 +17,16 @@ from sqlalchemy.orm import Mapped, mapped_column
 from civicsignals_api.db import Base
 
 
+def _new_uuid() -> uuid.UUID:
+    """Application-side UUID v4 default.
+
+    Generating the PK in Python keeps the migration free of any dependency on a
+    server-side function (``gen_random_uuid()`` is core in Postgres 13+ but
+    needs ``pgcrypto`` on older installs), so the table creates on a stock DB.
+    """
+    return uuid.uuid4()
+
+
 class DeadLetter(Base):
     """A field/document that no extraction step could resolve (doc 18 §2.3, §3.4).
 
@@ -33,7 +43,7 @@ class DeadLetter(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
-        server_default=text("gen_random_uuid()"),
+        default=_new_uuid,
     )
     recipe_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     recipe_version: Mapped[int] = mapped_column(Integer, nullable=False)

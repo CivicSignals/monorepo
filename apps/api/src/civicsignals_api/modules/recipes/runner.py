@@ -396,57 +396,71 @@ def _eval_css(soup: BeautifulSoup, selector: str, attr: str | None) -> str | Non
     return _value_from_element(element, attr)
 
 
-def _eval_xpath(html: str, selector: str, attr: str | None) -> str | None:
-    """Evaluate an XPath selector against ``html`` using lxml.
+class ParsedDocument:
+    """A document parsed once, shared across every field's selector chain.
 
-    lxml ships only with the ``ingestion`` extra (see pyproject), so we import it
-    lazily and raise a clear :class:`RecipeError` if a recipe declares an XPath
-    selector in an image that lacks it — rather than failing at module import.
+    Holds the BeautifulSoup DOM (for CSS) and lazily parses an lxml tree (for
+    XPath) **at most once per document** — so a recipe with several XPath
+    selectors/fields does not re-parse the whole HTML each time. lxml ships only
+    with the ``ingestion`` extra, so it is imported lazily and only when a recipe
+    actually uses an XPath selector.
     """
-    try:
-        from lxml import html as lxml_html  # type: ignore[import-untyped]
-    except ImportError as exc:  # pragma: no cover - depends on the install extra
-        raise RecipeError("xpath selectors require lxml (install the 'ingestion' extra)") from exc
 
-    tree = lxml_html.fromstring(html)
-    matches = tree.xpath(selector)
-    if not matches:
-        return None
-    first = matches[0]
-    if attr is not None:
-        # On an element node, read the attribute; on a string result (e.g. the
-        # xpath already selected `@attr` or `text()`), use it directly.
-        value = first.get(attr) if hasattr(first, "get") else None
-        text = "" if value is None else str(value)
-    elif hasattr(first, "text_content"):
-        text = str(first.text_content()).strip()
-    else:
-        text = str(first).strip()
-    return text or None
+    def __init__(self, soup: BeautifulSoup, html: str) -> None:
+        self.soup = soup
+        self.html = html
+        self._lxml_tree: object | None = None
+        self._lxml_parsed = False
+
+    def _xpath_tree(self) -> object:
+        if not self._lxml_parsed:
+            try:
+                from lxml import html as lxml_html  # type: ignore[import-untyped]
+            except ImportError as exc:  # pragma: no cover - depends on install extra
+                raise RecipeError(
+                    "xpath selectors require lxml (install the 'ingestion' extra)"
+                ) from exc
+            self._lxml_tree = lxml_html.fromstring(self.html)
+            self._lxml_parsed = True
+        return self._lxml_tree
+
+    def eval_xpath(self, selector: str, attr: str | None) -> str | None:
+        tree = self._xpath_tree()
+        matches = tree.xpath(selector)  # type: ignore[attr-defined]
+        if not matches:
+            return None
+        first = matches[0]
+        if attr is not None:
+            # An element node -> read the attribute; a string result (the xpath
+            # already selected `@attr`/`text()`) -> use it directly.
+            value = first.get(attr) if hasattr(first, "get") else None
+            text = "" if value is None else str(value)
+        elif hasattr(first, "text_content"):
+            text = str(first.text_content()).strip()
+        else:
+            text = str(first).strip()
+        return text or None
+
+    def eval_selector(self, selector: Selector, attr: str | None) -> str | None:
+        """Evaluate one selector (CSS or XPath) and return its value or ``None``."""
+        if selector.type is SelectorType.XPATH:
+            return self.eval_xpath(selector.selector, attr)
+        return _eval_css(self.soup, selector.selector, attr)
 
 
-def _eval_selector(
-    soup: BeautifulSoup, html: str, selector: Selector, attr: str | None
-) -> str | None:
-    """Evaluate one selector (CSS or XPath) and return its value or ``None``."""
-    if selector.type is SelectorType.XPATH:
-        return _eval_xpath(html, selector.selector, attr)
-    return _eval_css(soup, selector.selector, attr)
-
-
-def _extract_field(soup: BeautifulSoup, html: str, name: str, spec: FieldSpec) -> FieldExtraction:
+def _extract_field(doc: ParsedDocument, name: str, spec: FieldSpec) -> FieldExtraction:
     """Run the ordered *selector* chain for one field (doc 18 §3.4).
 
     Tries ``spec.selectors`` in order; the first non-empty match wins. Index 0 is
     the primary (``method=primary``); any later hit is a fallback
     (``method=fallback``, which flags the document degraded). Takes the shared
-    DOM + raw html so ``extract()`` parses the document once regardless of field
-    count. The LLM-assisted and dead-letter rungs are applied by the caller
-    (:meth:`RecipeRunner._resolve_field`) because they need the raw text and the
-    injected LLM extractor.
+    :class:`ParsedDocument` so ``extract()`` parses the document once (CSS and,
+    lazily, XPath) regardless of field count. The LLM-assisted and dead-letter
+    rungs are applied by the caller (:meth:`RecipeRunner._resolve_field`) because
+    they need the raw text and the injected LLM extractor.
     """
     for index, selector in enumerate(spec.selectors):
-        value = _eval_selector(soup, html, selector, spec.attr)
+        value = doc.eval_selector(selector, spec.attr)
         if value is not None:
             return FieldExtraction(
                 name=name,
@@ -603,8 +617,7 @@ class RecipeRunner:
     def _resolve_field(
         self,
         *,
-        soup: BeautifulSoup,
-        html: str,
+        doc: ParsedDocument,
         page_text: str,
         name: str,
         spec: FieldSpec,
@@ -616,7 +629,7 @@ class RecipeRunner:
         winning :class:`FieldExtraction` and, when the field could not be
         extracted at all, a :class:`DeadLetterEntry` describing the miss.
         """
-        result = _extract_field(soup, html, name, spec)
+        result = _extract_field(doc, name, spec)
         if result.method is not ExtractionMethod.DEAD_LETTER:
             return result, None  # primary or fallback selector hit
 
@@ -656,15 +669,16 @@ class RecipeRunner:
         Each field is resolved primary → fallback(s) → optional LLM-assisted →
         dead-letter; the first non-empty result wins. A non-primary win flags the
         document ``degraded: true`` and ticks the per-recipe drift counters
-        (consumed later by E7). Required fields (``required: true``) that produce
-        nothing — even after the LLM rung — raise
-        :class:`RequiredFieldMissingError`: the boundary contract (doc 18 §3.1)
-        rejects invalid extractions rather than silently swallowing them. (The
-        accompanying dead-letter row still records the miss for replay.)
+        (consumed later by E7). A ``required: true`` field that produces nothing —
+        even after the LLM rung — raises :class:`RequiredFieldMissingError`: the
+        boundary contract (doc 18 §3.1) rejects an invalid extraction rather than
+        silently swallowing it. Because that aborts the whole document, the
+        dead-letter list returned here covers only *optional* fields that missed;
+        a required-field miss is signalled by the exception itself.
         """
-        soup = _parse_html(raw.content)  # parse once; shared across all fields
+        doc = ParsedDocument(_parse_html(raw.content), raw.content)  # parsed once
         # Visible text for the LLM rung; computed once and only when needed.
-        page_text = soup.get_text(" ", strip=True) if self._any_llm_assisted() else ""
+        page_text = doc.soup.get_text(" ", strip=True) if self._any_llm_assisted() else ""
 
         out: dict[str, str | None] = {}
         field_extractions: list[FieldExtraction] = []
@@ -674,7 +688,7 @@ class RecipeRunner:
 
         for name, spec in self.recipe.fields.items():
             result, dead_letter = self._resolve_field(
-                soup=soup, html=raw.content, page_text=page_text, name=name, spec=spec, raw=raw
+                doc=doc, page_text=page_text, name=name, spec=spec, raw=raw
             )
             field_extractions.append(result)
             out[name] = result.value
