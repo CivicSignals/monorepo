@@ -102,6 +102,9 @@ def test_put_if_absent_skips_upload_when_present() -> None:
         def get_object(self, **kwargs: object) -> object:  # pragma: no cover - unused
             return {}
 
+        def delete_object(self, **kwargs: object) -> object:  # pragma: no cover - unused
+            return {}
+
     client = _CountingClient()
     store = RawDocumentStorage(client, "bucket")
     data = b"same bytes"
@@ -124,6 +127,9 @@ def test_exists_reraises_non_404() -> None:
             return {}
 
         def get_object(self, **kwargs: object) -> object:  # pragma: no cover
+            return {}
+
+        def delete_object(self, **kwargs: object) -> object:  # pragma: no cover
             return {}
 
     store = RawDocumentStorage(_FailingClient(), "bucket")

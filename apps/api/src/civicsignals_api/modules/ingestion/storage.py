@@ -72,6 +72,8 @@ class SupportsS3(Protocol):
 
     def head_object(self, **kwargs: object) -> object: ...
 
+    def delete_object(self, **kwargs: object) -> object: ...
+
 
 def build_s3_client(settings: Settings | None = None) -> SupportsS3:
     """Build a boto3 S3 client from settings (MinIO in dev, AWS in prod).
@@ -121,15 +123,17 @@ class RawDocumentStorage:
         data: bytes,
         *,
         content_type: str = "application/octet-stream",
+        precomputed_hash: str | None = None,
     ) -> StoredObject:
         """Store ``data`` at its content address and return the :class:`StoredObject`.
 
         The key is ``sha256/<hash>``; storing the same bytes again writes the same
         key with byte-identical content (a harmless idempotent overwrite), so
         identical content dedupes to one object. ``ContentType`` is recorded as
-        object metadata for faithful round-tripping.
+        object metadata for faithful round-tripping. Pass ``precomputed_hash`` to
+        reuse a hash the caller already computed (avoids re-hashing large bytes).
         """
-        hash_hex = content_hash(data)
+        hash_hex = precomputed_hash or content_hash(data)
         key = key_for_hash(hash_hex)
         self._client.put_object(
             Bucket=self._bucket,
@@ -138,10 +142,7 @@ class RawDocumentStorage:
             ContentType=content_type,
         )
         return StoredObject(
-            key=key,
-            content_hash=hash_hex,
-            size=len(data),
-            content_type=content_type,
+            key=key, content_hash=hash_hex, size=len(data), content_type=content_type
         )
 
     def put_document_if_absent(
@@ -149,15 +150,17 @@ class RawDocumentStorage:
         data: bytes,
         *,
         content_type: str = "application/octet-stream",
+        precomputed_hash: str | None = None,
     ) -> StoredObject:
         """Like :meth:`put_document` but skip the upload when the object is present.
 
         Because storage is content-addressed, an object already at ``sha256/<hash>``
         is byte-identical to ``data`` — so a re-fetch of unchanged content costs one
         HEAD instead of a PUT. Always returns the :class:`StoredObject` (the content
-        address is computed locally regardless of whether an upload happened).
+        address is computed regardless of whether an upload happened).
+        ``precomputed_hash`` lets the caller reuse a hash it already computed.
         """
-        hash_hex = content_hash(data)
+        hash_hex = precomputed_hash or content_hash(data)
         key = key_for_hash(hash_hex)
         if not self.exists(key):
             self._client.put_object(
@@ -167,17 +170,22 @@ class RawDocumentStorage:
                 ContentType=content_type,
             )
         return StoredObject(
-            key=key,
-            content_hash=hash_hex,
-            size=len(data),
-            content_type=content_type,
+            key=key, content_hash=hash_hex, size=len(data), content_type=content_type
         )
 
     def get_document(self, key: str) -> bytes:
-        """Fetch the raw bytes stored at ``key`` (raises if the key is absent)."""
+        """Fetch the raw bytes stored at ``key`` (raises if the key is absent).
+
+        The boto3 ``StreamingBody`` is closed after reading so the underlying HTTP
+        connection is returned to the pool promptly — leaving it open in a
+        long-running worker would leak sockets.
+        """
         response = self._client.get_object(Bucket=self._bucket, Key=key)
         body = response["Body"]  # type: ignore[index]  # boto3 StreamingBody
-        data: bytes = body.read()
+        try:
+            data: bytes = body.read()
+        finally:
+            body.close()
         return data
 
     def exists(self, key: str) -> bool:

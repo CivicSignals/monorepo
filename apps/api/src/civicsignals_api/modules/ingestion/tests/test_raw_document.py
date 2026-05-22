@@ -33,7 +33,7 @@ from civicsignals_api.db import Base
 from civicsignals_api.modules.entities.models import Entity
 from civicsignals_api.modules.ingestion import services
 from civicsignals_api.modules.ingestion.models import RawDocument
-from civicsignals_api.modules.ingestion.storage import RawDocumentStorage, StoredObject
+from civicsignals_api.modules.ingestion.storage import RawDocumentStorage
 
 _DSN = (
     os.environ.get("INGESTION_TEST_DSN")
@@ -143,26 +143,28 @@ async def test_store_persists_provenance_and_bytes(
     await session.rollback()
 
 
-class _CountingStorage(RawDocumentStorage):
-    """A storage that counts its conditional-upload calls, so a test can assert the
-    dedupe path issues no S3 write (the bytes are already stored). Subclasses the
-    real storage and reuses its bucket/client; only the counter is added."""
+class _PutCountingStorage(RawDocumentStorage):
+    """A storage that counts actual S3 ``put_object`` calls, so a test can assert
+    the dedupe path issues no *write* (it may HEAD, but the content-addressed
+    object is already present so no PUT happens). Subclasses the real storage and
+    wraps the client's ``put_object`` to tally writes."""
 
     def __init__(self, inner: RawDocumentStorage) -> None:
         super().__init__(inner._client, inner.bucket)
-        self.if_absent_calls = 0
+        self.puts = 0
+        real_put = inner._client.put_object
 
-    def put_document_if_absent(
-        self, data: bytes, *, content_type: str = "application/octet-stream"
-    ) -> StoredObject:
-        self.if_absent_calls += 1
-        return super().put_document_if_absent(data, content_type=content_type)
+        def _counting_put(**kwargs: object) -> object:
+            self.puts += 1
+            return real_put(**kwargs)
+
+        self._client.put_object = _counting_put  # type: ignore[method-assign]
 
 
 async def test_store_is_idempotent_on_recipe_and_hash(
     session: AsyncSession, storage: RawDocumentStorage
 ) -> None:
-    counting = _CountingStorage(storage)
+    counting = _PutCountingStorage(storage)
     content = b"identical fetched content"
     async with session.begin():
         first = await services.store_raw_document(
@@ -188,8 +190,9 @@ async def test_store_is_idempotent_on_recipe_and_hash(
     assert second.deduped is True
     assert second.id == first.id
     assert second.content_hash == first.content_hash
-    # The dedupe path short-circuits on the DB row and never touches S3.
-    assert counting.if_absent_calls == 1
+    # Uploaded exactly once across both calls: the dedupe path finds the object
+    # already present and issues no second PUT.
+    assert counting.puts == 1
 
     # Exactly one row exists for this (recipe_id, content_hash).
     rows = (
@@ -198,6 +201,42 @@ async def test_store_is_idempotent_on_recipe_and_hash(
         .all()
     )
     assert len(rows) == 1
+    await session.rollback()
+
+
+async def test_dedupe_path_reuploads_when_blob_missing(
+    session: AsyncSession, storage: RawDocumentStorage
+) -> None:
+    """If the S3 object was deleted out-of-band, the dedupe path restores it so the
+    row's ``blob_key`` stays readable (doc 18 §3.6: the snapshot is the source of
+    truth)."""
+    content = b"snapshot that gets deleted from S3"
+    async with session.begin():
+        stored = await services.store_raw_document(
+            session,
+            storage,
+            content=content,
+            recipe_id="r_blob",
+            connector="http_static",
+            source_url="https://example.gov/blob",
+        )
+    # Simulate an out-of-band deletion of the blob.
+    storage._client.delete_object(Bucket=storage.bucket, Key=stored.blob_key)
+    assert storage.exists(stored.blob_key) is False
+
+    # Re-storing the same (recipe_id, content) dedupes the row but restores the blob.
+    async with session.begin():
+        again = await services.store_raw_document(
+            session,
+            storage,
+            content=content,
+            recipe_id="r_blob",
+            connector="http_static",
+            source_url="https://example.gov/blob",
+        )
+    assert again.deduped is True
+    assert again.id == stored.id
+    assert storage.get_document(stored.blob_key) == content
     await session.rollback()
 
 

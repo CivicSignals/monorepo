@@ -87,31 +87,39 @@ async def store_raw_document(
     re-selects, so two ingest workers racing on the same content can't trip the
     UNIQUE constraint — the loser simply observes ``deduped=True``.
 
-    The caller owns the transaction: this flushes (to materialize the row) but does
-    **not** commit, so it composes inside a larger unit of work. ``fetched_at``
-    defaults to ``datetime.now(UTC)`` (set explicitly for provenance rather than
-    relying on the DB ``server_default``).
+    The caller owns the transaction: this does **not** commit, so it composes
+    inside a larger unit of work. ``fetched_at`` defaults to ``datetime.now(UTC)``
+    (set explicitly for provenance rather than relying on the DB ``server_default``).
     """
     from datetime import UTC
 
     fetched_at = fetched_at or datetime.now(UTC)
-    content_hash = storage_module.content_hash(content)
+    # Hash the bytes exactly once and reuse it for the lookup *and* the upload
+    # (the storage methods accept ``precomputed_hash`` so large docs aren't
+    # re-hashed).
+    doc_hash = storage_module.content_hash(content)
 
-    # Short-circuit: an existing row means the bytes are already stored (the key
-    # is the hash), so we neither re-upload nor re-insert (doc 18 §3.6).
-    existing = await _find_by_recipe_and_hash(session, recipe_id, content_hash)
+    # Short-circuit: an existing row means we don't re-insert. But the S3 object
+    # could have been deleted/expired out-of-band, which would leave ``blob_key``
+    # unreadable — so still ensure the bytes are present (a no-op PUT when they
+    # are), then return the existing provenance row (doc 18 §3.6).
+    existing = await _find_by_recipe_and_hash(session, recipe_id, doc_hash)
     if existing is not None:
+        storage.put_document_if_absent(
+            content, content_type=content_type, precomputed_hash=doc_hash
+        )
         return _to_schema(existing, deduped=True)
 
     # New content: upload (skipping the PUT if the object is already present) then
     # insert idempotently. ON CONFLICT DO NOTHING makes the SELECT->INSERT safe
     # under concurrent ingestion of identical content.
-    stored = storage.put_document_if_absent(content, content_type=content_type)
-    new_id = uuid.uuid4()
+    stored = storage.put_document_if_absent(
+        content, content_type=content_type, precomputed_hash=doc_hash
+    )
     stmt = (
         pg_insert(RawDocument)
         .values(
-            id=new_id,
+            id=uuid.uuid4(),
             recipe_id=recipe_id,
             recipe_version=recipe_version,
             connector=connector,
@@ -129,11 +137,10 @@ async def store_raw_document(
         .returning(RawDocument.id)
     )
     inserted_id = (await session.execute(stmt)).scalar_one_or_none()
-    await session.flush()
 
     if inserted_id is None:
         # A concurrent writer won the race; re-select the row it inserted.
-        existing = await _find_by_recipe_and_hash(session, recipe_id, content_hash)
+        existing = await _find_by_recipe_and_hash(session, recipe_id, doc_hash)
         assert existing is not None  # the conflicting row must exist post-insert
         return _to_schema(existing, deduped=True)
 
