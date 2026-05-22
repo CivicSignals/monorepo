@@ -45,11 +45,10 @@ spec:
             {{- toYaml .Values.workerIngest.args | nindent 12 }}
           env:
             {{- include "civicsignals.apiEnv" . | nindent 12 }}
-            - name: CELERY_CONCURRENCY
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "civicsignals.fullname" . }}-config
-                  key: CELERY_INGEST_CONCURRENCY
+            # CELERYD_CONCURRENCY is read natively by Celery and controls the
+            # worker pool size without requiring changes to docker-entrypoint.sh.
+            - name: CELERYD_CONCURRENCY
+              value: {{ .Values.config.celeryIngestConcurrency | quote }}
             {{- with .Values.workerIngest.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

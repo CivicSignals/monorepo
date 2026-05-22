@@ -3,4 +3,4 @@
 .DS_Store
 # CI artifacts
 *.orig
-*.lock
+# NOTE: do NOT ignore *.lock — Chart.lock must be included for reproducible builds.

@@ -35,6 +35,10 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
+  # automountServiceAccountToken=false by default for security (no K8s API access needed).
+  # Set to true (or use SA annotations) when using cloud IAM integrations such as
+  # AWS IRSA (EKS) or GKE Workload Identity that rely on projected SA tokens.
+  automountServiceAccountToken: false
 
 # ---------------------------------------------------------------------------
 # Pod-level settings (applies to all deployments unless overridden per-component)
@@ -167,6 +171,7 @@ workerIngest:
   enabled: true
   replicaCount: 2
   command: ["/app/docker-entrypoint.sh"]
+  # The entrypoint passes --concurrency $CELERY_CONCURRENCY when set (see templates).
   args: ["worker_ingest"]
 
   resources:
@@ -329,10 +334,11 @@ ingress:
       secretName: civicsignals-web-tls
 
   # API backend
+  # For single-host setups, set api.host = web.host and api.path = /api
   api:
     host: api.civicsignals.example.com
-    # or use a path prefix on the same host:
-    # pathPrefix: /api
+    # path: "/" for dedicated subdomain, or "/api" for single-host path routing
+    path: "/"
     tls:
       enabled: false
       secretName: civicsignals-api-tls
@@ -345,10 +351,21 @@ secrets:
   # Postgres connection strings (PgBouncer + direct)
   # In production, DATABASE_URL points at PgBouncer (port 6432).
   # DATABASE_DIRECT_URL bypasses it (port 5432) for Alembic, LISTEN/NOTIFY.
-  databaseUrl: "postgresql+asyncpg://civicsignals:CHANGEME@pgbouncer:6432/civicsignals"
-  databaseDirectUrl: "postgresql+psycopg://civicsignals:CHANGEME@postgres:5432/civicsignals"
+  #
+  # Hostname placeholders: when using the bundled PgBouncer, use:
+  #   <release-name>-civicsignals-pgbouncer:6432
+  # When using bundled postgres directly (no pgbouncer), use:
+  #   <release-name>-postgresql:5432
+  # Alembic uses async_engine_from_config so both URLs must use an async driver.
+  databaseUrl: "postgresql+asyncpg://civicsignals:CHANGEME@RELEASE-NAME-civicsignals-pgbouncer:6432/civicsignals"
+  databaseDirectUrl: "postgresql+asyncpg://civicsignals:CHANGEME@RELEASE-NAME-civicsignals-pgbouncer:6432/civicsignals"
 
-  redisUrl: "redis://redis:6379/0"
+  # Celery broker + result backend (separate Redis DBs to avoid key collisions)
+  # When using bundled Redis: redis://RELEASE-NAME-redis-master:6379/1
+  celeryBrokerUrl: "redis://RELEASE-NAME-civicsignals-redis-master:6379/1"
+  celeryResultBackend: "redis://RELEASE-NAME-civicsignals-redis-master:6379/2"
+
+  redisUrl: "redis://RELEASE-NAME-civicsignals-redis-master:6379/0"
 
   # S3 / MinIO credentials
   s3AccessKeyId: "CHANGEME"
@@ -366,7 +383,13 @@ secrets:
   smtpPort: "587"
   smtpUser: "resend"
   smtpPassword: ""
-  smtpFromEmail: "noreply@civicsignals.example.com"
+  # Matches Settings.email_from (env var EMAIL_FROM) in apps/api/src/civicsignals_api/config.py
+  emailFrom: "noreply@civicsignals.example.com"
+
+  # PgBouncer DB password (used by the bundled PgBouncer Deployment).
+  # Set to the Postgres user password; not needed when bundled.postgres.enabled=true
+  # if the bundled subchart manages credentials internally.
+  pgbouncerDbPassword: "CHANGEME"
 
   # Sentry (optional; leave empty to disable)
   sentryDsn: ""
@@ -375,23 +398,26 @@ secrets:
 # ConfigMap (non-secret runtime config)
 # ---------------------------------------------------------------------------
 config:
-  # S3 endpoint — empty string = AWS S3; set to MinIO URL for bundled/eval
-  s3Endpoint: ""
-  s3Bucket: "civicsignals"
+  # S3 settings — env var names match apps/api/src/civicsignals_api/config.py Settings
+  # S3_ENDPOINT_URL: empty string = AWS S3; set to MinIO URL for bundled/eval
+  # e.g. "http://RELEASE-NAME-civicsignals-minio:9000" when bundled.minio.enabled=true
+  s3EndpointUrl: ""
+  s3RawBucket: "civicsignals"
   s3Region: "us-east-1"
 
-  # Log level: debug | info | warning | error
-  logLevel: "info"
+  # Log level: DEBUG | INFO | WARNING | ERROR
+  logLevel: "INFO"
 
-  # Feature flags
-  enableSentry: "false"
-  enableTelemetry: "true"   # anonymised, opt-in for self-host
+  # Environment label (development | staging | production)
+  environment: "production"
 
   # API public base URL (used for webhook callbacks, email links)
   apiBaseUrl: "https://api.civicsignals.example.com"
   webBaseUrl: "https://civicsignals.example.com"
 
-  # Celery concurrency per worker type
+  # Celery concurrency per worker type.
+  # Passed via --concurrency flag in the worker entrypoint args.
+  # Increase for CPU-bound workers; tune alongside resource limits.
   celeryIngestConcurrency: "4"
   celeryExtractConcurrency: "2"
   celeryScoreConcurrency: "4"
@@ -447,8 +473,20 @@ pgbouncer:
   replicaCount: 1
   image:
     repository: edoburu/pgbouncer
-    tag: "latest"
+    # Pin to a specific version for reproducibility; bump explicitly on upgrade.
+    tag: "1.23.1"
     pullPolicy: IfNotPresent
+
+  # edoburu/pgbouncer connection parameters (DB_HOST / DB_USER / etc.)
+  # Defaults assume the bundled postgresql subchart; override for external RDS.
+  # dbHost defaults to "<release>-postgresql" (Bitnami subchart Service name).
+  dbHost: ""       # e.g. "my-rds.cluster.us-east-1.rds.amazonaws.com"
+  dbPort: "5432"
+  dbUser: "civicsignals"
+  dbName: "civicsignals"
+  # DB_PASSWORD is read from secrets.pgbouncerDbPassword; add it to your
+  # values override.  It defaults to "" (no auth) which is only safe in dev.
+
   resources:
     requests:
       cpu: 50m

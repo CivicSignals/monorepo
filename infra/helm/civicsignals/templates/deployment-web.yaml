@@ -52,7 +52,8 @@ spec:
               containerPort: 3000
               protocol: TCP
           env:
-            - name: NEXT_PUBLIC_API_URL
+            # Matches NEXT_PUBLIC_API_BASE_URL in apps/web/.env.example
+            - name: NEXT_PUBLIC_API_BASE_URL
               valueFrom:
                 configMapKeyRef:
                   name: {{ include "civicsignals.fullname" . }}-config

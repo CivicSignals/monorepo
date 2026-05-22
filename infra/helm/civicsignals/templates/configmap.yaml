@@ -1,4 +1,5 @@
 # CivicSignals — non-secret runtime configuration
+# Env var names match Settings in apps/api/src/civicsignals_api/config.py.
 # task O3 / doc 06 §10
 # SPDX-License-Identifier: AGPL-3.0-only
 apiVersion: v1
@@ -8,14 +9,20 @@ metadata:
   labels:
     {{- include "civicsignals.labels" . | nindent 4 }}
 data:
-  S3_ENDPOINT: {{ .Values.config.s3Endpoint | quote }}
-  S3_BUCKET: {{ .Values.config.s3Bucket | quote }}
+  # Settings.s3_endpoint_url (None = AWS S3; set for MinIO)
+  S3_ENDPOINT_URL: {{ .Values.config.s3EndpointUrl | quote }}
+  # Settings.s3_raw_bucket
+  S3_RAW_BUCKET: {{ .Values.config.s3RawBucket | quote }}
+  # Settings.s3_region
   S3_REGION: {{ .Values.config.s3Region | quote }}
+  # Settings.log_level
   LOG_LEVEL: {{ .Values.config.logLevel | quote }}
-  ENABLE_SENTRY: {{ .Values.config.enableSentry | quote }}
-  ENABLE_TELEMETRY: {{ .Values.config.enableTelemetry | quote }}
+  # Settings.environment
+  ENVIRONMENT: {{ .Values.config.environment | quote }}
+  # Public URLs (informational; used in email links, webhooks)
   API_BASE_URL: {{ .Values.config.apiBaseUrl | quote }}
   WEB_BASE_URL: {{ .Values.config.webBaseUrl | quote }}
+  # Celery worker concurrency (passed as --concurrency to celery worker)
   CELERY_INGEST_CONCURRENCY: {{ .Values.config.celeryIngestConcurrency | quote }}
   CELERY_EXTRACT_CONCURRENCY: {{ .Values.config.celeryExtractConcurrency | quote }}
   CELERY_SCORE_CONCURRENCY: {{ .Values.config.celeryScoreConcurrency | quote }}

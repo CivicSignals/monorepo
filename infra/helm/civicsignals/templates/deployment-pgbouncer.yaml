@@ -4,8 +4,9 @@
 # than directly to Postgres. This caps backend connections at ~25-40 per RDS
 # instance even when many worker pods are running (doc 06 §4).
 #
-# When bundled.postgres.enabled=true this is optional; when using external
-# RDS it is strongly recommended (pgbouncer.enabled=true, the default).
+# The edoburu/pgbouncer image is configured via DB_HOST, DB_USER, DB_PASSWORD,
+# DB_NAME env vars (not a connection URL). See infra/docker-compose.yml for the
+# reference configuration.
 #
 # task O3 / doc 06 §4, §10
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -47,15 +48,27 @@ spec:
               containerPort: 6432
               protocol: TCP
           env:
-            # The database hostname/credentials come from the DATABASE_DIRECT_URL secret.
-            # Operators can also provide DB_HOST, DB_USER, DB_PASSWORD, DB_NAME directly.
-            - name: DATABASE_DIRECT_URL
+            # edoburu/pgbouncer expects individual connection parameters,
+            # not a connection URL.  Override these via pgbouncer.extraEnv
+            # or set pgbouncer.dbHost/dbUser/dbPassword/dbName in values.
+            - name: DB_HOST
+              value: {{ .Values.pgbouncer.dbHost | default (printf "%s-postgresql" (include "civicsignals.fullname" .)) | quote }}
+            - name: DB_PORT
+              value: {{ .Values.pgbouncer.dbPort | default "5432" | quote }}
+            - name: DB_USER
+              value: {{ .Values.pgbouncer.dbUser | default "civicsignals" | quote }}
+            - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "civicsignals.fullname" . }}-secret
-                  key: DATABASE_DIRECT_URL
+                  key: PGBOUNCER_DB_PASSWORD
+                  optional: true
+            - name: DB_NAME
+              value: {{ .Values.pgbouncer.dbName | default "civicsignals" | quote }}
             - name: POOL_MODE
               value: "transaction"
+            - name: AUTH_TYPE
+              value: "scram-sha-256"
             - name: MAX_CLIENT_CONN
               value: "1000"
             - name: DEFAULT_POOL_SIZE

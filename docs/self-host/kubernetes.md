@@ -4,7 +4,10 @@
 
 This document is a stub.  A complete Kubernetes self-host guide is planned for Q4.
 
-## Quick start (evaluation)
+## Quick start (evaluation — bundled datastores)
+
+> **Warning:** bundled datastores are suitable for evaluation only.
+> Use managed Postgres (RDS), Redis (ElastiCache), and S3 for production.
 
 ```bash
 # 1. Add the bitnami repo (bundled datastores use bitnami subcharts)
@@ -16,13 +19,26 @@ git clone https://github.com/CivicSignals/monorepo.git
 cd monorepo
 helm dependency update infra/helm/civicsignals
 
-# 3. Install with bundled datastores (NOT for production)
+# 3. Install with bundled datastores
+#    Service names inside the cluster will be:
+#      Postgres:  civicsignals-postgresql:5432
+#      Redis:     civicsignals-redis-master:6379
+#      MinIO:     civicsignals-minio:9000
+#      PgBouncer: civicsignals-civicsignals-pgbouncer:6432
 helm upgrade --install civicsignals infra/helm/civicsignals \
   --namespace civicsignals \
   --create-namespace \
   --set bundled.postgres.enabled=true \
   --set bundled.redis.enabled=true \
   --set bundled.minio.enabled=true \
+  --set secrets.databaseUrl="postgresql+asyncpg://civicsignals:civicsignals@civicsignals-civicsignals-pgbouncer:6432/civicsignals" \
+  --set secrets.databaseDirectUrl="postgresql+asyncpg://civicsignals:civicsignals@civicsignals-postgresql:5432/civicsignals" \
+  --set secrets.celeryBrokerUrl="redis://civicsignals-redis-master:6379/1" \
+  --set secrets.celeryResultBackend="redis://civicsignals-redis-master:6379/2" \
+  --set secrets.redisUrl="redis://civicsignals-redis-master:6379/0" \
+  --set config.s3EndpointUrl="http://civicsignals-minio:9000" \
+  --set secrets.s3AccessKeyId="civicsignals" \
+  --set secrets.s3SecretAccessKey="civicsignals" \
   --set secrets.secretKey="$(openssl rand -hex 32)" \
   --set ingress.web.host=civicsignals.example.com \
   --set ingress.api.host=api.civicsignals.example.com
@@ -31,22 +47,33 @@ helm upgrade --install civicsignals infra/helm/civicsignals \
 ## Production (external managed datastores)
 
 For production, point the chart at your managed Postgres (RDS), Redis
-(ElastiCache), and S3 bucket:
+(ElastiCache), and S3 bucket.  No bundled subcharts are needed.
 
 ```bash
 helm upgrade --install civicsignals infra/helm/civicsignals \
   --namespace civicsignals \
   --create-namespace \
   --set secrets.databaseUrl="postgresql+asyncpg://user:pass@your-pgbouncer:6432/civicsignals" \
-  --set secrets.databaseDirectUrl="postgresql+psycopg://user:pass@your-rds:5432/civicsignals" \
-  --set secrets.redisUrl="redis://your-elasticache:6379/0" \
+  --set secrets.databaseDirectUrl="postgresql+asyncpg://user:pass@your-rds.cluster.us-east-1.rds.amazonaws.com:5432/civicsignals" \
+  --set secrets.celeryBrokerUrl="redis://your-elasticache.cache.amazonaws.com:6379/1" \
+  --set secrets.celeryResultBackend="redis://your-elasticache.cache.amazonaws.com:6379/2" \
+  --set secrets.redisUrl="redis://your-elasticache.cache.amazonaws.com:6379/0" \
   --set secrets.s3AccessKeyId="AK..." \
   --set secrets.s3SecretAccessKey="..." \
-  --set config.s3Bucket="civicsignals-prod" \
+  --set config.s3RawBucket="civicsignals-prod" \
   --set config.s3Region="us-east-1" \
   --set secrets.secretKey="$(openssl rand -hex 32)" \
   --set ingress.web.host=civicsignals.example.com \
   --set ingress.api.host=api.civicsignals.example.com
+```
+
+## Single-host ingress (api + web on same domain)
+
+```bash
+helm upgrade --install civicsignals infra/helm/civicsignals \
+  --set ingress.web.host=civicsignals.example.com \
+  --set ingress.api.host=civicsignals.example.com \
+  --set ingress.api.path=/api
 ```
 
 ## Secrets management

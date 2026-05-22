@@ -1,6 +1,7 @@
 {{/*
 CivicSignals Helm chart — template helpers
 task O3 / doc 06 §10
+Env var names align with Settings in apps/api/src/civicsignals_api/config.py.
 SPDX-License-Identifier: AGPL-3.0-only
 */}}
 
@@ -84,10 +85,11 @@ Resolved Web image (repo + tag).  Tag falls back to .Chart.AppVersion.
 
 {{/*
 Standard environment references injected into every API-family container.
+Env var names match Settings in apps/api/src/civicsignals_api/config.py.
 Pulls from the Secret and ConfigMap created by this chart.
 */}}
 {{- define "civicsignals.apiEnv" -}}
-# --- from Secret ---
+# --- from Secret (sensitive values) ---
 - name: DATABASE_URL
   valueFrom:
     secretKeyRef:
@@ -103,6 +105,16 @@ Pulls from the Secret and ConfigMap created by this chart.
     secretKeyRef:
       name: {{ include "civicsignals.fullname" . }}-secret
       key: REDIS_URL
+- name: CELERY_BROKER_URL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "civicsignals.fullname" . }}-secret
+      key: CELERY_BROKER_URL
+- name: CELERY_RESULT_BACKEND
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "civicsignals.fullname" . }}-secret
+      key: CELERY_RESULT_BACKEND
 - name: S3_ACCESS_KEY_ID
   valueFrom:
     secretKeyRef:
@@ -148,55 +160,46 @@ Pulls from the Secret and ConfigMap created by this chart.
     secretKeyRef:
       name: {{ include "civicsignals.fullname" . }}-secret
       key: SMTP_PASSWORD
-- name: SMTP_FROM_EMAIL
+# Settings.email_from (env var EMAIL_FROM)
+- name: EMAIL_FROM
   valueFrom:
     secretKeyRef:
       name: {{ include "civicsignals.fullname" . }}-secret
-      key: SMTP_FROM_EMAIL
+      key: EMAIL_FROM
 - name: SENTRY_DSN
   valueFrom:
     secretKeyRef:
       name: {{ include "civicsignals.fullname" . }}-secret
       key: SENTRY_DSN
-# --- from ConfigMap ---
-- name: S3_ENDPOINT
+# --- from ConfigMap (non-sensitive config) ---
+# Settings.s3_endpoint_url
+- name: S3_ENDPOINT_URL
   valueFrom:
     configMapKeyRef:
       name: {{ include "civicsignals.fullname" . }}-config
-      key: S3_ENDPOINT
-- name: S3_BUCKET
+      key: S3_ENDPOINT_URL
+# Settings.s3_raw_bucket
+- name: S3_RAW_BUCKET
   valueFrom:
     configMapKeyRef:
       name: {{ include "civicsignals.fullname" . }}-config
-      key: S3_BUCKET
+      key: S3_RAW_BUCKET
+# Settings.s3_region
 - name: S3_REGION
   valueFrom:
     configMapKeyRef:
       name: {{ include "civicsignals.fullname" . }}-config
       key: S3_REGION
+# Settings.log_level
 - name: LOG_LEVEL
   valueFrom:
     configMapKeyRef:
       name: {{ include "civicsignals.fullname" . }}-config
       key: LOG_LEVEL
-- name: ENABLE_SENTRY
+# Settings.environment
+- name: ENVIRONMENT
   valueFrom:
     configMapKeyRef:
       name: {{ include "civicsignals.fullname" . }}-config
-      key: ENABLE_SENTRY
-- name: ENABLE_TELEMETRY
-  valueFrom:
-    configMapKeyRef:
-      name: {{ include "civicsignals.fullname" . }}-config
-      key: ENABLE_TELEMETRY
-- name: API_BASE_URL
-  valueFrom:
-    configMapKeyRef:
-      name: {{ include "civicsignals.fullname" . }}-config
-      key: API_BASE_URL
-- name: WEB_BASE_URL
-  valueFrom:
-    configMapKeyRef:
-      name: {{ include "civicsignals.fullname" . }}-config
-      key: WEB_BASE_URL
+      key: ENVIRONMENT
 {{- end }}
