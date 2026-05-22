@@ -32,6 +32,7 @@ from civicsignals_api.modules.accounts.models import (  # noqa: F401  register t
     Workspace,
 )
 from civicsignals_api.modules.auth.models import (  # noqa: F401  register tables
+    ApiToken,
     EmailVerificationToken,
 )
 

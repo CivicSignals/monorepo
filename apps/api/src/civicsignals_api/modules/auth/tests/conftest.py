@@ -32,8 +32,14 @@ from sqlalchemy.pool import NullPool
 
 from civicsignals_api.db import Base, get_session
 from civicsignals_api.main import app
-from civicsignals_api.modules.accounts.models import User  # noqa: F401  registers the table
+from civicsignals_api.modules.accounts.models import (  # noqa: F401  registers the tables
+    Membership,
+    Organization,
+    User,
+    Workspace,
+)
 from civicsignals_api.modules.auth.models import (  # noqa: F401  registers the table
+    ApiToken,
     EmailVerificationToken,
     PasswordResetToken,
 )

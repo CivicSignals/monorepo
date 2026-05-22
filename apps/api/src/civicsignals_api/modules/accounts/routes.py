@@ -29,10 +29,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api import events
 from civicsignals_api.db import get_session
+from civicsignals_api.modules.auth import services as auth_services
 from civicsignals_api.modules.auth.dependencies import (
     CurrentUser,
     RequireAdmin,
     WorkspaceContext,
+)
+from civicsignals_api.modules.auth.models import ApiToken, ApiTokenType
+from civicsignals_api.modules.auth.schemas import (
+    ApiTokenCreate,
+    ApiTokenCreated,
+    ApiTokenList,
+    ApiTokenOut,
 )
 from civicsignals_api.problems import ProblemException
 
@@ -313,6 +321,116 @@ async def update_member_role(
     except Exception:
         logger.warning("member_role_changed_event_failed", workspace_id=str(workspace_id))
     return MemberOut.model_validate(target)
+
+
+# --- Workspace API tokens (B8) ----------------------------------------------
+# Server-to-server integration tokens scoped to one workspace (doc 08 §1.3,
+# resource map ``/workspaces/{id}/api-tokens``). Issuing/listing/revoking is an
+# *admin* capability (``RequireAdmin``); the secret is revealed once on create
+# and never again (threat-model §4.2). Personal access tokens (acting as the
+# user across workspaces) live under ``/auth/tokens`` in the auth module.
+
+
+def _bad_token_scopes(invalid: list[str]) -> ProblemException:
+    return ProblemException(
+        status=422,
+        code="invalid_scope",
+        title="Unknown token scope",
+        detail=f"Unknown scope(s): {', '.join(invalid)}.",
+        errors=[{"field": "scopes", "code": "unknown_scope", "message": s} for s in invalid],
+    )
+
+
+@workspaces_router.post(
+    "/{workspace_id}/api-tokens",
+    response_model=ApiTokenCreated,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a workspace API token (admin only, revealed once)",
+)
+async def create_api_token(
+    workspace_id: uuid.UUID,
+    body: ApiTokenCreate,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    response: Response,
+) -> ApiTokenCreated:
+    """Mint a workspace-scoped API token; the plaintext is returned **once**.
+
+    Requires the ``admin`` role (doc 06 §6). The token is bound to this
+    workspace and cannot reach any other tenant. The secret in ``token`` is never
+    retrievable again.
+    """
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    try:
+        issued = await auth_services.create_api_token(
+            session,
+            token_type=ApiTokenType.WORKSPACE,
+            name=body.name,
+            scopes=body.scopes,
+            user_id=ctx.user.id,
+            created_by_user_id=ctx.user.id,
+            workspace_id=workspace_id,
+            expires_at=body.expires_at,
+        )
+        await session.commit()
+    except auth_services.InvalidScopeError as exc:
+        await session.rollback()
+        raise _bad_token_scopes(exc.invalid) from exc
+
+    response.headers["Location"] = f"/api/v1/workspaces/{workspace_id}/api-tokens/{issued.token.id}"
+    out = ApiTokenOut.model_validate(issued.token)
+    return ApiTokenCreated(**out.model_dump(), token=issued.plaintext)
+
+
+@workspaces_router.get(
+    "/{workspace_id}/api-tokens",
+    response_model=ApiTokenList,
+    summary="List workspace API tokens (admin only, no secrets)",
+)
+async def list_api_tokens(
+    workspace_id: uuid.UUID, ctx: RequireAdmin, session: SessionDep
+) -> ApiTokenList:
+    """List the workspace's API tokens as metadata only — secrets never returned."""
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    tokens = await auth_services.list_workspace_api_tokens(session, workspace_id)
+    return ApiTokenList(items=[ApiTokenOut.model_validate(t) for t in tokens])
+
+
+def _resolve_workspace_token(token: ApiToken | None, workspace_id: uuid.UUID) -> ApiToken:
+    """Resolve a workspace token belonging to ``workspace_id`` or raise ``404``."""
+    if (
+        token is None
+        or token.token_type is not ApiTokenType.WORKSPACE
+        or token.workspace_id != workspace_id
+    ):
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Token not found",
+            detail="No such API token in this workspace.",
+        )
+    return token
+
+
+@workspaces_router.delete(
+    "/{workspace_id}/api-tokens/{token_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a workspace API token (admin only)",
+)
+async def revoke_api_token(
+    workspace_id: uuid.UUID,
+    token_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> Response:
+    """Revoke a workspace API token. Requires ``admin``; idempotent, immediate."""
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    token = _resolve_workspace_token(
+        await auth_services.get_api_token(session, token_id), workspace_id
+    )
+    await auth_services.revoke_api_token(session, token)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 router.include_router(accounts_router)
