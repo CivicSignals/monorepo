@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -588,3 +588,85 @@ async def delete_item(
     item = await get_item(session, workspace_id, item_id)
     await session.delete(item)
     await session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Reporting (J5)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class StageRollupRow:
+    """One row in the per-stage rollup produced by :func:`rollup_by_stage`.
+
+    ``item_count`` — total items in this stage.
+    ``total_value`` — sum of non-null value_estimate; ``None`` when no values.
+    """
+
+    stage_id: uuid.UUID
+    stage_name: str
+    stage_position: int
+    item_count: int
+    total_value: Decimal | None
+
+
+@dataclass(slots=True)
+class PipelineRollup:
+    """Workspace-level rollup returned by :func:`rollup_by_stage` (J5)."""
+
+    stages: list[StageRollupRow]
+    total_items: int
+    total_value: Decimal | None
+
+
+async def rollup_by_stage(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+) -> PipelineRollup:
+    """Return per-stage item counts + summed value_estimate for a workspace (J5).
+
+    Issues a single grouped SQL query (JOIN pipeline_stage → GROUP BY stage)
+    so there is no N+1. Stages with zero items are included (LEFT JOIN) so the
+    report always shows all configured stages even when empty. Results are
+    ordered by stage position. Workspace-isolated — callers pass workspace_id;
+    no cross-workspace data leaks.
+    """
+    # LEFT JOIN so stages with 0 items still appear.
+    stmt = (
+        select(
+            PipelineStage.id,
+            PipelineStage.name,
+            PipelineStage.position,
+            func.count(PipelineItem.id).label("item_count"),
+            func.sum(PipelineItem.value_estimate).label("total_value"),
+        )
+        .select_from(PipelineStage)
+        .outerjoin(
+            PipelineItem,
+            (PipelineItem.stage_id == PipelineStage.id)
+            & (PipelineItem.workspace_id == workspace_id),
+        )
+        .where(PipelineStage.workspace_id == workspace_id)
+        .group_by(PipelineStage.id, PipelineStage.name, PipelineStage.position)
+        .order_by(PipelineStage.position, PipelineStage.id)
+    )
+
+    rows = (await session.execute(stmt)).all()
+
+    stage_rows: list[StageRollupRow] = [
+        StageRollupRow(
+            stage_id=row.id,
+            stage_name=row.name,
+            stage_position=row.position,
+            item_count=int(row.item_count),
+            total_value=Decimal(str(row.total_value)) if row.total_value is not None else None,
+        )
+        for row in rows
+    ]
+
+    total_items = sum(r.item_count for r in stage_rows)
+    # Sum only stages that have at least one valued item; return None if nothing.
+    valued = [r.total_value for r in stage_rows if r.total_value is not None]
+    total_value: Decimal | None = sum(valued, Decimal("0")) if valued else None
+
+    return PipelineRollup(stages=stage_rows, total_items=total_items, total_value=total_value)

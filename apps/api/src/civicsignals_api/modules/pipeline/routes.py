@@ -46,10 +46,12 @@ from .schemas import (
     ItemOut,
     ItemPage,
     ItemUpdate,
+    PipelineReport,
     StageCreate,
     StageOut,
     StagePage,
     StageReorder,
+    StageRollup,
     StageUpdate,
 )
 
@@ -92,6 +94,47 @@ def _bad_request(detail: str) -> ProblemException:
         code="bad_request",
         title="Bad request",
         detail=detail,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reporting endpoint (J5)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/report",
+    response_model=PipelineReport,
+    summary="Pipeline rollup report",
+    tags=["pipeline"],
+)
+async def get_pipeline_report(
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+) -> PipelineReport:
+    """Workspace-level pipeline totals by stage (J5).
+
+    Returns per-stage item counts and summed value_estimate, plus workspace
+    totals. Computed with a single grouped SQL query — no N+1. Stages with
+    zero items are included so the chart always shows all columns.
+
+    RFC 7807 errors on unexpected failures.
+    """
+    rollup = await services.rollup_by_stage(session, ctx.workspace_id)
+    stage_out = [
+        StageRollup(
+            stage_id=r.stage_id,
+            stage_name=r.stage_name,
+            stage_position=r.stage_position,
+            item_count=r.item_count,
+            total_value=r.total_value,
+        )
+        for r in rollup.stages
+    ]
+    return PipelineReport(
+        stages=stage_out,
+        total_items=rollup.total_items,
+        total_value=rollup.total_value,
     )
 
 
@@ -150,9 +193,7 @@ async def create_stage(
         await session.commit()
     except (services.StageNameConflictError, IntegrityError) as exc:
         await session.rollback()
-        raise _conflict(
-            f"A stage named '{body.name}' already exists in this workspace."
-        ) from exc
+        raise _conflict(f"A stage named '{body.name}' already exists in this workspace.") from exc
     response.headers["Location"] = f"/api/v1/pipeline/stages/{stage.id}"
     return _stage_out(stage)
 
@@ -201,9 +242,7 @@ async def update_stage(
         raise _not_found("Stage") from exc
     except (services.StageNameConflictError, IntegrityError) as exc:
         await session.rollback()
-        raise _conflict(
-            f"A stage named '{body.name}' already exists in this workspace."
-        ) from exc
+        raise _conflict(f"A stage named '{body.name}' already exists in this workspace.") from exc
     return _stage_out(stage)
 
 

@@ -447,3 +447,135 @@ def test_items_require_workspace_header(client: TestClient) -> None:
     token = _signup(client, "no-ws@example.com")
     resp = client.get(ITEMS, headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 400  # require_workspace returns 400 when no workspace id supplied
+
+
+# ---------------------------------------------------------------------------
+# J5 — Pipeline rollup / report tests
+# ---------------------------------------------------------------------------
+
+REPORT = "/api/v1/pipeline/report"
+
+
+def test_report_empty_workspace(client: TestClient) -> None:
+    """A fresh workspace has nine stages and zero items in each."""
+    token = _signup(client, "report-empty@example.com")
+    ws = _create_workspace(client, token)
+
+    resp = client.get(REPORT, headers=_auth(token, ws))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["total_items"] == 0
+    assert body["total_value"] is None
+    assert len(body["stages"]) == 9  # nine default stages
+    for stage in body["stages"]:
+        assert stage["item_count"] == 0
+        assert stage["total_value"] is None
+
+
+def test_report_stages_ordered_by_position(client: TestClient) -> None:
+    """Stages in the report are returned in position order."""
+    token = _signup(client, "report-order@example.com")
+    ws = _create_workspace(client, token)
+
+    resp = client.get(REPORT, headers=_auth(token, ws))
+    assert resp.status_code == 200, resp.text
+    positions = [s["stage_position"] for s in resp.json()["stages"]]
+    assert positions == sorted(positions)
+
+
+def test_report_counts_and_sums(client: TestClient) -> None:
+    """Per-stage counts and total value aggregate correctly from seeded items."""
+    token = _signup(client, "report-agg@example.com")
+    ws = _create_workspace(client, token)
+
+    # Trigger provisioning + collect stage ids.
+    stages = client.get(STAGES, headers=_auth(token, ws)).json()["items"]
+    saved_id = stages[0]["id"]  # position 0 — Saved
+    research_id = stages[1]["id"]  # position 1 — Researching
+
+    # 2 items in Saved: one with value, one without.
+    client.post(
+        ITEMS,
+        json={"title": "Deal A", "stage_id": saved_id, "value_estimate": "100000.00"},
+        headers=_auth(token, ws),
+    )
+    client.post(
+        ITEMS,
+        json={"title": "Deal B", "stage_id": saved_id},
+        headers=_auth(token, ws),
+    )
+    # 1 item in Researching with a value.
+    client.post(
+        ITEMS,
+        json={"title": "Deal C", "stage_id": research_id, "value_estimate": "50000.50"},
+        headers=_auth(token, ws),
+    )
+
+    resp = client.get(REPORT, headers=_auth(token, ws))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["total_items"] == 3
+    # total_value = 100000.00 + 50000.50 = 150000.50
+    assert body["total_value"] is not None
+    from decimal import Decimal
+
+    assert Decimal(body["total_value"]) == Decimal("150000.50")
+
+    stage_map = {s["stage_name"]: s for s in body["stages"]}
+
+    # Saved: 2 items, value = 100000.00 (only the valued item counted)
+    assert stage_map["Saved"]["item_count"] == 2
+    assert Decimal(stage_map["Saved"]["total_value"]) == Decimal("100000.00")
+
+    # Researching: 1 item, value = 50000.50
+    assert stage_map["Researching"]["item_count"] == 1
+    assert Decimal(stage_map["Researching"]["total_value"]) == Decimal("50000.50")
+
+    # Won: still zero
+    assert stage_map["Won"]["item_count"] == 0
+    assert stage_map["Won"]["total_value"] is None
+
+
+def test_report_workspace_isolation(client: TestClient) -> None:
+    """Report for workspace A must not count items from workspace B."""
+    alice = _signup(client, "report-iso-alice@example.com")
+    bob = _signup(client, "report-iso-bob@example.com")
+    ws_a = _create_workspace(client, alice, "Report Alice WS")
+    ws_b = _create_workspace(client, bob, "Report Bob WS")
+
+    # Alice adds 3 items with values.
+    for i in range(3):
+        client.post(
+            ITEMS,
+            json={"title": f"Alice Deal {i}", "value_estimate": f"{(i + 1) * 1000}.00"},
+            headers=_auth(alice, ws_a),
+        )
+
+    # Bob adds 1 item.
+    client.post(ITEMS, json={"title": "Bob Deal"}, headers=_auth(bob, ws_b))
+
+    # Alice's report sees only her 3 items.
+    resp_a = client.get(REPORT, headers=_auth(alice, ws_a))
+    assert resp_a.status_code == 200
+    assert resp_a.json()["total_items"] == 3
+
+    # Bob's report sees only his 1 item (no value → total_value None).
+    resp_b = client.get(REPORT, headers=_auth(bob, ws_b))
+    assert resp_b.status_code == 200
+    assert resp_b.json()["total_items"] == 1
+    assert resp_b.json()["total_value"] is None
+
+
+def test_report_requires_auth(client: TestClient) -> None:
+    """Unauthenticated request returns 401."""
+    resp = client.get(REPORT)
+    assert resp.status_code == 401
+
+
+def test_report_requires_workspace(client: TestClient) -> None:
+    """Missing workspace header returns 400 (not 404)."""
+    token = _signup(client, "report-no-ws@example.com")
+    resp = client.get(REPORT, headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 400

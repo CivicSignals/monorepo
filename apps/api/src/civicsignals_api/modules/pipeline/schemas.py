@@ -135,3 +135,36 @@ class ItemPage(BaseModel):
 
     items: list[ItemOut]
     next_cursor: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Reporting schemas (J5)
+# ---------------------------------------------------------------------------
+
+
+class StageRollup(BaseModel):
+    """Per-stage totals in the pipeline rollup report (J5).
+
+    ``item_count`` — number of items currently in this stage.
+    ``total_value`` — sum of all non-null ``value_estimate`` values (USD, 2dp).
+                      ``None`` when no items have a value estimate.
+    """
+
+    stage_id: UUID
+    stage_name: str
+    stage_position: int
+    item_count: int
+    total_value: Decimal | None
+
+
+class PipelineReport(BaseModel):
+    """Workspace-level pipeline rollup (J5, ``GET /pipeline/report``).
+
+    ``stages``       — per-stage counts and summed value, ordered by position.
+    ``total_items``  — total item count across all stages.
+    ``total_value``  — summed value across all stages; ``None`` if no values set.
+    """
+
+    stages: list[StageRollup]
+    total_items: int
+    total_value: Decimal | None
