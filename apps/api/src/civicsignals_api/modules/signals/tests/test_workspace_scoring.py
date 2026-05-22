@@ -15,11 +15,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from civicsignals_api.modules.signals.workspace_scoring import (
+    MAX_FEEDBACK_ADJUSTMENT,
+    MIN_FEEDBACK_FOR_OVERRIDE,
     ComponentWeights,
     IcpCriteria,
     KeywordExcludedError,
     ScoringConfig,
     SignalDimensions,
+    derive_signal_type_overrides,
     keyword_match,
     recency_score,
     score_signal_against_icp,
@@ -315,3 +318,116 @@ def test_component_weights_must_sum_to_one() -> None:
 def test_recency_half_life_must_be_positive() -> None:
     with pytest.raises(ValueError, match="must be > 0"):
         ScoringConfig(recency_half_life_days=0.0)
+
+
+# --- F5 feedback re-weighting (pure override-derivation math, doc 14 §12) ----
+
+
+def test_no_feedback_yields_empty_override_map() -> None:
+    # The no-op default: no feedback → no nudge → empty map.
+    assert derive_signal_type_overrides({}) == {}
+
+
+def test_below_volume_floor_is_ignored() -> None:
+    # Fewer than MIN_FEEDBACK_FOR_OVERRIDE data points → no nudge (one click can't move).
+    counts = {"rfp_posted": (MIN_FEEDBACK_FOR_OVERRIDE - 1, 0)}
+    assert derive_signal_type_overrides(counts) == {}
+
+
+def test_all_relevant_nudges_weight_up_to_the_bound() -> None:
+    # Unanimous relevant (net = +1) → max upward nudge.
+    counts = {"rfp_posted": (5, 0)}
+    overrides = derive_signal_type_overrides(counts)
+    assert overrides["rfp_posted"] == pytest.approx(1.0 + MAX_FEEDBACK_ADJUSTMENT)
+
+
+def test_all_not_relevant_nudges_weight_down_to_the_bound() -> None:
+    # Unanimous not_relevant (net = -1) → max downward nudge.
+    counts = {"news_mention": (0, 7)}
+    overrides = derive_signal_type_overrides(counts)
+    assert overrides["news_mention"] == pytest.approx(1.0 - MAX_FEEDBACK_ADJUSTMENT)
+
+
+def test_partial_sentiment_scales_proportionally() -> None:
+    # net = (3 - 1) / 4 = 0.5 → 1 + 0.25*0.5 = 1.125.
+    counts = {"rfp_posted": (3, 1)}
+    overrides = derive_signal_type_overrides(counts)
+    assert overrides["rfp_posted"] == pytest.approx(1.0 + MAX_FEEDBACK_ADJUSTMENT * 0.5)
+
+
+def test_balanced_feedback_is_a_noop() -> None:
+    # net = 0 → multiplier exactly 1.0 → omitted (kept sparse, no nudge).
+    counts = {"rfp_posted": (3, 3)}
+    assert derive_signal_type_overrides(counts) == {}
+
+
+def test_override_is_always_within_the_clamp_band() -> None:
+    # Even with a huge max_adjustment passed, the result clamps to [lo, hi].
+    counts = {"rfp_posted": (100, 0), "news_mention": (0, 100)}
+    overrides = derive_signal_type_overrides(counts, max_adjustment=5.0)
+    assert overrides["rfp_posted"] == pytest.approx(6.0)  # 1 + 5*1
+    assert overrides["news_mention"] == pytest.approx(-4.0)  # 1 - 5*1 (clamp = lo)
+
+
+def test_wrong_extraction_is_not_a_scoring_input() -> None:
+    # derive_signal_type_overrides only knows (relevant, not_relevant) — wrong_extraction
+    # is filtered upstream and never reaches here. A type with only wrong_extraction
+    # feedback (modelled as (0, 0)) produces no override.
+    counts = {"rfp_posted": (0, 0)}
+    assert derive_signal_type_overrides(counts) == {}
+
+
+def test_overrides_apply_multiplicatively_to_the_signal_type_component() -> None:
+    # A downward nudge on the signal type drops the blended score vs. the baseline,
+    # while a config with no overrides scores identically to the default config.
+    icp = _icp(signal_weights={"rfp_posted": 1.0})
+    kwargs: dict[str, object] = {
+        "text_blob": "RFP for productivity software",
+        "confidence": 0.9,
+        "observed_at": NOW,
+        "now": NOW,
+    }
+    baseline = score_signal_against_icp(_signal(), icp, **kwargs)  # type: ignore[arg-type]
+    nudged_down = score_signal_against_icp(
+        _signal(),
+        icp,
+        config=ScoringConfig(signal_type_weight_overrides={"rfp_posted": 0.75}),
+        **kwargs,  # type: ignore[arg-type]
+    )
+    nudged_up_clamped = score_signal_against_icp(
+        _signal(),
+        icp,
+        config=ScoringConfig(signal_type_weight_overrides={"rfp_posted": 1.25}),
+        **kwargs,  # type: ignore[arg-type]
+    )
+    # A no-feedback config is a byte-for-byte no-op vs. the default.
+    no_feedback = score_signal_against_icp(_signal(), icp, config=ScoringConfig(), **kwargs)  # type: ignore[arg-type]
+    assert no_feedback.score == baseline.score
+    assert nudged_down.score < baseline.score
+    # base weight 1.0 is already clamped at 1.0, so an upward nudge cannot exceed it.
+    assert nudged_up_clamped.score == baseline.score
+
+
+def test_unweighted_type_can_be_nudged_up() -> None:
+    # When the ICP pinned no weight (falls back to DEFAULT_SIGNAL_TYPE_WEIGHT=0.6), an
+    # upward nudge has headroom and raises the score.
+    icp = _icp(signal_weights={})  # rfp_posted not pinned → default 0.6
+    kwargs: dict[str, object] = {
+        "text_blob": "RFP for productivity software",
+        "confidence": 0.9,
+        "observed_at": NOW,
+        "now": NOW,
+    }
+    baseline = score_signal_against_icp(_signal(), icp, **kwargs)  # type: ignore[arg-type]
+    nudged_up = score_signal_against_icp(
+        _signal(),
+        icp,
+        config=ScoringConfig(signal_type_weight_overrides={"rfp_posted": 1.25}),
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert nudged_up.score > baseline.score
+
+
+def test_scoring_config_rejects_out_of_band_override() -> None:
+    with pytest.raises(ValueError, match="feedback band"):
+        ScoringConfig(signal_type_weight_overrides={"rfp_posted": 2.0})

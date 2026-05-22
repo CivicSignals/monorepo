@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
+from civicsignals_api.ratelimit import public_directory_limiter
 
 from . import services
 from .schemas import EntityPage, EntityRead
@@ -26,6 +27,11 @@ router = APIRouter(prefix="/entities", tags=["entities"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 CursorQuery = Annotated[str | None, Query(description="Opaque pagination cursor.")]
 LimitQuery = Annotated[int, Query(ge=1, le=services.MAX_LIMIT)]
+# P4: the entity directory is the public, unauthenticated account universe (C1
+# req 5, doc 07 §3) that the /directory + /s pages read. Per-client (IP) rate
+# limit it to throttle scrapers while staying generous for humans and polite
+# crawlers (see civicsignals_api.ratelimit). All three reads share one bucket.
+PublicRateLimit = Depends(public_directory_limiter)
 
 
 def _problem(status: int, title: str, detail: str) -> JSONResponse:
@@ -44,6 +50,7 @@ def _problem(status: int, title: str, detail: str) -> JSONResponse:
 @router.get("", response_model=EntityPage, summary="List/search entities")
 async def list_entities(
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
     q: Annotated[str | None, Query(description="Name substring search.")] = None,
     type: Annotated[list[str] | None, Query(description="Filter by entity type slug.")] = None,
     kind: Annotated[list[str] | None, Query(description="Filter by kind slug.")] = None,
@@ -77,6 +84,7 @@ async def list_entities(
 async def get_entity(
     entity_id: uuid.UUID,
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
 ) -> EntityRead | JSONResponse:
     entity = await services.get_entity(session, entity_id)
     if entity is None:
@@ -92,6 +100,7 @@ async def get_entity(
 async def list_entity_children(
     entity_id: uuid.UUID,
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
     cursor: CursorQuery = None,
     limit: LimitQuery = services.DEFAULT_LIMIT,
 ) -> EntityPage:

@@ -240,6 +240,46 @@ class NewsMentionPayload(SignalPayload):
     published_at: date | None = None
 
 
+# ---------------------------------------------------------------------------
+# Public-surface allowlist (P2 — doc 13 §4.1, §4.6)
+# ---------------------------------------------------------------------------
+#
+# Only **late-stage public** signal types are publicly indexable. Doc 13 §4.1
+# (the "Free / Self-host" tier row) and §4.6 ("Late-stage public signals
+# (RFPs, news mentions, grant awards) appear on civicsignals.io/signals/...")
+# name exactly three commodity, already-public types: public RFPs, public news
+# mentions, public grant awards. Everything else — board agendas, leadership
+# changes, budgets, contracts, strategic plans, RFI/RFQ, grant *opportunities*
+# (forward-looking, closer to pre-public intent), open jobs, contract awards —
+# is paid-tier value that lives *upstream* of the public layer (§4.1) and must
+# NOT be exposed on the unauthenticated public surface or scraped by id.
+#
+# This is the single source of truth for the public allowlist. The public read
+# path (``GET /signals/{id}/public`` + ``GET /signals/{id}/sources``) and the
+# sitemap walk both gate on it, server-side authoritative.
+PUBLIC_SIGNAL_TYPES: frozenset[SignalType] = frozenset(
+    {
+        SignalType.RFP_POSTED,
+        SignalType.NEWS_MENTION,
+        SignalType.GRANT_AWARDED,
+    }
+)
+
+
+def is_public_signal_type(signal_type: str | None) -> bool:
+    """Return whether ``signal_type`` is in the public allowlist (P2; doc 13 §4.1, §4.6).
+
+    Tolerant of the raw string stored on a signal row (``signals_signal.signal_type``)
+    and of unknown/absent values: an unrecognised type is never public.
+    """
+    if signal_type is None:
+        return False
+    try:
+        return SignalType(signal_type) in PUBLIC_SIGNAL_TYPES
+    except ValueError:
+        return False
+
+
 # Dispatch table: signal type -> its strict payload model. Adding a new signal type
 # (doc 19 §13.2 — the taxonomy grows) is a new entry here plus the enum member.
 PAYLOAD_BY_TYPE: dict[SignalType, type[SignalPayload]] = {
@@ -343,3 +383,153 @@ class SignalPage(BaseModel):
 
     items: list[SignalRead]
     next_cursor: str | None = None
+
+
+# --- G2 signal-detail read shapes (the detail page; doc 14 §5.3) ---------------
+
+
+class SourceDocumentRead(BaseModel):
+    """One corroborating source document on the signal-detail page (G2).
+
+    A provenance projection of an ``ingestion_raw_document`` row: where the signal
+    came from and when it was fetched. ``missing`` flags a referenced id that no
+    longer resolves (a doc pruned after the signal was stored).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    raw_document_id: uuid.UUID
+    recipe_id: str | None
+    source_url: str | None
+    fetched_at: datetime | None
+    content_type: str | None
+    missing: bool = False
+
+
+class SuggestedContactRead(BaseModel):
+    """One suggested contact at the signal's entity on the detail page (G2).
+
+    A projection of a global ``contacts_contact`` row (contacts are global per
+    entity, doc 07 §3) — surfaced so a user acting on a signal can reach the right
+    person without leaving the page.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    contact_id: uuid.UUID
+    name: str
+    title: str | None
+    department: str | None
+    canonical_email: str | None
+    status: str
+    verified: bool
+
+
+class RelatedSignalRead(BaseModel):
+    """One related signal about the same entity on the detail page (G2)."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    signal: SignalRead
+
+
+class SignalDetailRead(BaseModel):
+    """The full signal-detail view for one (workspace, signal) pair (G2).
+
+    The global signal plus the calling workspace's score / status / breakdown (all
+    ``None`` when the signal did not score into this workspace's feed — the corpus is
+    global, so a signal is viewable by id regardless), the validated extracted
+    fields, the corroborating source documents, the suggested contacts at the
+    signal's entity, and the related signals about the same entity (doc 14 §5.3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal: SignalRead
+    entity_id: uuid.UUID | None
+    entity_name: str | None
+    score: float | None
+    status: str | None
+    score_breakdown: dict[str, object] | None
+    matched_keywords: list[str]
+    extracted_fields: dict[str, object]
+    source_documents: list[SourceDocumentRead]
+    suggested_contacts: list[SuggestedContactRead]
+    related_signals: list[RelatedSignalRead]
+    # The calling user's current F5 feedback verdict on this signal (relevant /
+    # not_relevant / wrong_extraction), or ``None`` if they have not given one
+    # (doc 14 §12). Lets the detail page's feedback controls reflect the selection.
+    feedback: str | None = None
+
+
+# --- Public source citations (P2) -----------------------------------------------
+
+
+class SignalSource(BaseModel):
+    """One source citation for a signal — the public-safe provenance of an
+    ``ingestion_raw_document`` that corroborates the signal (P2; doc 19 §7.3).
+
+    A signal's ``raw_document_ids`` reference ``ingestion_raw_document`` rows; this
+    is the *public* projection of one such row. Only crawler-/citizen-safe fields are
+    exposed: the ``source_url`` the document was fetched from, the producing recipe
+    slug (provenance), and when it was fetched. The S3 ``blob_key``, content hash,
+    HTTP status, and internal metadata are deliberately **not** surfaced — a public
+    signal page cites where the data came from, not how it is stored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: uuid.UUID
+    source_url: str
+    recipe_id: str
+    fetched_at: datetime | None = None
+
+
+class SignalSourcesRead(BaseModel):
+    """The ordered source citations for one signal (P2).
+
+    Not cursor-paginated: a signal has a small, bounded set of corroborating
+    documents (doc 19 §7.3 merge appends), so the full list is returned at once —
+    the public page renders every citation for transparency.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal_id: uuid.UUID
+    sources: list[SignalSource]
+
+
+# --- Public signal projection (P2) ----------------------------------------------
+
+
+class PublicSignalRead(BaseModel):
+    """The **public-safe** projection of a signal for the unauthenticated /s/{id} page.
+
+    Deliberately narrower than :class:`SignalRead` (the full internal read shape, which
+    the authenticated G1 feed / signals-ui use). A crawler-/citizen-facing page must
+    not leak the internal plumbing, so this exposes only public-safe fields:
+
+    - ``id`` / ``signal_type`` / ``title`` / ``summary`` — what the page displays;
+    - ``entity_name`` — the subject's public display name (the resolved entity name or
+      the raw extracted name), never the internal ``entity_id``;
+    - ``occurred_at`` / ``observed_at`` — the public/occurred date the page cites.
+
+    Fields intentionally **omitted** vs ``SignalRead`` (doc 13 §4.2 — depth is paid):
+    ``content_hash``, ``raw_document_ids``, ``recipe_id``, ``confidence``, ``status``,
+    ``review_required``, ``is_degraded``, ``entity_id``, and the full ``details`` JSONB.
+    Source citations are served separately by ``GET /signals/{id}/sources``.
+
+    This projection is only ever returned for a type in :data:`PUBLIC_SIGNAL_TYPES`
+    (doc 13 §4.1, §4.6); the read path 404s otherwise so a non-public signal cannot be
+    scraped by id.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID
+    signal_type: str
+    title: str
+    summary: str
+    entity_name: str | None
+    occurred_at: datetime | None
+    observed_at: datetime

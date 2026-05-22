@@ -48,6 +48,18 @@ class FakeRedis:
             return 1
         return 0
 
+    def incr(self, name: str, amount: int = 1) -> int:
+        # Part of the RedisClient Protocol (used by the P4 rate limiter, not the
+        # locks). Implemented so FakeRedis still satisfies the Protocol under mypy.
+        value = int(self.store.get(name, "0")) + amount
+        self.store[name] = str(value)
+        return value
+
+    def expire(self, name: str, time: int) -> bool:
+        # Protocol member (P4 rate limiter). No real TTL bookkeeping is needed for
+        # the lock-semantics tests; report success iff the key exists.
+        return name in self.store
+
     def expire_now(self, name: str) -> None:
         self.store.pop(name, None)
 
