@@ -14,8 +14,8 @@ next. The upgrade process is designed to be safe, idempotent, and non-destructiv
 
 Related docs:
 - [Quickstart](quickstart.md) — initial installation
-- [Configuration reference](config.md) — all environment variables (task O4)
-- [Backup and DR](backup.md) — `pg_dump` procedure and Backblaze B2 (task LC-8)
+- Configuration reference — `docs/self-host/config.md` (coming in task O4)
+- Backup and DR — `docs/self-host/backup.md` (coming in task LC-8)
 
 ---
 
@@ -32,8 +32,8 @@ docker compose -f infra/docker-compose.yml --env-file infra/.env \
 ```
 
 Store the backup somewhere outside the host — Backblaze B2, S3, or your preferred
-off-site storage. See [backup.md](backup.md) for the automated nightly `pg_dump` setup
-recommended for production.
+off-site storage. Automated nightly `pg_dump` setup will be covered in
+`docs/self-host/backup.md` (task LC-8).
 
 ---
 
@@ -72,8 +72,8 @@ app will not serve traffic until migrations are complete, even if you skip step 
 
 ### Why migrations bypass PgBouncer
 
-CivicSignals runs PgBouncer in **transaction mode** to cap backend connections (see
-[architecture doc §4](../../06-architecture.md#4-database-choice)). Transaction mode
+CivicSignals runs PgBouncer in **transaction mode** to cap backend connections
+([PgBouncer transaction pooling docs](https://www.pgbouncer.org/features.html)). Transaction mode
 prohibits session-level commands like `SET SEARCH_PATH`, `CREATE TABLE`, `ALTER TABLE`,
 and `LOCK TABLE` — all of which Alembic issues during DDL migrations.
 
@@ -128,10 +128,11 @@ be present for every revision). The recommended rollback strategy is:
 # Stop the stack (data volumes are untouched)
 docker compose -f infra/docker-compose.yml --env-file infra/.env down
 
-# Restore the database from backup
+# Restore the database from the gzipped backup
 docker compose -f infra/docker-compose.yml --env-file infra/.env up -d postgres
-docker compose -f infra/docker-compose.yml --env-file infra/.env \
-  exec -i postgres psql -U <POSTGRES_USER> <POSTGRES_DB> < backup-YYYYMMDDHHMMSS.sql
+gunzip -c backup-YYYYMMDDHHMMSS.sql.gz | \
+  docker compose -f infra/docker-compose.yml --env-file infra/.env \
+  exec -T postgres psql -U <POSTGRES_USER> <POSTGRES_DB>
 
 # Pin the previous version in infra/.env
 # CIVIC_VERSION=0.3.1   # example — replace with the actual previous release tag
