@@ -509,7 +509,7 @@ async def store_candidates(
     raw_document_id: uuid.UUID,
     recipe_id: str,
     candidates: list[CandidateRecord],
-) -> list[ExtractionCandidate]:
+) -> tuple[list[ExtractionCandidate], list[uuid.UUID]]:
     """Persist candidates + promote validated ones into ``signals_signal`` (E1/E4).
 
     Two responsibilities (doc 19 §1 "store", §6.1 "validate"):
@@ -520,6 +520,10 @@ async def store_candidates(
        candidate into a global ``signals_signal`` row via
        ``signals.services.promote_candidate_to_signal``. The candidate row is
        stamped ``promoted`` (with the resulting signal's id) on success.
+
+    Returns the persisted candidate rows **and** the ids of the signals they were
+    promoted into (deduped, first-seen order) — the embed step (I1) reads the latter
+    to embed the freshly-stored signals.
 
     On a schema-validation failure the candidate row is stamped ``rejected`` (for
     the doc 19 §6.1 audit) and a :class:`SignalValidationError` is re-raised so the
@@ -548,6 +552,8 @@ async def store_candidates(
         rows.append(row)
     await session.flush()  # assign candidate ids before promotion links to them
 
+    signal_ids: list[uuid.UUID] = []
+    seen_signal_ids: set[uuid.UUID] = set()
     for candidate, row in zip(candidates, rows, strict=True):
         candidate_input = CandidateInput(
             signal_type=candidate.signal_type,
@@ -565,7 +571,7 @@ async def store_candidates(
             source_candidate_id=row.id,
         )
         try:
-            await signals_services.promote_candidate_to_signal(session, candidate_input)
+            signal = await signals_services.promote_candidate_to_signal(session, candidate_input)
         except SignalValidationError:
             # Hard gate (doc 19 §6.1): record the rejection for audit, then surface
             # the error so the job dead-letters with it (no signal written).
@@ -576,8 +582,37 @@ async def store_candidates(
         # ``signals_signal.source_candidate_id`` (set during promotion), so the
         # candidate row just records that it was promoted.
         row.status = CANDIDATE_STATUS_PROMOTED
+        if signal.id not in seen_signal_ids:
+            seen_signal_ids.add(signal.id)
+            signal_ids.append(signal.id)
     await session.flush()
-    return rows
+    return rows, signal_ids
+
+
+# ---------------------------------------------------------------------------
+# Stage 7b: embed (I1) — embed each stored signal into pgvector
+# ---------------------------------------------------------------------------
+
+
+async def embed_signals(
+    session: AsyncSession,
+    signal_ids: list[uuid.UUID],
+    *,
+    gateway: LLMGateway,
+    workspace_id: str | None,
+) -> int:
+    """Embed the freshly-stored signals into ``signals_signal.vector_embedding`` (I1).
+
+    Delegates to ``signals.services.embed_signals`` (the public seam — no cross-module
+    model import, doc 06 §3), which builds ``title + summary`` (+ key fields) text and
+    persists the pgvector embedding for fuzzy dedupe (doc 19 §7.4 / E10) + smart search
+    (doc 14 §6.2 / I3). **Best-effort**: the service swallows + logs an embed failure
+    and leaves the column NULL, so a failure here never loses the signal — the
+    ``signals.backfill_embeddings`` sweep re-attempts. Returns the count embedded.
+    """
+    return await signals_services.embed_signals(
+        session, signal_ids, gateway=gateway, workspace_id=workspace_id
+    )
 
 
 def _candidate_entity_name(candidate: CandidateRecord) -> str | None:
@@ -606,11 +641,16 @@ async def run_extraction_pipeline(
 ) -> PipelineResult:
     """Run the full funnel for one document (doc 19 §1; E1).
 
-    fetch -> parse -> relevance gate -> extract -> score -> dedupe -> store. The
-    caller (the Celery task) owns the transaction *and* the job-status bookkeeping
+    fetch -> parse -> relevance gate -> extract -> score -> dedupe -> store -> embed.
+    The caller (the Celery task) owns the transaction *and* the job-status bookkeeping
     + retry/dead-letter; this function just runs the stages and reports the result.
     On an irrelevant verdict it short-circuits before any extract call (the cost
     lever, doc 19 §3.1) and reports ``skipped=True``.
+
+    The embed step (I1) runs after store: each promoted signal is embedded into its
+    ``signals_signal.vector_embedding`` pgvector column for fuzzy dedupe (doc 19 §7.4)
+    + smart search (doc 14 §6.2). It is **best-effort** — an embed failure is logged
+    and the column left NULL (the signal is never lost) — so it never fails the job.
     """
     gateway = gateway or get_gateway()
     classifier = classifier or RelevanceClassifier(gateway=gateway)
@@ -635,13 +675,14 @@ async def run_extraction_pipeline(
 
     raw_candidates = await extract_candidates(gateway, parsed, workspace_id=workspace_id)
     scored = [dedupe_candidate(score_candidate(c)) for c in raw_candidates]
-    await store_candidates(
+    _rows, signal_ids = await store_candidates(
         session,
         job_id=job_id,
         raw_document_id=raw_document_id,
         recipe_id=parsed.recipe_id,
         candidates=scored,
     )
+    await embed_signals(session, signal_ids, gateway=gateway, workspace_id=workspace_id)
     return PipelineResult(
         raw_document_id=raw_document_id,
         relevant=True,

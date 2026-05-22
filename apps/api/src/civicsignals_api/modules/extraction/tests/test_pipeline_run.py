@@ -29,6 +29,7 @@ from civicsignals_api.llm_gateway import (
     TASK_CLASSIFY,
     TASK_EXTRACTION,
     FakeBackend,
+    FakeEmbeddingBackend,
     LLMGateway,
     ModelChoice,
     TaskModelPolicy,
@@ -102,6 +103,10 @@ def _gateway(*, relevance: str, extract: str) -> tuple[LLMGateway, FakeBackend]:
             "extract_be": extract_be,
         },
         policy=policy,
+        # The store stage embeds each promoted signal (I1); a deterministic fake
+        # embedding backend keeps that step network-free.
+        embedding_backends={"fake_embed": FakeEmbeddingBackend(provider="fake_embed")},
+        embedding_choice=ModelChoice("fake_embed", "fake-embed-model"),
     )
     return gateway, extract_be
 
@@ -121,23 +126,39 @@ def _patch_get_raw_document(monkeypatch: pytest.MonkeyPatch) -> StoredRawDocumen
     return doc
 
 
+class _FakeSignal:
+    """A stand-in promoted signal; the store stage only reads its ``id`` (I1 embed)."""
+
+    def __init__(self) -> None:
+        self.id = uuid.uuid4()
+
+
 @pytest.fixture
 def _stub_promote(monkeypatch: pytest.MonkeyPatch) -> list[object]:
-    """Stub the E4 promotion (needs real Postgres upsert; covered in persistence test).
+    """Stub the E4 promotion + I1 embed (both need real Postgres; see persistence test).
 
     Records the :class:`CandidateInput` instances the store stage builds so the
     orchestrator wiring can be asserted without a database. Returns a fake signal
-    object so ``store_candidates`` proceeds as on a successful promote.
+    object (with an ``id``) so ``store_candidates`` proceeds as on a successful
+    promote. The embed step is stubbed to a no-op here — its DB round-trip is
+    exercised in ``test_pipeline_persistence.py``.
     """
     received: list[object] = []
 
     async def _fake_promote(session: object, candidate: object) -> object:
         received.append(candidate)
-        return object()  # a stand-in "signal"; the store stage only reads its id
+        return _FakeSignal()
+
+    async def _fake_embed(session: object, signal_ids: list[uuid.UUID], **kwargs: object) -> int:
+        return len(signal_ids)
 
     monkeypatch.setattr(
         "civicsignals_api.modules.extraction.pipeline.signals_services.promote_candidate_to_signal",
         _fake_promote,
+    )
+    monkeypatch.setattr(
+        "civicsignals_api.modules.extraction.pipeline.signals_services.embed_signals",
+        _fake_embed,
     )
     return received
 

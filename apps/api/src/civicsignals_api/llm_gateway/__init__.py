@@ -20,17 +20,26 @@ from .accounting import (
     UsageCounters,
     estimate_cost_usd,
 )
-from .backends import AnthropicBackend, FakeBackend, OllamaBackend, OpenAIBackend
+from .backends import (
+    AnthropicBackend,
+    FakeBackend,
+    FakeEmbeddingBackend,
+    OllamaBackend,
+    OpenAIBackend,
+)
 from .gateway import LLMGateway
 from .policy import DEFAULT_TASK_MODELS, KNOWN_PROVIDERS, ModelChoice, TaskModelPolicy
 from .types import (
     TASK_CLASSIFY,
+    TASK_EMBED,
     TASK_EXTRACTION,
     TASK_SMART_SEARCH_REWRITE,
     TASK_SUMMARY,
     TASK_TRANSLATE,
     BackendNotAvailableError,
+    EmbeddingResult,
     LLMBackend,
+    LLMEmbeddingBackend,
     LLMError,
     LLMResult,
     PermanentLLMError,
@@ -41,15 +50,19 @@ __all__ = [
     "DEFAULT_TASK_MODELS",
     "KNOWN_PROVIDERS",
     "TASK_CLASSIFY",
+    "TASK_EMBED",
     "TASK_EXTRACTION",
     "TASK_SMART_SEARCH_REWRITE",
     "TASK_SUMMARY",
     "TASK_TRANSLATE",
     "AnthropicBackend",
     "BackendNotAvailableError",
+    "EmbeddingResult",
     "FakeBackend",
+    "FakeEmbeddingBackend",
     "InMemoryTokenAccountant",
     "LLMBackend",
+    "LLMEmbeddingBackend",
     "LLMError",
     "LLMGateway",
     "LLMResult",
@@ -89,6 +102,21 @@ def _policy_from_settings(settings: Settings) -> TaskModelPolicy:
     return TaskModelPolicy(overrides=overrides)
 
 
+def _embedding_choice_from_settings(settings: Settings) -> ModelChoice:
+    """Resolve the deployment's embeddings (provider, model) from settings (I1).
+
+    ``embedding_model`` is "provider:model" (a known provider prefix splits it) or
+    just "model" (uses ``embedding_provider``). Mirrors ``_policy_from_settings``'s
+    colon handling so an Ollama tag like ``nomic-embed-text:latest`` keeps its colon
+    rather than being mistaken for a provider prefix.
+    """
+    raw = settings.embedding_model
+    prefix, sep, rest = raw.partition(":")
+    if sep and prefix in KNOWN_PROVIDERS:
+        return ModelChoice(provider=prefix, model=rest)
+    return ModelChoice(provider=settings.embedding_provider, model=raw)
+
+
 def build_gateway(settings: Settings | None = None) -> LLMGateway:
     """Construct an :class:`LLMGateway` wired from settings.
 
@@ -98,22 +126,33 @@ def build_gateway(settings: Settings | None = None) -> LLMGateway:
     called.
     """
     settings = settings or get_settings()
+    openai_backend = OpenAIBackend(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+    )
+    ollama_backend = OllamaBackend(base_url=settings.ollama_base_url)
     backends: dict[str, LLMBackend] = {
         "anthropic": AnthropicBackend(
             api_key=settings.anthropic_api_key,
             base_url=settings.anthropic_base_url,
         ),
-        "openai": OpenAIBackend(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
-        ),
-        "ollama": OllamaBackend(base_url=settings.ollama_base_url),
+        "openai": openai_backend,
+        "ollama": ollama_backend,
+    }
+    # Embeddings (I1): OpenAI + Ollama serve embeddings (Anthropic has no
+    # first-party embeddings endpoint). The same backend instances are shared with
+    # the completion registry so their vendor clients (and ``aclose``) are reused.
+    embedding_backends: dict[str, LLMEmbeddingBackend] = {
+        "openai": openai_backend,
+        "ollama": ollama_backend,
     }
     return LLMGateway(
         backends,
         policy=_policy_from_settings(settings),
         accountant=InMemoryTokenAccountant(),
         max_attempts=settings.llm_max_attempts,
+        embedding_backends=embedding_backends,
+        embedding_choice=_embedding_choice_from_settings(settings),
     )
 
 
