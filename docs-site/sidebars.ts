@@ -32,13 +32,20 @@ const sidebars: SidebarsConfig = {
     },
   ],
 
-  // TODO Q4 — Self-host docs (quickstart, production, upgrade, hardening, backup)
+  // Q4 — Self-host docs
   selfHostSidebar: [
     {
       type: "category",
       label: "Self-host",
       items: [
         "self-host/intro",
+        "self-host/quickstart",
+        "self-host/production",
+        "self-host/configuration",
+        "self-host/upgrade",
+        "self-host/hardening",
+        "self-host/backup",
+        "self-host/kubernetes",
       ],
     },
   ],
