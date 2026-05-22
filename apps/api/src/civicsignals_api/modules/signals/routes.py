@@ -13,8 +13,9 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   GET  /signals/fuzzy-reviews/{id}           — get one review row
   POST /signals/fuzzy-reviews/{id}/approve   — approve → merge candidate into match
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
-  GET  /signals/{id}/sources                 — public source citations for a signal (P2)
-  GET  /signals/{id}                         — get one signal
+  GET  /signals/{id}/public                  — public narrowed signal projection (P2, public types only)
+  GET  /signals/{id}/sources                 — public source citations for a signal (P2, public types only)
+  GET  /signals/{id}                         — get one signal (full internal read)
 
 Route ordering note: ``/feed``, ``/fuzzy-reviews`` and their sub-paths MUST be
 registered before ``/{signal_id}`` (the parameterised catch-all) so that FastAPI's
@@ -43,7 +44,7 @@ from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import RequireAdmin, RequireViewer
 
 from . import services
-from .schemas import SignalPage, SignalRead, SignalSourcesRead
+from .schemas import PublicSignalRead, SignalPage, SignalRead, SignalSourcesRead
 from .services import WorkspaceFeedPage
 
 router = APIRouter(prefix="/signals", tags=["signals"])
@@ -410,11 +411,40 @@ async def reject_fuzzy_review(
 
 
 # ---------------------------------------------------------------------------
-# Public source citations (P2) — read-only, unauthenticated.
+# Public signal read + source citations (P2) — read-only, unauthenticated.
 #
-# Registered before /{signal_id} so the static ``/sources`` suffix is matched as a
-# sub-resource of the signal id (mirrors entities' ``/{entity_id}/children``).
+# Registered before /{signal_id} so the static ``/public`` / ``/sources`` suffixes
+# are matched as sub-resources of the signal id (mirrors entities'
+# ``/{entity_id}/children``).
+#
+# BOTH gate on ``PUBLIC_SIGNAL_TYPES`` (doc 13 §4.1, §4.6): a non-public (paid-tier)
+# signal 404s server-side so the public surface cannot be scraped by id. The full
+# internal ``SignalRead`` stays on the authenticated ``GET /{signal_id}`` below.
 # ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{signal_id}/public",
+    response_model=PublicSignalRead,
+    summary="Public signal projection for the /s/{id} page (P2)",
+)
+async def get_public_signal(
+    signal_id: uuid.UUID,
+    session: SessionDep,
+) -> PublicSignalRead | JSONResponse:
+    """Public, unauthenticated, narrowed read of a signal (P2; doc 13 §4.1, §4.6).
+
+    Powers the public ``/s/{id}`` page. Returns only public-safe fields (id, type,
+    title, summary, public entity name, occurred/observed dates) — never the internal
+    ``content_hash`` / ``raw_document_ids`` / ``confidence`` / ``status`` / ``details``
+    that the full ``SignalRead`` carries (doc 13 §4.2: depth is paid). 404s when the
+    signal does not exist or its type is not in the public allowlist, so a paid-tier
+    signal cannot be scraped by id.
+    """
+    result = await services.get_public_signal(session, signal_id)
+    if result is None:
+        return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
+    return result
 
 
 @router.get(
@@ -432,7 +462,9 @@ async def get_signal_sources(
     no ``X-Workspace-Id`` and no auth — it powers the public ``/s/{id}`` signal page,
     which cites where each fact came from. Returns the public-safe provenance of every
     corroborating ``ingestion_raw_document`` (source URL + recipe + fetch time); the
-    S3 key and internal metadata are never exposed.
+    S3 key and internal metadata are never exposed. 404s when the signal does not
+    exist or its type is not in :data:`~signals.schemas.PUBLIC_SIGNAL_TYPES`
+    (doc 13 §4.1, §4.6) so a paid-tier signal cannot be scraped by id.
     """
     result = await services.get_signal_sources(session, signal_id)
     if result is None:

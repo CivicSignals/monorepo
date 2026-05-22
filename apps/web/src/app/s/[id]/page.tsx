@@ -28,9 +28,11 @@ import Link from "next/link";
 import {
   fetchPublicSignal,
   fetchPublicSignalSources,
+  isPublicSignalType,
+  type PublicSignalRead,
   type PublicSignalSource,
 } from "@/lib/public-signals-api";
-import { SIGNAL_TYPE_LABELS, type SignalRead, type SignalType } from "@/lib/signals-api";
+import { SIGNAL_TYPE_LABELS, type SignalType } from "@/lib/signals-api";
 
 // ---- Revalidate at the page level (5 minutes). ----
 // Must be a literal — Next.js static analysis cannot resolve imported constants.
@@ -64,8 +66,8 @@ function formatDate(iso: string): string {
 }
 
 /** Best display name for the signal's subject entity. */
-function subjectName(signal: SignalRead): string | null {
-  return signal.entity_name_raw ?? null;
+function subjectName(signal: PublicSignalRead): string | null {
+  return signal.entity_name ?? null;
 }
 
 // ---- SEO metadata ----
@@ -155,6 +157,13 @@ export default async function PublicSignalPage({ params }: PageProps) {
 
   const signal = await fetchPublicSignal(id);
   if (!signal) notFound();
+
+  // Public-surface gate (P2; doc 13 §4.1, §4.6): only late-stage public types are
+  // publicly indexable. The server is authoritative (the /public endpoint 404s a
+  // non-public type, so we'd already have notFound()'d above), but guard here too so
+  // a paid-tier signal can never render on the public page even if the API contract
+  // ever loosens.
+  if (!isPublicSignalType(signal.signal_type)) notFound();
 
   // Source citations are non-fatal: if the sub-fetch fails, the page still renders
   // (the signal core is the primary content). Mirrors C5's parallel-fetch fallback.

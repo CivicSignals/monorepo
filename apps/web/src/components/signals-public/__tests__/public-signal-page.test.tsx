@@ -6,8 +6,10 @@
 
 import { describe, expect, it, vi, afterEach, beforeEach } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import type { SignalRead } from "@/lib/signals-api";
-import type { PublicSignalSources } from "@/lib/public-signals-api";
+import type {
+  PublicSignalRead,
+  PublicSignalSources,
+} from "@/lib/public-signals-api";
 
 beforeEach(() => {
   vi.resetModules();
@@ -19,25 +21,17 @@ afterEach(() => {
 });
 
 // ---- Fixtures ----
+// The public page consumes the narrowed PublicSignalRead projection (P2), not the
+// full internal SignalRead — no content_hash / raw_document_ids / confidence / etc.
 
-const BASE_SIGNAL: SignalRead = {
+const BASE_SIGNAL: PublicSignalRead = {
   id: "signal-abc",
-  entity_id: "ent-001",
-  entity_name_raw: "Northshore School District",
+  entity_name: "Northshore School District",
   signal_type: "rfp_posted",
-  recipe_id: "wa_k12_rfps",
-  raw_document_ids: ["doc-001"],
-  content_hash: "hash-xyz",
   occurred_at: "2026-04-15T10:00:00Z",
   observed_at: "2026-04-16T08:00:00Z",
   summary: "District seeking bids for 45 electric school buses, delivery by August 2026.",
   title: "RFP: School Transportation Fleet 2026",
-  details: { due_at: "2026-06-01T17:00:00Z" },
-  confidence: 0.93,
-  status: "new",
-  is_degraded: false,
-  review_required: false,
-  created_at: "2026-04-16T08:00:00Z",
 };
 
 const SOURCES: PublicSignalSources = {
@@ -75,7 +69,7 @@ function mockNavigation() {
 }
 
 async function renderSignalPage(
-  signalOverride: SignalRead | null = BASE_SIGNAL,
+  signalOverride: PublicSignalRead | null = BASE_SIGNAL,
   sourcesOverride: PublicSignalSources | "reject" = SOURCES,
 ) {
   mockNavigation();
@@ -88,6 +82,8 @@ async function renderSignalPage(
         : vi.fn().mockResolvedValue(sourcesOverride),
     fetchPublicSignals: vi.fn(),
     fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+    isPublicSignalType: (t: string) =>
+      ["rfp_posted", "news_mention", "grant_awarded"].includes(t),
     SIGNALS_REVALIDATE_SECONDS: 300,
     SITEMAP_SIGNAL_LIMIT: 1000,
   }));
@@ -194,6 +190,8 @@ describe("PublicSignalPage — render", () => {
       fetchPublicSignalSources: vi.fn().mockResolvedValue(EMPTY_SOURCES),
       fetchPublicSignals: vi.fn(),
       fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      isPublicSignalType: (t: string) =>
+        ["rfp_posted", "news_mention", "grant_awarded"].includes(t),
       SIGNALS_REVALIDATE_SECONDS: 300,
       SITEMAP_SIGNAL_LIMIT: 1000,
     }));
@@ -207,18 +205,29 @@ describe("PublicSignalPage — render", () => {
       )({ params: Promise.resolve({ id: "missing" }) }),
     ).rejects.toThrow("NEXT_NOT_FOUND");
   });
+
+  it("calls notFound() for a non-public signal type (P2 public-surface gate)", async () => {
+    // Defensive: even if the API returned a paid-tier type, the page must 404.
+    const NON_PUBLIC: PublicSignalRead = {
+      ...BASE_SIGNAL,
+      signal_type: "board_agenda_item",
+    };
+    await expect(renderSignalPage(NON_PUBLIC)).rejects.toThrow("NEXT_NOT_FOUND");
+  });
 });
 
 // ---- generateMetadata tests ----
 
 describe("PublicSignalPage — generateMetadata", () => {
-  async function getMeta(signal: SignalRead | null) {
+  async function getMeta(signal: PublicSignalRead | null) {
     mockNavigation();
     vi.doMock("@/lib/public-signals-api", () => ({
       fetchPublicSignal: vi.fn().mockResolvedValue(signal),
       fetchPublicSignalSources: vi.fn().mockResolvedValue(EMPTY_SOURCES),
       fetchPublicSignals: vi.fn(),
       fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      isPublicSignalType: (t: string) =>
+        ["rfp_posted", "news_mention", "grant_awarded"].includes(t),
       SIGNALS_REVALIDATE_SECONDS: 300,
       SITEMAP_SIGNAL_LIMIT: 1000,
     }));

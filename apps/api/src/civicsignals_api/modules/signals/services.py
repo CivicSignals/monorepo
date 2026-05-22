@@ -91,6 +91,8 @@ from .models_fuzzy_review import (
 )
 from .schemas import (
     PAYLOAD_BY_TYPE,
+    PUBLIC_SIGNAL_TYPES,
+    PublicSignalRead,
     SignalPage,
     SignalPayload,
     SignalRead,
@@ -98,6 +100,7 @@ from .schemas import (
     SignalSourcesRead,
     SignalType,
     SignalValidationError,
+    is_public_signal_type,
     parse_signal_payload,
 )
 from .scoring import (
@@ -471,9 +474,44 @@ async def decide_fuzzy_review(
 
 
 async def get_signal(session: AsyncSession, signal_id: uuid.UUID) -> SignalRead | None:
-    """Fetch one global signal by id (doc 08; the signal-detail read seam)."""
+    """Fetch one global signal by id (doc 08; the signal-detail read seam).
+
+    This is the **authenticated** read shape (the full internal ``SignalRead``). The
+    public ``/s/{id}`` page uses :func:`get_public_signal` instead — a narrowed,
+    public-type-gated projection (P2; doc 13 §4.1, §4.6).
+    """
     row = await session.get(Signal, signal_id)
     return SignalRead.model_validate(row) if row is not None else None
+
+
+async def get_public_signal(session: AsyncSession, signal_id: uuid.UUID) -> PublicSignalRead | None:
+    """Fetch the public projection of a signal for the /s/{id} page (P2).
+
+    Returns a narrowed :class:`PublicSignalRead` (public-safe fields only — no
+    ``content_hash`` / ``raw_document_ids`` / ``confidence`` / ``status`` / internal
+    ``details``) — the SHOULD-FIX narrowed projection that mirrors C5's public entity
+    read precedent (doc 13 §4.2: depth is paid, not the public layer).
+
+    Returns ``None`` (so the route 404s) when the signal does not exist **or** its
+    type is not in :data:`~signals.schemas.PUBLIC_SIGNAL_TYPES` (doc 13 §4.1, §4.6) —
+    the authoritative server-side gate so a paid-tier signal cannot be scraped by id.
+    Merged (soft-deleted, doc 19 §7.4) rows are also withheld — they no longer surface
+    publicly.
+    """
+    row = await session.get(Signal, signal_id)
+    if row is None or not is_public_signal_type(row.signal_type):
+        return None
+    if row.status == SIGNAL_STATUS_MERGED:
+        return None
+    return PublicSignalRead(
+        id=row.id,
+        signal_type=row.signal_type,
+        title=row.title,
+        summary=row.summary,
+        entity_name=row.entity_name_raw,
+        occurred_at=row.occurred_at,
+        observed_at=row.observed_at,
+    )
 
 
 async def get_signal_sources(
@@ -494,16 +532,21 @@ async def get_signal_sources(
     cycle (signals ← ingestion ← signals via the event bus), matching how
     ``foia.services`` reaches the same seam.
 
-    Returns ``None`` when the signal does not exist (so the route can 404), and a
-    :class:`SignalSourcesRead` with possibly-empty ``sources`` when it exists but has
-    no resolvable documents (an unresolved/manual signal — the page still renders,
-    just without citations). Documents whose ids no longer resolve are skipped rather
-    than erroring: a missing raw-document row must not 500 a public page.
+    Returns ``None`` when the signal does not exist **or** its type is not in
+    :data:`~signals.schemas.PUBLIC_SIGNAL_TYPES` (doc 13 §4.1, §4.6) — both 404 on the
+    public route so a non-public (paid-tier) signal cannot be scraped by id through the
+    sources endpoint. Returns a :class:`SignalSourcesRead` with possibly-empty
+    ``sources`` when a public signal exists but has no resolvable documents (an
+    unresolved/manual signal — the page still renders, just without citations).
+    Documents whose ids no longer resolve are skipped rather than erroring: a missing
+    raw-document row must not 500 a public page.
     """
     from civicsignals_api.modules.ingestion import services as ingestion_services
 
     signal = await session.get(Signal, signal_id)
-    if signal is None:
+    if signal is None or not is_public_signal_type(signal.signal_type):
+        # Public-type gate (P2; doc 13 §4.1, §4.6): a paid-tier signal is invisible to
+        # the public surface — 404 so it cannot be scraped by id.
         return None
 
     sources: list[SignalSource] = []
@@ -1172,6 +1215,7 @@ __all__ = [
     "HIGH_STAKES_TYPES",
     "MAX_LIMIT",
     "PAYLOAD_BY_TYPE",
+    "PUBLIC_SIGNAL_TYPES",
     "REVIEW_STATUS_APPROVED",
     "REVIEW_STATUS_PENDING",
     "REVIEW_STATUS_REJECTED",
@@ -1188,6 +1232,7 @@ __all__ = [
     "FuzzyReviewNotFoundError",
     "FuzzyReviewSignalMissingError",
     "IcpCriteria",
+    "PublicSignalRead",
     "ScoreResult",
     "ScoringConfig",
     "SignalDimensions",
@@ -1218,9 +1263,11 @@ __all__ = [
     "encode_cursor",
     "find_duplicate",
     "get_fuzzy_review",
+    "get_public_signal",
     "get_signal",
     "get_signal_sources",
     "is_high_stakes_type",
+    "is_public_signal_type",
     "list_fuzzy_reviews",
     "list_signals",
     "list_workspace_signals",
