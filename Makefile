@@ -69,4 +69,4 @@ check-recipes: ## Validate recipes against the JSON Schema + replay golden fixtu
 	uvx --from check-jsonschema check-jsonschema \
 		--schemafile packages/recipe-schema/schema/recipe.schema.json \
 		recipes/*/recipe.yml
-	python scripts/replay_fixtures.py recipes
+	python3 scripts/replay_fixtures.py recipes

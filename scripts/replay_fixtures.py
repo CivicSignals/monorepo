@@ -93,7 +93,7 @@ def main(argv: list[str]) -> int:
             checked += 1
             # The committed expectation must itself be valid JSON.
             try:
-                expected_doc = json.loads(expected.read_text())
+                expected_doc = json.loads(expected.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 errors.append(f"{expected}: invalid JSON ({exc})")
                 continue
