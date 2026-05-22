@@ -25,7 +25,7 @@ Each `.yaml` file must contain the following top-level keys:
 | `fee_waiver_language` | string | Boilerplate for requesting fee waivers under this statute |
 | `submission_method_hint` | string | Common submission methods for this jurisdiction |
 | `status` | string | MUST be `draft` — all templates await counsel review |
-| `placeholders` | list[string] | All placeholder tokens present in `body` |
+| `placeholders` | list[string] | Caller-supplied placeholder tokens (see note below) |
 | `body` | string | Markdown request body with `{placeholder}` tokens |
 
 ## Placeholder conventions
@@ -43,16 +43,34 @@ Each `.yaml` file must contain the following top-level keys:
 | `{date}` | Date the request is submitted |
 | `{fee_waiver_basis}` | Basis for fee waiver (e.g. "news media", "educational institution") |
 
-All placeholders are listed under the `placeholders` key in each template.
-Three placeholders are **optional** — callers may omit them or pass an empty string
-and `render_template()` will substitute an empty string rather than raising an error:
+### Caller-supplied placeholders (`placeholders` list)
+
+The `placeholders` list in each template contains **only caller-supplied keys** —
+values the API client must provide in the `render_template()` context dict. It does
+**not** include template-owned tokens (see below).
+
+Three caller-supplied placeholders are **optional** — callers may omit them or pass
+an empty string and `render_template()` will substitute an empty string in the rendered
+body rather than raising an error:
 
 - `{requester_phone}`
 - `{requester_organization}`
 - `{records_officer_name}`
 
-All other placeholders are **required**. Passing a missing or empty required
-placeholder to `render_template()` raises `MissingPlaceholderError` (HTTP 422).
+All other placeholders in `placeholders` are **required**. Passing a missing or empty
+required placeholder raises `MissingPlaceholderError` (HTTP 422).
+
+### Template-owned tokens
+
+Some `{token}` references appear in the body but are **not** in `placeholders` because
+they are resolved automatically from the template definition itself (not from the caller):
+
+- `{fee_waiver_language}` — injected from the template's `fee_waiver_language` field.
+
+Template-owned tokens may themselves contain caller-supplied placeholders (e.g.
+`fee_waiver_language` often contains `{fee_waiver_basis}` and `{entity_name}`). These
+are resolved from the caller's context in the same rendering pass. Do **not** add
+template-owned token names to the `placeholders` list — the validator will reject it.
 
 ## Status
 

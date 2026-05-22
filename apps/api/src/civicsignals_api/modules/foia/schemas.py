@@ -53,7 +53,15 @@ class FoiaTemplateRead(BaseModel):
         description="Common submission method(s) for this jurisdiction."
     )
     status: str = Field(description="Template status; 'draft' = pending counsel review.")
-    placeholders: list[str] = Field(description="All named placeholder tokens present in the body.")
+    placeholders: list[str] = Field(
+        description=(
+            "Caller-supplied placeholder keys the client must provide to render this template. "
+            "Does NOT include template-owned tokens (e.g. 'fee_waiver_language') that are "
+            "injected automatically from the template definition. "
+            "Three entries are optional (requester_phone, requester_organization, "
+            "records_officer_name) — all others are required."
+        )
+    )
     body: str = Field(description="Markdown request body with {placeholder} tokens.")
 
 
@@ -76,8 +84,12 @@ class FoiaTemplateRenderRequest(BaseModel):
 
     context: dict[str, str] = Field(
         description=(
-            "Key-value map of placeholder values. All placeholders listed in "
-            "the template's 'placeholders' field must be present and non-empty."
+            "Key-value map of placeholder values. Required placeholders (all entries "
+            "in the template's 'placeholders' list except requester_phone, "
+            "requester_organization, and records_officer_name) must be present and "
+            "non-empty, or a 422 error is returned. Optional placeholders default to "
+            "empty string when omitted. Template-owned tokens (e.g. fee_waiver_language) "
+            "are injected automatically and must NOT be supplied here."
         )
     )
 

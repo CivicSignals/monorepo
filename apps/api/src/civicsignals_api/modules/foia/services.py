@@ -228,6 +228,15 @@ def _load_template_file(path: Path) -> FoiaTemplate:
     fee_waiver_text: str = str(raw.get("fee_waiver_language", ""))
     declared: set[str] = {str(p) for p in raw.get("placeholders", [])}
 
+    # Reject template-owned keys if mistakenly listed in ``placeholders``.
+    # They are injected automatically and must not be required from callers.
+    owned_in_declared = declared & _TEMPLATE_OWNED_KEYS
+    if owned_in_declared:
+        raise TemplateLoadError(
+            f"{path.name}: template-owned keys must not appear in 'placeholders': "
+            f"{sorted(owned_in_declared)}. Remove them from the 'placeholders' list."
+        )
+
     # Placeholders allowed in template-owned fields: they must either be in
     # ``placeholders`` (user-supplied) or be other template-owned keys.
     # We do NOT allow new undeclared placeholders inside fee_waiver_language.
@@ -257,6 +266,16 @@ def _load_template_file(path: Path) -> FoiaTemplate:
             f"(currently: {sorted(_TEMPLATE_OWNED_KEYS)})."
         )
 
+    # Verify that all declared placeholders are actually used in body or
+    # fee_waiver_language (prevents silent dead entries that inflate required set).
+    all_used = body_placeholders | (fwl_placeholders - _TEMPLATE_OWNED_KEYS)
+    unused_declared = declared - all_used
+    if unused_declared:
+        raise TemplateLoadError(
+            f"{path.name}: 'placeholders' contains keys not used in body or "
+            f"fee_waiver_language: {sorted(unused_declared)}. Remove unused entries."
+        )
+
     return FoiaTemplate(raw)
 
 
@@ -265,9 +284,23 @@ def _build_registry() -> dict[str, FoiaTemplate]:
 
     Called once at module import. Raises :exc:`TemplateLoadError` on the first
     bad file so startup fails loudly rather than silently skipping templates.
+    Also raises if the templates directory is missing or contains no YAML files
+    (fail-fast: the API must not start with an empty template library).
     """
+    if not TEMPLATES_DIR.is_dir():
+        raise TemplateLoadError(
+            f"FOIA templates directory not found: {TEMPLATES_DIR}. "
+            "Ensure the 'templates/' directory is included in the deployed artifact."
+        )
+
     registry: dict[str, FoiaTemplate] = {}
     yaml_files = sorted(TEMPLATES_DIR.glob("*.yaml"))
+    if not yaml_files:
+        raise TemplateLoadError(
+            f"No YAML template files found in {TEMPLATES_DIR}. "
+            "At least one template is required for the FOIA module to operate."
+        )
+
     for path in yaml_files:
         tmpl = _load_template_file(path)
         if tmpl.jurisdiction in registry:
