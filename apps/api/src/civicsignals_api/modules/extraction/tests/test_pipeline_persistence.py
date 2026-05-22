@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -38,6 +38,12 @@ from civicsignals_api.llm_gateway import (
     ModelChoice,
     TaskModelPolicy,
 )
+
+# Import the entities models so ``entities_entity`` (the target of
+# ``signals_signal.entity_id``) is on Base.metadata and the FK DDL resolves when we
+# create signals_signal below. The end-to-end signal is stored entity_id=None, so
+# no entity rows are needed — only the table must exist for the FK.
+from civicsignals_api.modules.entities import models as _entities_models  # noqa: F401
 from civicsignals_api.modules.extraction import pipeline, services
 from civicsignals_api.modules.extraction.models import (
     JOB_STATUS_DONE,
@@ -48,6 +54,7 @@ from civicsignals_api.modules.extraction.models import (
 )
 from civicsignals_api.modules.extraction.relevance import RelevanceClassifier
 from civicsignals_api.modules.ingestion.services import StoredRawDocument
+from civicsignals_api.modules.signals.models import Signal
 
 _DSN = os.environ.get("EXTRACTION_TEST_DSN")
 pytestmark = pytest.mark.skipif(
@@ -81,13 +88,32 @@ async def engine() -> AsyncIterator[AsyncEngine]:
         Base.metadata.tables[ExtractionCandidate.__tablename__],
     ]
     relevance = Base.metadata.tables[RelevanceDecision.__tablename__]
+    # The store stage now promotes candidates into signals_signal (E4), so the
+    # end-to-end test needs that table too. signals_signal.entity_id FKs the global
+    # entities tables, so those must exist for the FK DDL to resolve (no entity rows
+    # are inserted — the end-to-end signal is stored entity_id=None). pgvector +
+    # pg_trgm back the signal embedding + entity name index respectively.
+    signals = Base.metadata.tables[Signal.__tablename__]
+    entity_tables = [
+        Base.metadata.tables[name] for name in ("entities_entity", "entities_geo", "entities_kind")
+    ]
     async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all, tables=[*owned, relevance], checkfirst=True)
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[*owned, relevance, *entity_tables, signals],
+            checkfirst=True,
+        )
     try:
         yield eng
     finally:
         async with eng.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all, tables=owned, checkfirst=True)
+            # Drop signals_signal first (extraction owns neither relevance nor
+            # signals lifecycle, but the end-to-end test populated signals here, so
+            # we clean it up). Use CASCADE-free drop since nothing FKs into it in
+            # this scoped schema.
+            await conn.run_sync(Base.metadata.drop_all, tables=[*owned, signals], checkfirst=True)
         await eng.dispose()
 
 
@@ -200,7 +226,15 @@ async def test_pipeline_end_to_end_persists_candidate(
         extract=json.dumps(
             {
                 "candidates": [
-                    {"signal_type": "rfp_posted", "confidence": 0.8, "fields": {"title": "ERP RFP"}}
+                    {
+                        "signal_type": "rfp_posted",
+                        "confidence": 0.8,
+                        "fields": {
+                            "title": "ERP RFP",
+                            "summary": "RFP for ERP modernization.",
+                            "due_at": "2026-06-01T17:00:00Z",
+                        },
+                    }
                 ]
             }
         ),
@@ -239,6 +273,21 @@ async def test_pipeline_end_to_end_persists_candidate(
         assert candidates[0].signal_type == "rfp_posted"
         assert candidates[0].fields["title"] == "ERP RFP"
         assert candidates[0].confidence == pytest.approx(0.8)
+        # The candidate was promoted into a global signal (E4 hard gate passed).
+        assert candidates[0].status == "promoted"
+
+        # The funnel produced exactly one signals_signal row, linked back to the job
+        # + candidate (doc 19 §1 store; doc 07 signals_signal).
+        signals = (
+            (await session.execute(select(Signal).where(Signal.extraction_job_id == job.id)))
+            .scalars()
+            .all()
+        )
+        assert len(signals) == 1
+        assert signals[0].signal_type == "rfp_posted"
+        assert signals[0].title == "ERP RFP"
+        assert signals[0].source_candidate_id == candidates[0].id
+        assert str(doc_id) in signals[0].raw_document_ids
 
         refreshed = await session.get(ExtractionJob, job.id)
         assert refreshed is not None
