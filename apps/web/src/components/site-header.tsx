@@ -4,7 +4,10 @@ import Link from "next/link";
 import { AuthNav } from "@/components/auth/auth-nav";
 
 // Internal routes that exist in the App Router.
-const INTERNAL_LINKS = [{ href: "/pricing" as const, label: "Pricing" }];
+const INTERNAL_LINKS = [
+  { href: "/entities" as const, label: "Entities" },
+  { href: "/pricing" as const, label: "Pricing" },
+];
 
 // External links rendered as plain <a> to avoid typedRoutes validation.
 const EXTERNAL_LINKS = [
