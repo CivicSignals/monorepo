@@ -4,7 +4,7 @@
 // loading, error, and not-found states.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
@@ -150,12 +150,20 @@ type MockReturn = ReturnType<typeof useSignalDetail>;
 function stub(over: {
   data?: SignalDetailRead;
   isLoading?: boolean;
+  isPending?: boolean;
   error?: Error | null;
+  fetchStatus?: "fetching" | "paused" | "idle";
+  refetch?: () => unknown;
+  isFetching?: boolean;
 }): MockReturn {
   return {
     data: undefined,
     isLoading: false,
+    isPending: false,
     error: null,
+    fetchStatus: "idle",
+    refetch: vi.fn(),
+    isFetching: false,
     ...over,
   } as MockReturn;
 }
@@ -274,9 +282,11 @@ describe("SignalDetail — loaded view", () => {
   });
 });
 
-describe("SignalDetail — loading / error / not-found", () => {
+describe("SignalDetail — loading / error / not-found / disabled", () => {
   it("shows the skeleton while loading", () => {
-    mockUseSignalDetail.mockReturnValue(stub({ isLoading: true }) as MockReturn);
+    mockUseSignalDetail.mockReturnValue(
+      stub({ isLoading: true, isPending: true, fetchStatus: "fetching" }) as MockReturn,
+    );
     render(<SignalDetail id="sig-001" />, { wrapper });
     expect(screen.getByTestId("signal-loading")).toBeTruthy();
   });
@@ -304,5 +314,27 @@ describe("SignalDetail — loading / error / not-found", () => {
     expect(screen.getByTestId("signal-error").textContent).toContain(
       "Service unavailable",
     );
+  });
+
+  it("offers a retry on a non-404 error that calls refetch", () => {
+    const refetch = vi.fn();
+    mockUseSignalDetail.mockReturnValue(
+      stub({ error: new Error("Service unavailable"), refetch }) as MockReturn,
+    );
+    render(<SignalDetail id="sig-001" />, { wrapper });
+    fireEvent.click(screen.getByTestId("error-retry"));
+    expect(refetch).toHaveBeenCalledOnce();
+  });
+
+  // G2 fall-through fix: a *disabled* query (no token / workspace) reports
+  // status:'pending' + fetchStatus:'idle' (isLoading is false). It must show a
+  // sign-in prompt, NOT "Signal not found".
+  it("shows an auth-required state — not 'Signal not found' — when the query is disabled", () => {
+    mockUseSignalDetail.mockReturnValue(
+      stub({ isPending: true, fetchStatus: "idle" }) as MockReturn,
+    );
+    render(<SignalDetail id="sig-001" />, { wrapper });
+    expect(screen.getByTestId("signal-auth-required")).toBeTruthy();
+    expect(screen.queryByTestId("signal-not-found")).toBeNull();
   });
 });

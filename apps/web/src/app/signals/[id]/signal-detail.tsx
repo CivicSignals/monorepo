@@ -10,9 +10,11 @@
 // - F4: the "Why this signal?" panel (WhyThisSignal) renders human-readable bullets
 //   + component contributions from score_breakdown; the Inspect panel still keeps the
 //   raw JSON below for debugging / transparency.
-// - TODO G4: per-signal status transitions (dismiss / pin / push) attach to the
+// - G4: per-signal status transitions (dismiss / pin / push) attach to the
 //   header action area.
-// - TODO G5: polished loading skeleton / empty / error states.
+// - G5: polished loading skeleton, error state with retry, and an auth-required
+//   state for the disabled query (no token / workspace) — the latter fixes the
+//   G2 fall-through where a disabled query rendered "Signal not found".
 
 "use client";
 
@@ -29,6 +31,7 @@ import { useSignalDetail } from "@/hooks/use-signals";
 import { ProblemError } from "@/lib/auth-api";
 import { StatusControls } from "@/components/signals/status-controls";
 import { FeedbackControls } from "@/components/signals/feedback-controls";
+import { AuthRequiredState, ErrorState } from "@/components/ui/states";
 import { WhyThisSignal } from "./why-this-signal";
 
 // ---- Helpers ----------------------------------------------------------------
@@ -219,7 +222,24 @@ interface SignalDetailProps {
 }
 
 export function SignalDetail({ id }: SignalDetailProps) {
-  const { data, isLoading, error } = useSignalDetail(id);
+  const { data, isLoading, isPending, error, fetchStatus, refetch, isFetching } =
+    useSignalDetail(id);
+
+  // The query is *disabled* (no token / active workspace) when it is still
+  // pending yet not fetching — TanStack v5 reports status:'pending' +
+  // fetchStatus:'idle' (so `isLoading`, which is pending && fetching, is false).
+  // Without this guard the component falls through to `!data` → "Signal not
+  // found", wrongly implying the signal is missing (the G2 fall-through bug).
+  // Surface a sign-in prompt instead.
+  if (isPending && fetchStatus === "idle") {
+    return (
+      <AuthRequiredState
+        testId="signal-auth-required"
+        title="Sign in to view this signal"
+        description="Sign in and pick a workspace to view this signal."
+      />
+    );
+  }
 
   if (isLoading) return <DetailSkeleton />;
 
@@ -243,13 +263,13 @@ export function SignalDetail({ id }: SignalDetailProps) {
         </Link>
       </div>
     ) : (
-      <div
-        role="alert"
-        data-testid="signal-error"
-        className="rounded-lg border border-destructive/50 bg-destructive/10 px-5 py-4 text-sm text-destructive"
-      >
-        {message}
-      </div>
+      <ErrorState
+        testId="signal-error"
+        title="Couldn't load this signal"
+        message={message}
+        onRetry={() => void refetch()}
+        retrying={isFetching}
+      />
     );
   }
 

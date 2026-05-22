@@ -68,7 +68,9 @@ export const feedKeys = {
  *
  * Server state only — do NOT put feed data in Zustand (doc 06 §2).
  *
- * TODO G5: polished loading/empty/error states (leave seams here).
+ * G5: the FeedList consumes this hook's `isPending` + `fetchStatus` to tell the
+ * disabled (no token / workspace) case apart from a genuine empty feed, and its
+ * `refetch` / `isFetching` to drive the error-state retry affordance.
  */
 export function useWorkspaceFeed(filters: Omit<FeedFilters, "cursor"> = {}) {
   const { token, workspaceId } = useAuth();

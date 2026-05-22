@@ -116,12 +116,19 @@ function makeInfiniteData(pages: FeedPage[]): InfiniteData<FeedPage> {
 
 type MockReturn = ReturnType<typeof useWorkspaceFeed>;
 
-function stubIdle(): Partial<MockReturn> {
+// A disabled query (no token / workspace): TanStack v5 reports status:'pending'
+// + fetchStatus:'idle', so isPending is true while isLoading (pending && fetching)
+// is false. The feed must show the auth-required state, not an empty feed.
+function stubDisabled(): Partial<MockReturn> {
   return {
     data: undefined,
     isLoading: false,
+    isPending: true,
+    fetchStatus: "idle",
     isError: false,
     error: null,
+    refetch: vi.fn(),
+    isFetching: false,
     fetchNextPage: vi.fn(),
     hasNextPage: false,
     isFetchingNextPage: false,
@@ -132,20 +139,29 @@ function stubLoading(): Partial<MockReturn> {
   return {
     data: undefined,
     isLoading: true,
+    isPending: true,
+    fetchStatus: "fetching",
     isError: false,
     error: null,
+    refetch: vi.fn(),
+    isFetching: true,
     fetchNextPage: vi.fn(),
     hasNextPage: false,
     isFetchingNextPage: false,
   };
 }
 
+// A settled error: status:'error' (so isPending is false), fetchStatus:'idle'.
 function stubError(msg = "Network error"): Partial<MockReturn> {
   return {
     data: undefined,
     isLoading: false,
+    isPending: false,
+    fetchStatus: "idle",
     isError: true,
     error: new Error(msg),
+    refetch: vi.fn(),
+    isFetching: false,
     fetchNextPage: vi.fn(),
     hasNextPage: false,
     isFetchingNextPage: false,
@@ -156,8 +172,12 @@ function stubLoaded(pages: FeedPage[], hasNextPage = false): Partial<MockReturn>
   return {
     data: makeInfiniteData(pages),
     isLoading: false,
+    isPending: false,
+    fetchStatus: "idle",
     isError: false,
     error: null,
+    refetch: vi.fn(),
+    isFetching: false,
     fetchNextPage: vi.fn(),
     hasNextPage,
     isFetchingNextPage: false,
@@ -236,10 +256,13 @@ describe("FeedList — renders items from mocked data", () => {
 });
 
 describe("FeedList — loading state", () => {
-  it("shows loading indicator when isLoading", () => {
+  it("shows a skeleton (not a bare spinner) when loading", () => {
     mockUseWorkspaceFeed.mockReturnValue(stubLoading() as MockReturn);
     render(<FeedList />, { wrapper });
+    // The skeleton container reuses the feed-loading testid…
     expect(screen.getByTestId("feed-loading")).toBeTruthy();
+    // …and renders placeholder rows that mirror the real layout.
+    expect(screen.getAllByTestId("feed-item-skeleton").length).toBeGreaterThan(0);
   });
 
   it("does not render feed-list while loading", () => {
@@ -258,22 +281,66 @@ describe("FeedList — error state", () => {
     const err = screen.getByTestId("feed-error");
     expect(err.textContent).toContain("Service unavailable");
   });
+
+  it("offers a retry that calls refetch", () => {
+    const refetch = vi.fn();
+    mockUseWorkspaceFeed.mockReturnValue({
+      ...(stubError("Service unavailable") as MockReturn),
+      refetch,
+    } as MockReturn);
+    render(<FeedList />, { wrapper });
+    fireEvent.click(screen.getByTestId("error-retry"));
+    expect(refetch).toHaveBeenCalledOnce();
+  });
 });
 
-describe("FeedList — empty state", () => {
-  it("shows empty state when data has no items", () => {
+describe("FeedList — empty states", () => {
+  it("shows the no-signals-yet empty state when there are no filters", () => {
     mockUseWorkspaceFeed.mockReturnValue(
       stubLoaded([makePage([])]) as MockReturn,
     );
     render(<FeedList />, { wrapper });
     expect(screen.getByTestId("feed-empty")).toBeTruthy();
+    expect(screen.queryByTestId("feed-empty-filtered")).toBeNull();
   });
 
-  it("shows empty state when not authenticated (no data)", () => {
-    mockUseWorkspaceFeed.mockReturnValue(stubIdle() as MockReturn);
+  it("shows the filtered empty state (distinct) when filters are active", () => {
+    mockUseWorkspaceFeed.mockReturnValue(
+      stubLoaded([makePage([])]) as MockReturn,
+    );
+    render(
+      <FeedList
+        filters={{ signal_type: "rfp_posted" }}
+        onFiltersChange={vi.fn()}
+      />,
+      { wrapper },
+    );
+    expect(screen.getByTestId("feed-empty-filtered")).toBeTruthy();
+    expect(screen.queryByTestId("feed-empty")).toBeNull();
+  });
+
+  it("the filtered empty state can clear filters", () => {
+    mockUseWorkspaceFeed.mockReturnValue(
+      stubLoaded([makePage([])]) as MockReturn,
+    );
+    const onChange = vi.fn();
+    render(
+      <FeedList filters={{ min_score: 80 }} onFiltersChange={onChange} />,
+      { wrapper },
+    );
+    fireEvent.click(screen.getByTestId("feed-clear-filters"));
+    expect(onChange).toHaveBeenCalledWith({});
+  });
+});
+
+describe("FeedList — disabled / auth-required state", () => {
+  it("shows the auth-required state (not an empty feed) when the query is disabled", () => {
+    mockUseWorkspaceFeed.mockReturnValue(stubDisabled() as MockReturn);
     render(<FeedList />, { wrapper });
-    // Neither loading nor error; items array is empty → empty state
-    expect(screen.getByTestId("feed-empty")).toBeTruthy();
+    expect(screen.getByTestId("feed-auth-required")).toBeTruthy();
+    // Must NOT imply the feed is empty.
+    expect(screen.queryByTestId("feed-empty")).toBeNull();
+    expect(screen.queryByTestId("feed-loading")).toBeNull();
   });
 });
 

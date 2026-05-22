@@ -11,8 +11,10 @@
 //   URL search params without a Zustand store (they are ephemeral UI state,
 //   not workspace-level client state).
 //
-// Seams:
-// - TODO G5: polish loading skeletons / empty / error states.
+// G5: polished loading skeleton (mirrors a feed row), distinct empty states
+// (no filters → "no signals yet"; active filters → "no matches, clear filters"),
+// an error state with a retry affordance, and an auth-required state for the
+// disabled query (no token / workspace) so we never imply the feed is empty.
 
 "use client";
 
@@ -29,6 +31,12 @@ import { SIGNAL_TYPE_LABELS } from "@/lib/signals-api";
 import { useWorkspaceFeed } from "@/hooks/use-signals";
 import { StatusControls } from "@/components/signals/status-controls";
 import { BulkActionBar } from "@/components/signals/bulk-action-bar";
+import {
+  AuthRequiredState,
+  EmptyState,
+  ErrorState,
+  SkeletonBlock,
+} from "@/components/ui/states";
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -176,6 +184,55 @@ function FeedItemCard({
   );
 }
 
+/**
+ * A single skeleton feed row that mirrors {@link FeedItemCard}'s layout
+ * (checkbox · type badge + title + summary + meta on the left, score on the
+ * right) so the skeleton → content swap doesn't shift the page.
+ */
+function FeedItemSkeleton() {
+  return (
+    <div
+      data-testid="feed-item-skeleton"
+      className="rounded-lg border border-gray-200 bg-white p-4"
+    >
+      <div className="flex items-start gap-3">
+        <SkeletonBlock className="mt-1 h-4 w-4 flex-shrink-0" />
+        <div className="flex flex-1 items-start justify-between gap-4">
+          <div className="min-w-0 flex-1 space-y-2">
+            <SkeletonBlock className="h-3 w-20 rounded-full" />
+            <SkeletonBlock className="h-4 w-3/4" />
+            <SkeletonBlock className="h-3 w-full" />
+            <SkeletonBlock className="h-3 w-2/5" />
+          </div>
+          <div className="flex-shrink-0 space-y-1 text-right">
+            <SkeletonBlock className="h-4 w-12 rounded-full" />
+            <SkeletonBlock className="ml-auto h-3 w-10" />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** A list of {@link FeedItemSkeleton} rows shown while the first page loads. */
+function FeedListSkeleton({ rows = 5 }: { rows?: number }) {
+  return (
+    <ul
+      data-testid="feed-loading"
+      role="status"
+      aria-busy="true"
+      aria-label="Loading signals"
+      className="space-y-3"
+    >
+      {Array.from({ length: rows }).map((_, i) => (
+        <li key={i}>
+          <FeedItemSkeleton />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 // ---- Filter controls --------------------------------------------------------
 
 const SIGNAL_TYPES: SignalType[] = [
@@ -292,7 +349,8 @@ export interface FeedListProps {
  * parent (page encodes them in URL search params). TanStack Query drives all
  * data fetching and pagination — server state never touches Zustand (doc 06 §2).
  *
- * TODO G5: replace basic loading/empty/error with polished skeleton/empty-state.
+ * G5: polished skeleton (mirrors a row), filter-aware empty state, error state
+ * with retry, and an auth-required state for the disabled query.
  */
 export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
   // Map FeedFiltersState → FeedFilters for the hook.
@@ -302,8 +360,31 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
     ...(filters.min_score !== undefined ? { min_score: filters.min_score } : {}),
   };
 
-  const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage } =
-    useWorkspaceFeed(queryFilters);
+  const hasActiveFilters =
+    filters.signal_type !== undefined ||
+    filters.status !== undefined ||
+    filters.min_score !== undefined;
+
+  const {
+    data,
+    isLoading,
+    isPending,
+    isError,
+    error,
+    fetchStatus,
+    refetch,
+    isFetching,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useWorkspaceFeed(queryFilters);
+
+  // The query is *disabled* (no token / active workspace) when it is still
+  // pending yet not fetching — TanStack v5 reports status:'pending' +
+  // fetchStatus:'idle' (so `isLoading`, which is pending && fetching, is false).
+  // Surface a sign-in prompt instead of an empty feed so we never imply the
+  // workspace has no signals when we simply haven't asked.
+  const isDisabled = isPending && fetchStatus === "idle";
 
   const allItems = useMemo(
     () => data?.pages.flatMap((p) => p.data) ?? [],
@@ -359,41 +440,58 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
       {/* Bulk-action bar (G3) — appears when ≥ 1 row is selected. */}
       <BulkActionBar selectedIds={selectedList} onClear={clearSelection} />
 
-      {/* Loading state — TODO G5: replace with skeleton */}
-      {isLoading && (
-        <div
-          data-testid="feed-loading"
-          className="py-12 text-center text-sm text-gray-400"
-          role="status"
-          aria-live="polite"
-        >
-          Loading signals...
-        </div>
+      {/* Auth-required state — the query is disabled (no token / workspace). Show
+          a sign-in prompt rather than an empty/loading feed. */}
+      {isDisabled && (
+        <AuthRequiredState
+          testId="feed-auth-required"
+          title="Sign in to see your feed"
+          description="Sign in and pick a workspace to view its scored signal feed."
+        />
       )}
 
-      {/* Error state — TODO G5: replace with error card */}
-      {isError && (
-        <div
-          data-testid="feed-error"
-          className="py-8 text-center text-sm text-red-500"
-          role="alert"
-        >
-          Failed to load signals: {error?.message ?? "Unknown error"}
-        </div>
+      {/* Loading skeleton — mirrors a feed row so there's no layout shift. */}
+      {!isDisabled && isLoading && <FeedListSkeleton />}
+
+      {/* Error state — with a retry affordance wired to TanStack Query's refetch. */}
+      {!isDisabled && isError && (
+        <ErrorState
+          testId="feed-error"
+          title="Couldn't load signals"
+          message={error?.message ?? "Unknown error"}
+          onRetry={() => void refetch()}
+          retrying={isFetching}
+        />
       )}
 
-      {/* Empty state — TODO G5: replace with illustrated empty-state */}
-      {!isLoading && !isError && allItems.length === 0 && (
-        <div
-          data-testid="feed-empty"
-          className="py-16 text-center text-sm text-gray-400"
-        >
-          <p className="font-medium text-gray-500 mb-1">No signals yet</p>
-          <p>
-            Signals matching your ICP will appear here once the scoring pipeline
-            has run.
-          </p>
-        </div>
+      {/* Empty states — distinguish "filters matched nothing" from "no signals
+          at all" (different copy + action). */}
+      {!isDisabled && !isLoading && !isError && allItems.length === 0 && (
+        hasActiveFilters ? (
+          <EmptyState
+            testId="feed-empty-filtered"
+            title="No signals match these filters"
+            description="Try widening or clearing your filters to see more signals."
+            action={
+              onFiltersChange && (
+                <button
+                  type="button"
+                  data-testid="feed-clear-filters"
+                  onClick={() => onFiltersChange({})}
+                  className="rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50"
+                >
+                  Clear filters
+                </button>
+              )
+            }
+          />
+        ) : (
+          <EmptyState
+            testId="feed-empty"
+            title="No signals yet"
+            description="Signals matching your ICP will appear here once the scoring pipeline has run."
+          />
+        )
       )}
 
       {/* Feed items */}
