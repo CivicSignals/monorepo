@@ -16,6 +16,9 @@ SIGNAL_CREATED = "signal.created"
 SIGNAL_SCORED = "signal.scored"
 SIGNAL_PUSHED = "signal.pushed"
 MEMBER_INVITED = "member.invited"
+# B3: password reset audit events. B9 will consume and persist these.
+AUTH_PASSWORD_RESET_REQUESTED = "auth.password_reset.requested"
+AUTH_PASSWORD_RESET_COMPLETED = "auth.password_reset.completed"
 
 Handler = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -24,6 +27,17 @@ _subscribers: dict[str, list[Handler]] = defaultdict(list)
 
 def subscribe(event: str, handler: Handler) -> None:
     _subscribers[event].append(handler)
+
+
+def unsubscribe(event: str, handler: Handler) -> None:
+    """Remove all registrations of ``handler`` for ``event`` (idempotent).
+
+    If the same handler was registered more than once, all copies are removed so
+    the caller can call this once without regard to the registration count.
+    """
+    handlers = _subscribers.get(event)
+    if handlers:
+        _subscribers[event] = [h for h in handlers if h is not handler]
 
 
 async def publish(event: str, payload: dict[str, Any]) -> None:

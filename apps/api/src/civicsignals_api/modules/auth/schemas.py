@@ -7,7 +7,7 @@ from pydantic import BaseModel, EmailStr, Field
 from civicsignals_api.modules.accounts.schemas import UserOut
 
 # bcrypt operates on the first 72 bytes; cap length to keep behaviour predictable
-# and avoid wasting work on absurd inputs.
+# and avoid wasting work on absurd inputs. Consistent with B1 signup policy.
 PASSWORD_MIN_LEN = 8
 PASSWORD_MAX_LEN = 128
 
@@ -57,3 +57,28 @@ class SignupResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+# --- B3: Password reset -------------------------------------------------------
+
+
+class PasswordResetRequestBody(BaseModel):
+    """Body for POST /auth/password-reset/request.
+
+    Only the email is required; the response is ALWAYS 204 to prevent user
+    enumeration (doc 08 §3.1, threat-model §4.2).
+    """
+
+    email: EmailStr
+
+
+class PasswordResetConfirmBody(BaseModel):
+    """Body for POST /auth/password-reset/confirm.
+
+    ``token`` is the opaque URL-safe token from the reset email. ``new_password``
+    is validated against the same policy as signup (B1) so users can't set a
+    trivially weak password via the reset path.
+    """
+
+    token: str = Field(min_length=1)
+    new_password: str = Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN)

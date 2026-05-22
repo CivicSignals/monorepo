@@ -124,3 +124,34 @@ export function verifyEmail(
 export function getMe(token: string): Promise<User> {
   return request<User>("/auth/me", { token });
 }
+
+// --- B3: Password reset -------------------------------------------------------
+
+export interface PasswordResetRequestInput {
+  email: string;
+}
+
+/** POST /auth/password-reset/request — always 204, no user enumeration. */
+export function passwordResetRequest(
+  input: PasswordResetRequestInput,
+): Promise<void> {
+  return request<void>("/auth/password-reset/request", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export interface PasswordResetConfirmInput {
+  token: string;
+  new_password: string;
+}
+
+/** POST /auth/password-reset/confirm — 200 on success, 400 on bad token. */
+export function passwordResetConfirm(
+  input: PasswordResetConfirmInput,
+): Promise<{ message: string }> {
+  return request<{ message: string }>("/auth/password-reset/confirm", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}

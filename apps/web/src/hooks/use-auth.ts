@@ -10,12 +10,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type AuthResponse,
   type LoginInput,
+  type PasswordResetConfirmInput,
+  type PasswordResetRequestInput,
   type SignupInput,
   type SignupResponse,
   type User,
   getMe,
   login as loginApi,
   logout as logoutApi,
+  passwordResetConfirm as passwordResetConfirmApi,
+  passwordResetRequest as passwordResetRequestApi,
   signup as signupApi,
   verifyEmail as verifyEmailApi,
 } from "@/lib/auth-api";
@@ -77,5 +81,21 @@ export function useCurrentUser() {
     queryKey: ME_QUERY_KEY,
     queryFn: () => (token ? getMe(token) : Promise.resolve(null)),
     enabled: token !== null,
+  });
+}
+
+// --- B3: Password reset -------------------------------------------------------
+
+/** Always 204 — resolves void on success (no user enumeration). */
+export function usePasswordResetRequest() {
+  return useMutation<void, Error, PasswordResetRequestInput>({
+    mutationFn: passwordResetRequestApi,
+  });
+}
+
+/** Returns { message: "password reset" } on success, throws ProblemError on bad token. */
+export function usePasswordResetConfirm() {
+  return useMutation<{ message: string }, Error, PasswordResetConfirmInput>({
+    mutationFn: passwordResetConfirmApi,
   });
 }
