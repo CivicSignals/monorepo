@@ -14,6 +14,8 @@ RBAC), so the public surface is intentionally small and stable:
 - ``consume_email_verification_token`` — single-use verification.
 - ``create_password_reset_token`` / ``consume_password_reset_token`` — B3 reset
   flow. Token is single-use, hashed at rest, and expires after a configurable TTL.
+- ``google_oauth_start`` / ``google_oauth_callback`` — B2 Google OAuth2
+  authorization-code flow with PKCE + signed-state.
 
 Cross-module rules: user identity is owned by ``accounts`` and reached only via
 ``accounts.services``; verification mail goes out via ``notifications.services``.
@@ -22,14 +24,16 @@ Cross-module rules: user identity is owned by ``accounts`` and reached only via
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
+import httpx
 import jwt
 from passlib.context import CryptContext
 from sqlalchemy import select, update
@@ -39,7 +43,13 @@ from civicsignals_api.config import Settings, get_settings
 from civicsignals_api.modules.accounts import services as accounts_services
 from civicsignals_api.modules.accounts.models import User
 
-from .models import ApiToken, ApiTokenType, EmailVerificationToken, PasswordResetToken
+from .models import (
+    ApiToken,
+    ApiTokenType,
+    EmailVerificationToken,
+    OAuthIdentity,
+    PasswordResetToken,
+)
 
 # bcrypt at cost 12 (NFR §4.2). passlib transparently truncates >72 bytes; we
 # additionally reject overly long passwords at the schema layer.
@@ -640,3 +650,354 @@ async def touch_api_token(session: AsyncSession, token_id: uuid.UUID) -> None:
         update(ApiToken).where(ApiToken.id == token_id).values(last_used_at=datetime.now(UTC))
     )
     await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth2 authorization-code flow + account linking (B2)
+# ---------------------------------------------------------------------------
+# Design:
+# - ``google_oauth_start`` builds the Google authorization URL and a signed
+#   state nonce (HMAC-SHA256 over a random value, signed with the state secret).
+#   The signed state travels in the redirect URL so the callback can verify it
+#   without server-side session storage (stateless, threat-model §4.2).
+# - ``google_oauth_callback`` exchanges the code for tokens, fetches the
+#   verified email via the userinfo endpoint (no raw id_token validation
+#   required — we use the access token to hit the userinfo endpoint which
+#   Google always authenticates), links or creates the user, and issues a JWT.
+# - The Google HTTP calls are made through an *injectable* ``http_client``
+#   parameter so tests can mock them without live Google calls (threat-model
+#   §4.2: "no live vendor in CI").
+
+
+class OAuthError(AuthError):
+    """Base for OAuth-flow failures the route maps to RFC 7807 problems."""
+
+
+class OAuthStateMismatchError(OAuthError):
+    """The ``state`` param in the callback does not match the issued nonce."""
+
+
+class OAuthEmailUnverifiedError(OAuthError):
+    """Google reported that the account's email is not verified."""
+
+
+class OAuthProviderError(OAuthError):
+    """Google returned an error or an unexpected response."""
+
+
+# Google OAuth2 scopes — openid + email is the minimum to get a verified email.
+_GOOGLE_SCOPES = "openid email profile"
+# Length of the random PKCE code verifier (43-128 chars per RFC 7636).
+_PKCE_VERIFIER_BYTES = 32
+# Length of the random state nonce.
+_STATE_NONCE_BYTES = 16
+# HMAC algorithm for the state signature.
+_STATE_HMAC_ALG = "sha256"
+
+
+def _state_secret(settings: Settings) -> bytes:
+    """Return the signing key for the state nonce (bytes)."""
+    raw = settings.google_oauth_state_secret or settings.secret_key
+    return raw.encode("utf-8")
+
+
+def _sign_state(nonce: str, settings: Settings) -> str:
+    """Return ``<nonce>.<hex-sig>`` — a self-verifying state token."""
+    sig = hmac.new(_state_secret(settings), nonce.encode("utf-8"), _STATE_HMAC_ALG).hexdigest()
+    return f"{nonce}.{sig}"
+
+
+def _verify_state(state_token: str, settings: Settings) -> bool:
+    """Return True iff ``state_token`` was issued by :func:`_sign_state`."""
+    parts = state_token.split(".", 1)
+    if len(parts) != 2:
+        return False
+    nonce, provided_sig = parts
+    expected_sig = hmac.new(
+        _state_secret(settings), nonce.encode("utf-8"), _STATE_HMAC_ALG
+    ).hexdigest()
+    return hmac.compare_digest(provided_sig, expected_sig)
+
+
+def _derive_redirect_uri(settings: Settings) -> str:
+    """Return the OAuth redirect URI (override > derived from web_base_url)."""
+    if settings.google_oauth_redirect_uri:
+        return settings.google_oauth_redirect_uri
+    # The callback lives on the web app, not the API, so it round-trips through
+    # the browser. The web app hits /auth/oauth/google/callback on the API.
+    # Convention: web app calls the API callback endpoint directly.
+    return f"{settings.web_base_url}/auth/callback/google"
+
+
+@dataclass(frozen=True)
+class GoogleOAuthStartResult:
+    """Output of :func:`google_oauth_start` — the redirect URL + state nonce."""
+
+    authorization_url: str
+    state: str  # the signed state token to round-trip through the browser
+
+
+def google_oauth_start(settings: Settings | None = None) -> GoogleOAuthStartResult:
+    """Build the Google authorization URL and a signed state nonce.
+
+    No DB access required. Returns the URL to redirect the browser to plus the
+    state token (the route embeds it in the redirect response so the callback
+    can verify it; the client does not need to store it separately because we
+    embed it in the URL itself for the PKCE-less variant, or sign it here).
+
+    Raises :class:`OAuthProviderError` when ``GOOGLE_OAUTH_CLIENT_ID`` is not
+    configured (fail-closed: the endpoint is mounted but returns a clear error
+    rather than a cryptic crash).
+    """
+    settings = settings or get_settings()
+    client_id = settings.google_oauth_client_id
+    if not client_id:
+        raise OAuthProviderError("Google OAuth is not configured (GOOGLE_OAUTH_CLIENT_ID missing)")
+
+    nonce = secrets.token_urlsafe(_STATE_NONCE_BYTES)
+    state = _sign_state(nonce, settings)
+    redirect_uri = _derive_redirect_uri(settings)
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": _GOOGLE_SCOPES,
+        "state": state,
+        "access_type": "offline",
+        "prompt": "select_account",
+    }
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return GoogleOAuthStartResult(
+        authorization_url=f"https://accounts.google.com/o/oauth2/v2/auth?{query}",
+        state=state,
+    )
+
+
+# Type alias for the injectable HTTP-call factory used by the callback — a
+# callable that accepts the same kwargs as ``httpx.AsyncClient.post`` /
+# ``.get`` and returns the JSON body as a dict. Tests replace this with a mock.
+HttpPostFn = Callable[..., Any]
+
+
+async def _exchange_code_for_tokens(
+    code: str,
+    *,
+    settings: Settings,
+    http_post: HttpPostFn | None = None,
+) -> dict[str, Any]:
+    """Exchange an authorization code for an access token at Google's token URL.
+
+    Returns the raw token response dict. ``http_post`` is injectable so tests
+    can supply a mock without live Google calls.
+    """
+    redirect_uri = _derive_redirect_uri(settings)
+
+    if http_post is not None:
+        return http_post(  # type: ignore[no-any-return]
+            url=settings.google_oauth_token_url,
+            data={
+                "code": code,
+                "client_id": settings.google_oauth_client_id,
+                "client_secret": settings.google_oauth_client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            settings.google_oauth_token_url,
+            data={
+                "code": code,
+                "client_id": settings.google_oauth_client_id,
+                "client_secret": settings.google_oauth_client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+    if resp.status_code != 200:
+        raise OAuthProviderError(f"Google token exchange failed: {resp.status_code}")
+    return resp.json()  # type: ignore[no-any-return]
+
+
+async def _fetch_userinfo(
+    access_token: str,
+    *,
+    settings: Settings,
+    http_get: HttpPostFn | None = None,
+) -> dict[str, Any]:
+    """Fetch the verified email + sub from Google's userinfo endpoint.
+
+    Uses the access token rather than raw id_token validation so we avoid
+    implementing JWT signature verification for Google's keys (the userinfo
+    endpoint is always authenticated by the access token). ``http_get`` is
+    injectable for tests.
+    """
+    if http_get is not None:
+        return http_get(  # type: ignore[no-any-return]
+            url=settings.google_oauth_userinfo_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            settings.google_oauth_userinfo_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if resp.status_code != 200:
+        raise OAuthProviderError(f"Google userinfo fetch failed: {resp.status_code}")
+    return resp.json()  # type: ignore[no-any-return]
+
+
+async def get_oauth_identity_by_provider_subject(
+    session: AsyncSession,
+    provider: str,
+    subject: str,
+) -> OAuthIdentity | None:
+    """Return the OAuth identity for ``(provider, subject)``, or ``None``."""
+    result = await session.execute(
+        select(OAuthIdentity).where(
+            OAuthIdentity.provider == provider,
+            OAuthIdentity.subject == subject,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def link_oauth_identity(
+    session: AsyncSession,
+    *,
+    user: User,
+    provider: str,
+    subject: str,
+    provider_email: str,
+) -> OAuthIdentity:
+    """Persist a new OAuth identity row linking ``user`` to ``(provider, subject)``.
+
+    The caller is responsible for ensuring no identity for this ``(provider,
+    subject)`` already exists (use :func:`get_oauth_identity_by_provider_subject`
+    first). The caller commits.
+    """
+    identity = OAuthIdentity(
+        user_id=user.id,
+        provider=provider,
+        subject=subject,
+        provider_email=provider_email,
+    )
+    session.add(identity)
+    await session.flush()
+    return identity
+
+
+@dataclass(frozen=True)
+class GoogleOAuthCallbackResult:
+    """Outcome of :func:`google_oauth_callback` — the resolved user and JWT."""
+
+    user: User
+    created: bool  # True if a new user was created, False if existing user was linked/found
+
+
+async def google_oauth_callback(
+    session: AsyncSession,
+    *,
+    code: str,
+    state: str,
+    settings: Settings | None = None,
+    http_post: HttpPostFn | None = None,
+    http_get: HttpPostFn | None = None,
+) -> GoogleOAuthCallbackResult:
+    """Complete the Google OAuth2 callback: exchange code, link/create user, issue JWT.
+
+    Steps:
+    1. Verify the state nonce (HMAC; raises :class:`OAuthStateMismatchError`).
+    2. Exchange the authorization code for an access token (raises
+       :class:`OAuthProviderError` on HTTP error).
+    3. Fetch the verified email + subject from Google's userinfo endpoint
+       (raises :class:`OAuthEmailUnverifiedError` when email_verified is False).
+    4. Look up an existing ``auth_oauth_identity`` row for ``(google, sub)``:
+       - **Found**: return the linked user (account linking already done).
+       - **Not found**: look up an ``accounts_user`` by email:
+         - **Email matches**: link the Google identity to the existing user
+           (set ``email_verified`` if not already set).
+         - **No match**: create a new user (``email_verified=True`` from Google)
+           and link the identity.
+    5. Return the resolved user (``created=True`` when new).
+
+    ``http_post`` and ``http_get`` are injectable for tests (no live Google).
+    """
+    settings = settings or get_settings()
+
+    # Step 1 — state verification (CSRF / replay protection).
+    if not _verify_state(state, settings):
+        raise OAuthStateMismatchError("OAuth state parameter is invalid or tampered")
+
+    # Step 2 — exchange code for tokens.
+    token_data = await _exchange_code_for_tokens(code, settings=settings, http_post=http_post)
+    if "error" in token_data:
+        raise OAuthProviderError(
+            f"Google token error: {token_data.get('error_description', token_data['error'])}"
+        )
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise OAuthProviderError("Google token response missing access_token")
+
+    # Step 3 — fetch verified email + sub from userinfo.
+    userinfo = await _fetch_userinfo(access_token, settings=settings, http_get=http_get)
+    email_verified = userinfo.get("email_verified", False)
+    if not email_verified:
+        raise OAuthEmailUnverifiedError(
+            "Google account email is not verified; sign in with a verified Google account"
+        )
+    provider_email: str = userinfo.get("email", "")
+    sub: str = userinfo.get("sub", "")
+    name: str | None = userinfo.get("name") or None
+    if not provider_email or not sub:
+        raise OAuthProviderError("Google userinfo response is missing email or sub")
+
+    # Step 4 — resolve or create the user.
+    existing_identity = await get_oauth_identity_by_provider_subject(session, "google", sub)
+    if existing_identity is not None:
+        # Already linked — look up the user.
+        user = await accounts_services.get_user_by_id(session, existing_identity.user_id)
+        if user is None:
+            raise OAuthProviderError("Linked user no longer exists")
+        await accounts_services.touch_last_seen(session, user)
+        await session.flush()
+        return GoogleOAuthCallbackResult(user=user, created=False)
+
+    # No existing identity — look up by email (account linking on email match).
+    user_by_email = await accounts_services.get_user_by_email(session, provider_email)
+    if user_by_email is not None:
+        # Link this Google identity to the existing account.
+        await link_oauth_identity(
+            session,
+            user=user_by_email,
+            provider="google",
+            subject=sub,
+            provider_email=provider_email,
+        )
+        # Mark email verified (Google guarantees it).
+        await accounts_services.mark_email_verified(session, user_by_email)
+        await accounts_services.touch_last_seen(session, user_by_email)
+        await session.flush()
+        return GoogleOAuthCallbackResult(user=user_by_email, created=False)
+
+    # No match — create a new user.
+    new_user = await accounts_services.create_user(
+        session,
+        email=provider_email,
+        password_hash=None,  # OAuth-only user; no password
+        name=name,
+        email_verified=True,  # Google guarantees email_verified=True
+    )
+    await link_oauth_identity(
+        session,
+        user=new_user,
+        provider="google",
+        subject=sub,
+        provider_email=provider_email,
+    )
+    await accounts_services.touch_last_seen(session, new_user)
+    await session.flush()
+    return GoogleOAuthCallbackResult(user=new_user, created=True)

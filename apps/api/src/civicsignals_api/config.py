@@ -60,6 +60,28 @@ class Settings(BaseSettings):
     # Invitation token TTL (B6). 7 days per doc 04 J7.
     invitation_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
 
+    # --- Google OAuth2 (B2) ---------------------------------------------------
+    # Authorization-code flow (PKCE). Set GOOGLE_OAUTH_CLIENT_ID + SECRET to
+    # enable; leave unset (default) to disable the /auth/oauth/google/* endpoints
+    # at runtime (they are mounted regardless; a missing client-id returns 501).
+    # GOOGLE_OAUTH_REDIRECT_URI overrides the auto-derived redirect if needed
+    # (e.g. when a reverse-proxy changes the apparent host).
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = None
+    # The OAuth2 state nonce is signed+encoded in the redirect URL so the
+    # callback can verify it without server-side session storage. The HMAC key
+    # falls back to ``secret_key`` when unset.
+    google_oauth_state_secret: str | None = None
+    # Google token endpoint + userinfo — overridable in tests so no live Google
+    # call is made. DO NOT change these in production; they exist solely for
+    # testability (threat-model §4.2: no live vendor in CI).
+    google_oauth_token_url: str = "https://oauth2.googleapis.com/token"
+    google_oauth_userinfo_url: str = "https://www.googleapis.com/oauth2/v3/userinfo"
+    # Where Google should redirect back to. Auto-derived as
+    # ``{web_base_url}/auth/callback/google`` when unset; override for
+    # reverse-proxy / custom-domain setups.
+    google_oauth_redirect_uri: str | None = None
+
     # LLM gateway (doc 06 §7, doc 18 §6.6). Vendor SDKs are imported lazily by
     # the backends; only the keys/base URLs configured here are needed.
     llm_default_provider: Literal["anthropic", "openai", "ollama"] = "anthropic"

@@ -18,7 +18,8 @@ from typing import Annotated
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -434,3 +435,125 @@ async def revoke_personal_token(
 
 
 router.include_router(tokens_router)
+
+
+# ---------------------------------------------------------------------------
+# B2: Google OAuth2 authorization-code flow
+# ---------------------------------------------------------------------------
+# Mounted under the existing ``/auth`` prefix → ``/api/v1/auth/oauth/google``.
+# The start endpoint redirects the browser to Google; the callback endpoint
+# receives the code + state, resolves/creates the user, and redirects the
+# browser to the web app with the issued tokens in the URL fragment (same
+# pattern as doc 08 §3.1 "Callback redirect — token in fragment").
+#
+# Error handling follows RFC 7807; a state mismatch / unverified email / Google
+# error redirects to the web app's /login?error=... so the user gets a readable
+# message instead of a raw 400 page in the browser.
+
+_oauth_router = APIRouter(prefix="/oauth/google", tags=["auth", "oauth"])
+
+
+@_oauth_router.get(
+    "/start",
+    status_code=status.HTTP_302_FOUND,
+    summary="Start Google OAuth2 sign-in (redirect to Google)",
+    response_description="302 redirect to Google's authorization page",
+    include_in_schema=True,
+)
+async def google_oauth_start(settings: SettingsDep) -> RedirectResponse:
+    """Redirect the browser to Google's OAuth2 authorization page.
+
+    Returns ``501 Not Implemented`` when ``GOOGLE_OAUTH_CLIENT_ID`` is not
+    configured so the error is clear in both development and production, rather
+    than a cryptic crash.
+    """
+    try:
+        result = auth_services.google_oauth_start(settings=settings)
+    except auth_services.OAuthProviderError as exc:
+        raise ProblemException(
+            status=status.HTTP_501_NOT_IMPLEMENTED,
+            code="oauth_not_configured",
+            title="Google OAuth not configured",
+            detail=str(exc),
+        ) from exc
+    return RedirectResponse(url=result.authorization_url, status_code=status.HTTP_302_FOUND)
+
+
+@_oauth_router.get(
+    "/callback",
+    status_code=status.HTTP_302_FOUND,
+    summary="Google OAuth2 callback — exchange code, link/create account, issue JWT",
+    response_description="302 redirect to web app with access token",
+    include_in_schema=True,
+)
+async def google_oauth_callback(
+    session: SessionDep,
+    settings: SettingsDep,
+    code: str = Query(..., description="Authorization code from Google"),
+    state: str = Query(..., description="State nonce returned by Google"),
+) -> RedirectResponse:
+    """Complete the Google OAuth2 flow: exchange code, link/create user, issue JWT.
+
+    On success redirects to ``{web_base_url}/auth/callback/google#access_token=...``
+    so the web app can store the token client-side without it appearing in the
+    server logs (token in URL fragment, not query string).
+
+    On error redirects to ``{web_base_url}/login?error=<code>`` so the user
+    sees a readable message in the browser (not a raw API error page).
+    """
+
+    def _error_redirect(code_str: str, detail: str) -> RedirectResponse:
+        from urllib.parse import urlencode
+
+        params = urlencode({"error": code_str, "detail": detail})
+        url = f"{settings.web_base_url}/login?{params}"
+        return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
+
+    try:
+        result = await auth_services.google_oauth_callback(
+            session,
+            code=code,
+            state=state,
+            settings=settings,
+        )
+        await session.commit()
+    except auth_services.OAuthStateMismatchError:
+        await session.rollback()
+        return _error_redirect(
+            "state_mismatch", "Sign-in session expired or tampered. Please try again."
+        )
+    except auth_services.OAuthEmailUnverifiedError:
+        await session.rollback()
+        return _error_redirect(
+            "email_unverified",
+            "Your Google account's email is not verified. Please verify it with Google first.",
+        )
+    except auth_services.OAuthProviderError as exc:
+        await session.rollback()
+        logger.warning("google_oauth_provider_error", detail=str(exc))
+        return _error_redirect("provider_error", "Google sign-in failed. Please try again.")
+    except IntegrityError:
+        await session.rollback()
+        return _error_redirect(
+            "identity_conflict",
+            "This Google account is already linked to another CivicSignals account.",
+        )
+
+    # Emit login audit event (best-effort).
+    try:
+        await events.publish(
+            AUTH_LOGIN,
+            {"user_id": str(result.user.id), "email": result.user.email, "provider": "google"},
+        )
+    except Exception:
+        logger.warning("google_oauth_login_event_failed", user_id=str(result.user.id))
+
+    pair = _token_pair(result.user.id, settings)
+    # Redirect to the web app callback page with the token in the URL fragment
+    # (not query string) so it doesn't appear in server logs or Referer headers.
+    fragment = f"access_token={pair.access_token}&refresh_token={pair.refresh_token}&expires_in={pair.expires_in}&token_type=bearer"
+    url = f"{settings.web_base_url}/auth/callback/google#{fragment}"
+    return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
+
+
+router.include_router(_oauth_router)

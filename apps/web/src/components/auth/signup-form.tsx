@@ -7,6 +7,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { type SignupValues, signupSchema } from "@/lib/auth-schemas";
 import { ProblemError } from "@/lib/auth-api";
 import { useSignup } from "@/hooks/use-auth";
+import { GoogleSignInButton } from "./google-sign-in-button";
 
 export function SignupForm() {
   const signup = useSignup();
@@ -144,6 +145,17 @@ export function SignupForm() {
       >
         {isSubmitting ? "Creating account…" : "Create account"}
       </button>
+
+      <div className="relative">
+        <div className="absolute inset-0 flex items-center">
+          <span className="w-full border-t" />
+        </div>
+        <div className="relative flex justify-center text-xs uppercase">
+          <span className="bg-background px-2 text-muted-foreground">or</span>
+        </div>
+      </div>
+
+      <GoogleSignInButton label="Sign up" />
 
       <p className="text-center text-sm text-muted-foreground">
         Already have an account?{" "}
