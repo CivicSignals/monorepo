@@ -39,7 +39,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
-from civicsignals_api.modules.auth.dependencies import CurrentWorkspace
+from civicsignals_api.modules.auth.dependencies import CurrentWorkspace, RequireMember
 from civicsignals_api.problems import ProblemException
 
 from . import services
@@ -53,6 +53,7 @@ from .schemas import (
     ItemOut,
     ItemPage,
     ItemUpdate,
+    ManualPipelineItemCreate,
     PipelineReport,
     StageCreate,
     StageOut,
@@ -371,6 +372,57 @@ async def create_item(
             owner_id=body.owner_id,
             notes=body.notes,
             value_estimate=body.value_estimate,
+        )
+        await session.commit()
+    except services.StageNotFoundError as exc:
+        await session.rollback()
+        raise _not_found("Stage") from exc
+    except services.PipelineError as exc:
+        await session.rollback()
+        raise _bad_request(str(exc)) from exc
+    response.headers["Location"] = f"/api/v1/pipeline/items/{item.id}"
+    return _item_out(item)
+
+
+@router.post(
+    "/items/manual",
+    response_model=ItemOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a manual pipeline item (J4)",
+    tags=["pipeline"],
+)
+async def create_manual_item(
+    body: ManualPipelineItemCreate,
+    ctx: RequireMember,
+    session: SessionDep,
+    response: Response,
+) -> ItemOut:
+    """Create a pipeline item without a linked signal — manual entry (J4).
+
+    This endpoint is the preferred path for team members adding opportunities
+    that were discovered offline (word-of-mouth, a meeting, etc.) rather than
+    from a signal. The item starts in the workspace's default stage unless
+    ``stage_id`` is supplied. Validates that the provided stage belongs to this
+    workspace (RFC 7807 ``404`` otherwise). Records a ``created`` activity entry
+    for audit purposes (J3). Requires at least the ``member`` role (B7).
+
+    RFC 7807 errors:
+    - ``400`` when the workspace has no stages configured (shouldn't happen in
+      practice — ``provision_default_stages`` is idempotent and called lazily).
+    - ``404`` when ``stage_id`` does not belong to this workspace.
+    - ``403`` when the caller's role is below ``member``.
+    """
+    try:
+        item = await services.create_item(
+            session,
+            ctx.workspace_id,
+            title=body.title,
+            stage_id=body.stage_id,
+            signal_id=None,  # explicitly None — this is a manual item (J4)
+            owner_id=body.owner_id,
+            notes=body.notes,
+            value_estimate=body.value_estimate,
+            actor_id=ctx.membership.id,
         )
         await session.commit()
     except services.StageNotFoundError as exc:

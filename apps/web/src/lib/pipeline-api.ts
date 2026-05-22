@@ -31,6 +31,36 @@ export interface PipelineReport {
   total_value: string | null;
 }
 
+/** A single pipeline item returned by the API (J1, J4). */
+export interface PipelineItem {
+  id: string;
+  workspace_id: string;
+  stage_id: string;
+  /** null for manually-created items (J4); populated for signal-linked items. */
+  signal_id: string | null;
+  owner_id: string | null;
+  title: string;
+  notes: string | null;
+  value_estimate: string | null;
+  status: "active" | "won" | "lost" | "disqualified" | "archived";
+  created_at: string;
+  updated_at: string;
+}
+
+/** Request body for POST /pipeline/items/manual (J4). */
+export interface ManualPipelineItemCreate {
+  title: string;
+  stage_id?: string;
+  notes?: string;
+  value_estimate?: string;
+  owner_id?: string;
+}
+
+export interface PipelineItemPage {
+  items: PipelineItem[];
+  next_cursor: string | null;
+}
+
 // ---- Transport ----
 
 async function request<T>(
@@ -66,4 +96,22 @@ export function getPipelineReport(
   workspaceId: string,
 ): Promise<PipelineReport> {
   return request<PipelineReport>("/pipeline/report", { token, workspaceId });
+}
+
+/**
+ * Create a manual pipeline item — not tied to a signal (J4).
+ * Maps to POST /pipeline/items/manual.
+ */
+export function createManualPipelineItem(
+  token: string,
+  workspaceId: string,
+  body: ManualPipelineItemCreate,
+): Promise<PipelineItem> {
+  return request<PipelineItem>("/pipeline/items/manual", {
+    method: "POST",
+    token,
+    workspaceId,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
