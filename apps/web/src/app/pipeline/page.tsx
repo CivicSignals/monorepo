@@ -1,14 +1,16 @@
-// Pipeline page (J5, J4) — /pipeline
+// Pipeline page (J2, J5, J4) — /pipeline
 //
-// Shows the workspace-level pipeline rollup report: per-stage item counts +
-// summed value_estimate displayed as a bar chart plus a summary table (J5).
-// Also provides a "New item" button that opens the manual item creation dialog
-// (J4) so team members can add opportunities without a linked signal.
+// Shows the drag-and-drop Kanban board (J2): one column per stage, cards
+// draggable between columns (optimistic move via TanStack Query). Below it, the
+// workspace-level pipeline rollup report: per-stage item counts + summed
+// value_estimate as a bar chart plus a summary table (J5). A "New item" button
+// opens the manual item creation dialog (J4) so team members can add
+// opportunities without a linked signal.
 //
 // State wiring:
 //   - Token from Zustand session store (client-only, doc 06 §2).
 //   - Active workspace id from Zustand UI store (client-only, doc 06 §2).
-//   - Report data from TanStack Query (server state, doc 06 §2).
+//   - Board (stages/items) + report data from TanStack Query (server state).
 //   - Modal open state is local React state (ephemeral UI, not Zustand).
 
 "use client";
@@ -17,6 +19,7 @@ import { useState } from "react";
 import { usePipelineReport } from "@/hooks/use-pipeline";
 import { useSessionStore } from "@/store/session";
 import { useUiStore } from "@/store/ui";
+import { KanbanBoard } from "@/components/pipeline/kanban-board";
 import { PipelineReportView } from "@/components/pipeline/pipeline-report";
 import { NewItemModal } from "@/components/pipeline/new-item-modal";
 
@@ -31,10 +34,10 @@ export default function PipelineReportPage() {
   const [isNewItemOpen, setIsNewItemOpen] = useState(false);
 
   return (
-    <main className="max-w-4xl mx-auto px-4 py-8">
+    <main className="max-w-6xl mx-auto px-4 py-8">
       {/* Header row: title + "New item" action */}
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Pipeline Report</h1>
+        <h1 className="text-2xl font-bold text-gray-900">Pipeline</h1>
         {token && workspaceId && (
           <button
             type="button"
@@ -45,6 +48,14 @@ export default function PipelineReportPage() {
           </button>
         )}
       </div>
+
+      {/* Kanban board (J2): drag-drop items between stage columns. Only rendered
+          when authenticated + a workspace is selected (it fetches stages/items). */}
+      {token && workspaceId && (
+        <section aria-label="Pipeline board" className="mb-10">
+          <KanbanBoard token={token} workspaceId={workspaceId} />
+        </section>
+      )}
 
       {/* Loading state */}
       {isLoading && (
@@ -91,9 +102,14 @@ export default function PipelineReportPage() {
         </div>
       )}
 
-      {/* Report */}
+      {/* Report (J5) */}
       {!isLoading && !isError && data && data.total_items > 0 && (
-        <PipelineReportView report={data} />
+        <section aria-label="Pipeline report">
+          <h2 className="mb-4 text-lg font-semibold text-gray-900">
+            Pipeline report
+          </h2>
+          <PipelineReportView report={data} />
+        </section>
       )}
 
       {/* Manual item creation dialog (J4) */}
