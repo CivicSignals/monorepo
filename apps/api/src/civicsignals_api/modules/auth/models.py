@@ -3,10 +3,12 @@
 Tables are prefixed ``auth_`` and are migrated only by this module
 (doc 06 §3, §4). The ``accounts`` module owns the user identity row
 (``accounts_user``); this module owns the **credential / token lifecycle** that
-hangs off it. For B1 that is the single-use email-verification token. B3
-(password reset) adds ``auth_password_reset_token`` here. B4 (MFA) adds its
-own ``auth_*`` table. B8 (API tokens) adds ``auth_api_token`` — long-lived
-bearer credentials (workspace + personal access tokens, doc 08 §1.3).
+hangs off it. For B1 that is the single-use email-verification token. B2 adds
+``auth_oauth_identity`` to store provider/subject pairs for Google OAuth (and
+future providers). B3 (password reset) adds ``auth_password_reset_token`` here.
+B4 (MFA) adds its own ``auth_*`` table. B8 (API tokens) adds ``auth_api_token``
+— long-lived bearer credentials (workspace + personal access tokens, doc 08
+§1.3).
 
 Tokens are never stored in cleartext: only a SHA-256 hash of the random token is
 persisted, so a database leak does not expose usable verification links or API
@@ -19,12 +21,59 @@ import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from civicsignals_api.db import Base
 from civicsignals_api.ids import uuid7
+
+
+class OAuthIdentity(Base):
+    """An OAuth provider identity linked to a :class:`~accounts.models.User` (B2).
+
+    Stores a ``(provider, subject)`` pair uniquely — e.g. ``("google",
+    "<google-sub>")`` — so the same Google account cannot be linked to two
+    different CivicSignals users. ``provider_email`` is cached from the id_token
+    / userinfo so diagnostic queries can find which address was used; the
+    authoritative email lives on the user row.
+
+    The unique constraint on ``(provider, subject)`` enforces identity
+    uniqueness; a second FK uniqueness constraint on ``(provider, user_id)``
+    (implemented as a ``UniqueConstraint``) ensures one user has at most one
+    linked Google account (and, in future, one per provider).
+    """
+
+    __tablename__ = "auth_oauth_identity"
+    __table_args__ = (
+        UniqueConstraint("provider", "subject", name="uq_auth_oauth_identity_provider_subject"),
+        UniqueConstraint("provider", "user_id", name="uq_auth_oauth_identity_provider_user"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Provider name — currently only "google" (B2); "github" / "microsoft" are
+    # future follow-ups. Stored as plain text rather than a constrained Enum so
+    # adding a provider requires no DDL change (only new code + data).
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    # Provider-issued stable subject identifier (``sub`` claim in Google's
+    # id_token; equivalent in other providers). Immutable for a given account.
+    subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # Provider email cached at link time (for diagnostics + future email-change
+    # detection). Not used as the login email — that is on ``accounts_user``.
+    provider_email: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class EmailVerificationToken(Base):

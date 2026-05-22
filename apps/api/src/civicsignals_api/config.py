@@ -60,6 +60,32 @@ class Settings(BaseSettings):
     # Invitation token TTL (B6). 7 days per doc 04 J7.
     invitation_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
 
+    # --- Google OAuth2 (B2) ---------------------------------------------------
+    # Standard authorization-code flow (signed-state HMAC nonce; no PKCE).
+    # Set GOOGLE_OAUTH_CLIENT_ID + SECRET to enable; leave unset (default) to
+    # disable the /auth/oauth/google/* endpoints at runtime (they are mounted
+    # regardless; a missing client-id returns 501).
+    # GOOGLE_OAUTH_REDIRECT_URI MUST be set in production to the API callback
+    # URL registered with Google, e.g.
+    # ``https://api.civicsignals.io/api/v1/auth/oauth/google/callback``.
+    # The redirect URI must point to the API server (not the web app) so Google
+    # sends the authorization code directly to the server.
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = None
+    # The OAuth2 state nonce is signed+encoded in the redirect URL so the
+    # callback can verify it without server-side session storage. The HMAC key
+    # falls back to ``secret_key`` when unset.
+    google_oauth_state_secret: str | None = None
+    # Google token endpoint + userinfo — overridable in tests so no live Google
+    # call is made. DO NOT change these in production; they exist solely for
+    # testability (threat-model §4.2: no live vendor in CI).
+    google_oauth_token_url: str = "https://oauth2.googleapis.com/token"
+    google_oauth_userinfo_url: str = "https://www.googleapis.com/oauth2/v3/userinfo"
+    # Where Google should redirect back to (must match the URI registered in
+    # Google Cloud Console). Defaults to a local dev URL; always override in
+    # staging/production via GOOGLE_OAUTH_REDIRECT_URI.
+    google_oauth_redirect_uri: str | None = None
+
     # LLM gateway (doc 06 §7, doc 18 §6.6). Vendor SDKs are imported lazily by
     # the backends; only the keys/base URLs configured here are needed.
     llm_default_provider: Literal["anthropic", "openai", "ollama"] = "anthropic"

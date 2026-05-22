@@ -125,6 +125,20 @@ export function getMe(token: string): Promise<User> {
   return request<User>("/auth/me", { token });
 }
 
+// --- B2: Google OAuth2 -------------------------------------------------------
+
+/**
+ * Return the URL to redirect the browser to in order to start Google sign-in.
+ *
+ * This does NOT make a fetch call — it returns the API start endpoint URL so
+ * the browser can navigate to it directly (which triggers the server-side 302
+ * redirect to Google). We construct the URL here so components can use it in
+ * anchor ``href``s without needing the API_BASE_URL in JSX.
+ */
+export function googleOAuthStartUrl(): string {
+  return `${API_BASE_URL}/auth/oauth/google/start`;
+}
+
 // --- B3: Password reset -------------------------------------------------------
 
 export interface PasswordResetRequestInput {
