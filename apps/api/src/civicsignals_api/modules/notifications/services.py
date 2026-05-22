@@ -283,14 +283,21 @@ async def build_digest_payload(
     Re-runs the saved search's stored filters against the workspace feed
     (``signals.list_workspace_signals``) bounded to signals published since the
     last send, and returns a serializable payload (recipient + saved search +
-    matched signals). H3 stops at *producing* the payload; the rendered email body
-    is H4.
+    matched signals). The H4 renderer (``templates.render_digest_email``) turns
+    this into the email body that ``send_digest`` delivers.
 
     Cross-module reads go through the sanctioned service surfaces only (doc 06 §3):
-    ``searches.services`` for the filter blob, ``signals.services`` for the feed.
+    ``searches.services`` for the filter blob, ``signals.services`` for the feed,
+    ``accounts.services`` for the recipient's email (the H4 renderer's ``to``).
     """
+    from civicsignals_api.modules.accounts import services as accounts_services
     from civicsignals_api.modules.searches import services as searches_services
     from civicsignals_api.modules.signals import services as signals_services
+
+    # Recipient address for the rendered digest (H4). May be ``None`` if the user
+    # row vanished; the delivery task treats a missing address as "nothing to send".
+    recipient = await accounts_services.get_user_by_id(session, subscription.user_id)
+    recipient_email = recipient.email if recipient is not None else None
 
     search = await searches_services.get_saved_search(
         session,
@@ -306,6 +313,7 @@ async def build_digest_payload(
             "saved_search_name": None,
             "workspace_id": str(subscription.workspace_id),
             "user_id": str(subscription.user_id),
+            "recipient_email": recipient_email,
             "signals": [],
         }
 
@@ -332,19 +340,24 @@ async def build_digest_payload(
             "signal_id": str(item.signal.id),
             "title": item.signal.title,
             "signal_type": item.signal.signal_type,
+            "entity": item.signal.entity_name_raw,
+            "occurred_at": (
+                item.signal.occurred_at.isoformat() if item.signal.occurred_at else None
+            ),
             "score": item.score,
             "status": item.status,
         }
         for item in page.items
     ]
 
-    # TODO H4: render this payload into the digest email body (subject + text/html)
-    #   and send via ``send_email``. H3 only selects + enqueues + produces the data.
+    # The H4 renderer (``templates.render_digest_email``) turns this payload into the
+    # branded HTML+text email; ``send_digest`` (tasks.py) renders + sends it.
     return {
         "saved_search_id": str(search.id),
         "saved_search_name": search.name,
         "workspace_id": str(subscription.workspace_id),
         "user_id": str(subscription.user_id),
+        "recipient_email": recipient_email,
         "since": since.isoformat() if since is not None else None,
         "signals": signals,
     }

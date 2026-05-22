@@ -18,8 +18,9 @@ local time:
 * :func:`send_digest` — per-subscription delivery on the ``notify`` worker. It first
   **claims the period** via :func:`services.mark_sent` (a guarded conditional UPDATE):
   if a concurrent worker already claimed it, this run is a no-op. On winning the
-  claim it builds the digest payload (new signals since last send). Rendering the
-  email body + sending is H4 — this task stops at producing the payload.
+  claim it builds the digest payload (new signals since last send), then (H4) renders
+  it into a branded HTML+text email (:mod:`notifications.templates`) and sends it via
+  the B1 mailer (Mailpit in dev). The empty-digest case still sends a short note.
 
 Distributed-safe dedupe: the leader lock prevents a duplicated *sweep*; the
 ``mark_sent`` period claim prevents a duplicated *send* (two sweeps, a beat retry,
@@ -36,10 +37,11 @@ from datetime import UTC, datetime
 import structlog
 
 from civicsignals_api.celery_app import celery_app
+from civicsignals_api.config import get_settings
 from civicsignals_api.db import SessionLocal
 from civicsignals_api.modules.ingestion.locks import RedisLock, get_redis_client
 
-from . import services
+from . import services, templates
 
 logger = structlog.get_logger(__name__)
 
@@ -84,8 +86,18 @@ def dispatch_digests() -> int:
         lock.release()
 
 
-async def _send_digest_async(subscription_id: uuid.UUID, now: datetime) -> bool:
-    """Async core of per-subscription delivery — True iff this run sent."""
+async def _send_digest_async(
+    subscription_id: uuid.UUID,
+    now: datetime,
+    *,
+    sender: services.EmailSender | None = None,
+) -> bool:
+    """Async core of per-subscription delivery — True iff this run sent.
+
+    ``sender`` is injectable so tests can substitute a recording transport instead
+    of SMTP (the B1 mailer pattern); production passes ``None`` and the default SMTP
+    transport (Mailpit in dev) is used.
+    """
     async with SessionLocal() as session:
         sub = await services.get_digest_subscription_by_id(session, subscription_id=subscription_id)
         if sub is None:
@@ -107,20 +119,38 @@ async def _send_digest_async(subscription_id: uuid.UUID, now: datetime) -> bool:
 
         payload = await services.build_digest_payload(session, subscription=sub, since=since)
 
-    # TODO H4: render ``payload`` into the digest email body and send via
-    #   ``services.send_email``. H3 stops at producing the payload.
+    # H4: render the payload into the branded HTML+text digest and send it. The
+    # period is already claimed above, so this won't double-send. A missing recipient
+    # address (deleted user) means there's nothing to deliver.
+    recipient_email = payload.get("recipient_email")
+    signal_count = len(payload.get("signals", []))
+    if not recipient_email:
+        logger.warning(
+            "notifications.send_digest.no_recipient",
+            subscription_id=str(subscription_id),
+        )
+        return False
+
+    settings = get_settings()
+    message = templates.render_digest_email(
+        payload,
+        web_base_url=settings.web_base_url,
+        to=str(recipient_email),
+    )
+    services.send_email(message, sender=sender)
+
     logger.info(
-        "notifications.send_digest.built",
+        "notifications.send_digest.sent",
         subscription_id=str(subscription_id),
         saved_search_id=payload.get("saved_search_id"),
-        signal_count=len(payload.get("signals", [])),
+        signal_count=signal_count,
     )
     return True
 
 
 @celery_app.task(name="notifications.send_digest")
 def send_digest(subscription_id: str, now_iso: str) -> bool:
-    """Per-subscription delivery (H3). Claims the period, then builds the payload.
+    """Per-subscription delivery (H3/H4). Claims the period, renders, and sends.
 
     Idempotent: the :func:`services.mark_sent` period claim suppresses a double
     send if the task is re-delivered or two sweeps raced. ``now_iso`` is the sweep's

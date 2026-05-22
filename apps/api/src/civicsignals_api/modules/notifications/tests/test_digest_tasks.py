@@ -142,14 +142,17 @@ async def test_send_digest_marks_sent_and_is_idempotent(
 ) -> None:
     sub_id = await _seed_via(session_factory, DigestFrequency.DAILY, send_hour=8)
     now = _utc(2026, 1, 15, 9)
+    recorder = services.RecordingEmailSender()
 
     with patch.object(tasks, "SessionLocal", session_factory):
-        first = await tasks._send_digest_async(sub_id, now)
+        first = await tasks._send_digest_async(sub_id, now, sender=recorder)
         # A re-delivered task for the same period is a no-op.
-        second = await tasks._send_digest_async(sub_id, now)
+        second = await tasks._send_digest_async(sub_id, now, sender=recorder)
 
     assert first is True
     assert second is False
+    # Only the winning claim sent (the no-op second run did not).
+    assert len(recorder.sent) == 1
 
     # last_sent_at / last_sent_period were recorded.
     async with session_factory() as session:
@@ -157,3 +160,26 @@ async def test_send_digest_marks_sent_and_is_idempotent(
         assert sub is not None
         assert sub.last_sent_at is not None
         assert sub.last_sent_period == "daily:2026-01-15"
+
+
+async def test_send_digest_renders_and_sends_via_mailer(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """send_digest renders the H4 email and hands it to the injected mailer."""
+    sub_id = await _seed_via(session_factory, DigestFrequency.DAILY, send_hour=8)
+    recorder = services.RecordingEmailSender()
+    now = _utc(2026, 1, 15, 9)
+
+    with patch.object(tasks, "SessionLocal", session_factory):
+        sent = await tasks._send_digest_async(sub_id, now, sender=recorder)
+
+    assert sent is True
+    assert len(recorder.sent) == 1
+    message = recorder.sent[0]
+    # Addressed to the seeded recipient, branded subject, both bodies present.
+    assert message.to.endswith("@example.com")
+    assert "CivicSignals" in message.subject
+    assert "Hot RFPs" in message.subject  # the saved-search name from _seed
+    assert message.html_body is not None
+    assert "Hot RFPs" in message.html_body
+    assert "Hot RFPs" in message.text_body
