@@ -80,6 +80,9 @@ function PlanCard({ plan }: { plan: PlanTier }) {
 
       <a
         href={plan.ctaHref}
+        {...(plan.ctaHref.startsWith("http") || plan.ctaHref.startsWith("mailto:")
+          ? { target: "_blank", rel: "noopener noreferrer" }
+          : {})}
         className={cn(
           "mt-6 block rounded-md px-4 py-2.5 text-center text-sm font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2",
           plan.highlighted
@@ -138,6 +141,8 @@ export function PricingTiers() {
           SMB tiers. Prices are illustrative pending launch — see{" "}
           <a
             href="https://github.com/CivicSignals/monorepo"
+            target="_blank"
+            rel="noopener noreferrer"
             className="underline underline-offset-4"
           >
             our changelog

@@ -163,7 +163,13 @@ export function PricingComparison() {
                   key={row.dimension}
                   className={idx % 2 === 1 ? "bg-muted/10" : ""}
                 >
-                  <Cell className="font-medium">{row.dimension}</Cell>
+                  {/* Row header for screen readers — associates dimension label with data cells */}
+                  <th
+                    scope="row"
+                    className="px-4 py-3 align-top text-sm font-medium leading-snug text-left"
+                  >
+                    {row.dimension}
+                  </th>
                   <Cell className="text-foreground">{row.civicSignals}</Cell>
                   <Cell className="text-muted-foreground">{row.starbridge}</Cell>
                   <Cell className="text-muted-foreground">{row.govWin}</Cell>
