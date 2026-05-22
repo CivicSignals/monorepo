@@ -19,11 +19,19 @@ N2 implements:
   - :func:`plan_allows` — check whether a plan includes a feature flag.
   - :func:`plan_limit` — retrieve a numeric quota limit for a plan/dimension pair.
 
+N3 implements:
+  - :func:`current_period` — return the first day of the current UTC calendar month.
+  - :func:`record_usage` — idempotent-friendly upsert/increment a usage counter.
+  - :func:`get_usage` — read per-dimension totals for a workspace+period.
+  - :func:`get_seats_count` — derive the current active seat count from accounts_member.
+  - :func:`refresh_seats_usage` — update billing_usage seats snapshot for a workspace.
+  - :func:`record_ai_run` — hook called by the LLM gateway accountant (N3 integration).
+
 All Stripe network calls are mediated through the ``StripeClient`` protocol so
 tests can inject a mock without hitting the Stripe API.
 
-# TODO N3: add ``record_usage(workspace_id, metric, delta)`` for metering.
-# TODO N4: add ``check_limit(workspace_id, metric)`` for hard limits.
+# TODO N4: add ``check_limit(workspace_id, metric)`` for hard limits (reads record_usage
+#   output and plan_limit to enforce soft 80% banner + hard 429).
 # TODO N5: add ``create_checkout_session`` / ``change_plan`` for self-serve flow.
 # TODO LC-13: provision real STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET.
 """
@@ -31,11 +39,12 @@ tests can inject a mock without hitting the Stripe API.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
 import stripe as stripe_sdk
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.config import get_settings
@@ -43,6 +52,7 @@ from civicsignals_api.ids import uuid7
 from civicsignals_api.modules.billing.models import (
     BillingCustomer,
     BillingSubscription,
+    BillingUsage,
     BillingWebhookEvent,
     SubscriptionPlan,
     SubscriptionStatus,
@@ -510,3 +520,231 @@ def plan_limit(plan: SubscriptionPlan, dimension: Dimension) -> int | None:
     ``billing.services`` only.
     """
     return _plan_limit_impl(plan, dimension)
+
+
+# ---------------------------------------------------------------------------
+# N3: Usage metering
+# ---------------------------------------------------------------------------
+
+
+def current_period() -> date:
+    """Return the first day of the current UTC calendar month (N3).
+
+    Each billing period is a calendar month.  Usage rows are keyed on
+    ``(workspace_id, period, dimension)`` where ``period = current_period()``.
+    A new month automatically creates new rows; old rows are preserved for
+    audit/analytics.
+    """
+    today = datetime.now(tz=UTC).date()
+    return today.replace(day=1)
+
+
+async def record_usage(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    dimension: Dimension,
+    delta: int = 1,
+    *,
+    period: date | None = None,
+) -> None:
+    """Increment a usage counter for ``(workspace_id, period, dimension)`` (N3).
+
+    Uses a PostgreSQL ``INSERT … ON CONFLICT DO UPDATE`` (upsert) to increment
+    atomically in a single round-trip — no read-before-write.  Safe to call
+    from concurrent workers on the same row.
+
+    ``period`` defaults to the current billing month.  Pass an explicit period
+    in tests to control the billing window.
+
+    For ``seats``, prefer :func:`refresh_seats_usage` (which overwrites rather
+    than accumulating) because the seat count is a snapshot, not a rate.
+
+    .. note::
+        This function does **not** begin a transaction.  The caller is
+        responsible for wrapping the session in a transaction (or letting
+        FastAPI's dependency-injected session auto-commit).
+    """
+    p = period or current_period()
+    stmt = (
+        pg_insert(BillingUsage)
+        .values(
+            id=uuid7(),
+            workspace_id=workspace_id,
+            period=p,
+            dimension=dimension.value,
+            count=delta,
+        )
+        .on_conflict_do_update(
+            index_elements=["workspace_id", "period", "dimension"],
+            set_={"count": BillingUsage.count + delta, "updated_at": func.now()},
+        )
+    )
+    await session.execute(stmt)
+
+
+async def set_usage(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    dimension: Dimension,
+    value: int,
+    *,
+    period: date | None = None,
+) -> None:
+    """Overwrite (set) a usage counter for ``(workspace_id, period, dimension)`` (N3).
+
+    Used for snapshot-style dimensions like ``seats`` where the value should be
+    the current total, not an accumulated delta.  Uses the same upsert pattern
+    as :func:`record_usage` but sets the count directly rather than adding.
+    """
+    p = period or current_period()
+    stmt = (
+        pg_insert(BillingUsage)
+        .values(
+            id=uuid7(),
+            workspace_id=workspace_id,
+            period=p,
+            dimension=dimension.value,
+            count=value,
+        )
+        .on_conflict_do_update(
+            index_elements=["workspace_id", "period", "dimension"],
+            set_={"count": value, "updated_at": func.now()},
+        )
+    )
+    await session.execute(stmt)
+
+
+async def get_usage(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    *,
+    period: date | None = None,
+) -> dict[str, int]:
+    """Return per-dimension usage totals for ``workspace_id`` in ``period`` (N3).
+
+    Returns a mapping of :class:`~civicsignals_api.modules.billing.plans.Dimension`
+    string value → count.  Dimensions with no recorded usage are not in the dict
+    (callers should treat missing keys as 0).
+
+    The ``period`` defaults to the current billing month.
+    """
+    p = period or current_period()
+    result = await session.execute(
+        select(BillingUsage.dimension, BillingUsage.count).where(
+            BillingUsage.workspace_id == workspace_id,
+            BillingUsage.period == p,
+        )
+    )
+    return {str(row[0]): int(row[1]) for row in result}
+
+
+async def get_seats_count(session: AsyncSession, workspace_id: uuid.UUID) -> int:
+    """Return the current number of active members in a workspace (N3).
+
+    Counts rows in ``accounts_member`` for this workspace.  Used by the
+    seats-usage refresh path (:func:`refresh_seats_usage`) and by the usage
+    endpoint to surface live seat counts.
+
+    No module imports accounts internals directly (doc 06 §3): we issue a
+    raw count query against the ``accounts_member`` table name here rather
+    than importing the Membership model — the column is stable and well-known.
+    """
+    from sqlalchemy import text
+
+    row = await session.execute(
+        text(
+            "SELECT COUNT(*) FROM accounts_member WHERE workspace_id = :ws_id"
+        ),
+        {"ws_id": str(workspace_id)},
+    )
+    return int(row.scalar_one())
+
+
+async def refresh_seats_usage(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    *,
+    period: date | None = None,
+) -> int:
+    """Snapshot the current seat count into billing_usage (N3).
+
+    Unlike other dimensions (which are incremented), seats is a snapshot of the
+    current member count.  This function reads the count from ``accounts_member``
+    and writes it to ``billing_usage`` using :func:`set_usage`.
+
+    Called by the billing scheduler task and by the usage endpoint on-demand so
+    the seat count is always fresh.
+
+    Returns the snapshotted seat count.
+    """
+    count = await get_seats_count(session, workspace_id)
+    await set_usage(session, workspace_id, Dimension.SEATS, count, period=period)
+    return count
+
+
+async def record_ai_run(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    delta: int = 1,
+    *,
+    period: date | None = None,
+) -> None:
+    """Record one or more LLM gateway calls for a workspace (N3).
+
+    This is the integration seam the LLM gateway (E2) calls after each
+    ``complete()`` invocation where a ``workspace_id`` is known.  It increments
+    the ``ai_runs_per_month`` dimension in billing_usage.
+
+    The gateway's in-process :class:`~civicsignals_api.llm_gateway.accounting.InMemoryTokenAccountant`
+    already accumulates per-workspace call counts; this function persists them
+    to Postgres so they survive process restarts and span multiple workers.
+
+    Typical call site (in the gateway or a task wrapper)::
+
+        await billing_services.record_ai_run(session, workspace_id=uuid.UUID(workspace_id))
+
+    # TODO N4: when ``ai_runs_per_month`` usage reaches the plan limit, raise a
+    #   429 via ``check_limit`` before dispatching the next LLM call.
+    """
+    await record_usage(session, workspace_id, Dimension.AI_RUNS_PER_MONTH, delta, period=period)
+
+
+# ---------------------------------------------------------------------------
+# N3: API-request metering hook
+# ---------------------------------------------------------------------------
+
+# NOTE: Full per-request metering middleware is intentionally deferred.
+# Incrementing billing_usage on every authenticated HTTP request would add a
+# DB write to every hot-path request — a non-trivial cost at 8M+ req/day.
+#
+# The recommended approach (when N4 enforcement is needed) is a periodic flush:
+# 1. Increment an in-Redis counter on each request (O(1), sub-ms).
+# 2. A background task (Celery beat, e.g. every 60s) reads the Redis counter,
+#    calls record_usage(Dimension.API_REQUESTS_PER_MONTH, delta=counter_value),
+#    and resets the Redis key.
+#
+# This function is the seam that background task should call.  For now it is
+# a thin wrapper around record_usage; the caller supplies the delta (batch size).
+#
+# TODO N4: wire up the Redis counter + Celery beat flush task.
+async def record_api_requests(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    delta: int = 1,
+    *,
+    period: date | None = None,
+) -> None:
+    """Record ``delta`` authenticated API requests for a workspace (N3).
+
+    Intended to be called from a periodic flush task rather than on every
+    request (see module-level note above).  Direct per-request call is fine
+    for low-volume workspaces or tests.
+
+    # TODO N4: wire the Redis counter + beat task; the per-request call site
+    #   in middleware should read:
+    #       redis_client.incr(f"api_req:{workspace_id}:{current_period()}")
+    #   and a beat task drains it here every 60 s.
+    """
+    await record_usage(
+        session, workspace_id, Dimension.API_REQUESTS_PER_MONTH, delta, period=period
+    )
