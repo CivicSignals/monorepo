@@ -16,11 +16,13 @@ N3 implements:
 N4 implements:
   - ``GET /billing/limits``     — per-dimension limit states (ok|warning|exceeded) for the workspace.
 
-The webhook endpoint is unauthenticated (verified by Stripe signature). All
-other endpoints use ``require_workspace`` (B5).
+N5 implements:
+  - ``POST /billing/change-plan``    — self-serve upgrade/downgrade (admin-gated; Stripe proration).
+  - ``POST /billing/portal-session`` — create a Stripe Customer Portal session URL (admin-gated).
 
-# TODO N5: add POST /billing/checkout-session (self-serve plan sign-up).
-# TODO N5: add POST /billing/plan (plan-change / upgrade / downgrade).
+The webhook endpoint is unauthenticated (verified by Stripe signature). All
+other endpoints use ``require_workspace`` (B5).  Plan-change + portal-session
+additionally require admin role (``RequireAdmin``).
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ from fastapi import APIRouter, Depends, Header, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
-from civicsignals_api.modules.auth.dependencies import CurrentWorkspace
+from civicsignals_api.modules.auth.dependencies import CurrentWorkspace, RequireAdmin
 from civicsignals_api.modules.billing import services
 from civicsignals_api.modules.billing.dependencies import require_feature, require_within_limit
 from civicsignals_api.modules.billing.models import BillingCustomer, BillingSubscription
@@ -41,10 +43,14 @@ from civicsignals_api.modules.billing.plans import Dimension, Feature, get_plan
 from civicsignals_api.modules.billing.schemas import (
     BillingCustomerOut,
     BillingSubscriptionOut,
+    ChangePlanIn,
+    ChangePlanOut,
     DimensionLimitOut,
     DimensionUsageOut,
     LimitState,
     PlanOut,
+    PortalSessionIn,
+    PortalSessionOut,
     WorkspaceLimitsOut,
     WorkspacePlanOut,
     WorkspaceUsageOut,
@@ -407,3 +413,108 @@ async def get_workspace_limits(
         period=period,
         dimensions=dimensions,
     )
+
+
+# ---------------------------------------------------------------------------
+# N5: Self-serve plan change + Customer Portal
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/change-plan",
+    response_model=ChangePlanOut,
+    status_code=200,
+    summary="Upgrade or downgrade the workspace subscription plan (N5)",
+    description=(
+        "Modifies the workspace's active Stripe subscription to the target plan "
+        "(solo / starter / pro). Stripe handles proration automatically — the "
+        "workspace is billed or credited for the remainder of the current period. "
+        "Enterprise plan changes are quote-driven; use the portal-session endpoint "
+        "or contact sales. Requires admin role (``RequireAdmin``).\n\n"
+        "The local ``billing_subscription`` is updated immediately; Stripe's "
+        "``customer.subscription.updated`` webhook will confirm the change shortly "
+        "afterwards and is idempotent (N1 webhook handler)."
+    ),
+)
+async def change_plan(
+    body: ChangePlanIn,
+    ctx: RequireAdmin,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> ChangePlanOut:
+    """Upgrade or downgrade the workspace's Stripe subscription to a new plan (N5).
+
+    Admin-gated (RequireAdmin). Returns the updated subscription info.
+    Returns RFC 7807 422 for invalid target plan, no subscription, or
+    Stripe misconfiguration.
+    """
+    try:
+        async with session.begin():
+            sub = await services.change_plan(session, ctx.workspace_id, body.target_plan)
+    except services.PlanChangeError as exc:
+        raise ProblemException(
+            status=422,
+            code=exc.code,
+            title="Plan change failed",
+            detail=exc.detail,
+        ) from exc
+    except services.BillingNotConfiguredError as exc:
+        raise ProblemException(
+            status=503,
+            code="billing_not_configured",
+            title="Billing not configured",
+            detail="Stripe is not configured for this deployment. Contact support.",
+        ) from exc
+
+    return ChangePlanOut(
+        workspace_id=sub.workspace_id,
+        plan=sub.plan,
+        status=sub.status,
+        stripe_subscription_id=sub.stripe_subscription_id,
+        stripe_price_id=sub.stripe_price_id,
+    )
+
+
+@router.post(
+    "/portal-session",
+    response_model=PortalSessionOut,
+    status_code=200,
+    summary="Create a Stripe Customer Portal session (N5)",
+    description=(
+        "Creates a Stripe-hosted Customer Portal session for the workspace admin. "
+        "The returned ``url`` should be opened immediately (it expires after a "
+        "short window). In the portal the admin can update payment methods, view "
+        "invoices, and change plans. Requires admin role (``RequireAdmin``).\n\n"
+        "The portal configuration (brand, allowed plan switches) is finalised by "
+        "LC-13. Until then, the portal uses Stripe's default configuration."
+    ),
+)
+async def create_portal_session(
+    body: PortalSessionIn,
+    ctx: RequireAdmin,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> PortalSessionOut:
+    """Create a Stripe Customer Portal session and return the redirect URL (N5).
+
+    Admin-gated (RequireAdmin). Returns a short-lived portal URL.
+    Returns RFC 7807 422 when no Stripe customer exists for the workspace.
+    """
+    try:
+        url = await services.create_portal_session(
+            session, ctx.workspace_id, return_url=body.return_url
+        )
+    except services.PlanChangeError as exc:
+        raise ProblemException(
+            status=422,
+            code=exc.code,
+            title="Portal session creation failed",
+            detail=exc.detail,
+        ) from exc
+    except services.BillingNotConfiguredError as exc:
+        raise ProblemException(
+            status=503,
+            code="billing_not_configured",
+            title="Billing not configured",
+            detail="Stripe is not configured for this deployment. Contact support.",
+        ) from exc
+
+    return PortalSessionOut(url=url)

@@ -4,6 +4,7 @@ N1: Stripe customer + subscription wiring output schemas.
 N2: Plan definition + workspace plan summary output schemas.
 N3: Usage metering output schemas (current-period usage vs plan limits).
 N4: Limit-state output schemas (soft/hard enforcement states per dimension).
+N5: Self-serve plan change + portal session request/response schemas.
 """
 
 from __future__ import annotations
@@ -189,3 +190,54 @@ class WorkspaceLimitsOut(BaseModel):
     workspace_id: uuid.UUID
     period: date
     dimensions: dict[str, DimensionLimitOut]
+
+
+# ---------------------------------------------------------------------------
+# N5: Self-serve plan change + portal session schemas
+# ---------------------------------------------------------------------------
+
+
+class ChangePlanIn(BaseModel):
+    """Request body for ``POST /billing/change-plan`` (N5).
+
+    ``target_plan`` is the :class:`~civicsignals_api.modules.billing.models.SubscriptionPlan`
+    value the workspace should move to.  Only self-serve plans are accepted
+    (solo / starter / pro); enterprise and self_hosted are rejected with 422.
+    """
+
+    target_plan: SubscriptionPlan
+
+
+class ChangePlanOut(BaseModel):
+    """Response for a successful plan change (N5).
+
+    Returns the updated subscription row so the frontend can update its
+    cached plan state immediately without an additional ``GET /billing/plan``.
+    """
+
+    workspace_id: uuid.UUID
+    plan: SubscriptionPlan
+    status: SubscriptionStatus
+    stripe_subscription_id: str | None
+    stripe_price_id: str | None
+
+
+class PortalSessionIn(BaseModel):
+    """Request body for ``POST /billing/portal-session`` (N5).
+
+    ``return_url`` is the full URL Stripe redirects the user to after they
+    exit the Customer Portal.  Typically the billing settings page.
+    """
+
+    return_url: str
+
+
+class PortalSessionOut(BaseModel):
+    """Response for a successful Customer Portal session creation (N5).
+
+    The ``url`` is the Stripe-hosted portal URL; the frontend should
+    ``window.location.href = url`` (or open it in a new tab) immediately after
+    receiving this response.  Portal sessions expire after a short window.
+    """
+
+    url: str
