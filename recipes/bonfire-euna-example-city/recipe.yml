@@ -1,0 +1,52 @@
+# Example recipe — city procurement opportunities via Bonfire / Euna
+# (doc 18 §5 wave 3 #19). Instantiates the multi-tenant `bonfire_euna` connector
+# (TODO D8) for one tenant portal via its public opportunity-listing data API.
+# Synthetic example: demonstrates per-tenant config + the `dd[data-key=...]`
+# selectors over the connector's JSON->HTML projection. Public listings only —
+# never login-gated content (doc 16 §18).
+recipe_id: bonfire-euna-example-city
+connector: bonfire_euna
+version: 1
+
+entity:
+  name: City of Example
+  state: TX
+  kind: city
+
+schedule:
+  cron: "0 8 * * *" # daily
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  bonfire_euna:
+    portal_url: https://cityofexample.bonfirehub.com
+    listing_path: /api/portal/opportunities
+    items_path: opportunities
+    page_size: 50
+    max_pages: 10
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='title']"
+    required: true
+  reference:
+    selectors:
+      - "dd[data-key='reference']"
+    required: false
+  due_date:
+    selectors:
+      - "dd[data-key='close_date']"
+    required: false
+  category:
+    selectors:
+      - "dd[data-key='category']"
+    required: false
+
+signal_types:
+  - rfp_posted

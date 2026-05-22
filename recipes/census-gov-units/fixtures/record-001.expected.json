@@ -1,0 +1,11 @@
+{
+  "signal_types": [],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "name": "City of Austin",
+    "fips": "4805000",
+    "state": "TX",
+    "govt_type": "Municipal"
+  }
+}

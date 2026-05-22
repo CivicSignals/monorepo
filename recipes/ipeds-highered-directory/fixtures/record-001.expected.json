@@ -1,0 +1,11 @@
+{
+  "signal_types": [],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "name": "The University of Texas at Austin",
+    "ipeds_unit_id": "228778",
+    "state": "TX",
+    "website": "www.utexas.edu"
+  }
+}

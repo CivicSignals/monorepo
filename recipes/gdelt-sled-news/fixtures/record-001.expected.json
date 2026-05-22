@@ -1,0 +1,11 @@
+{
+  "signal_types": ["news_mention"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Austin ISD names new superintendent",
+    "source_url": "https://example-news.org/2025/05/austin-isd-superintendent",
+    "source_domain": "example-news.org",
+    "seen_date": "20250515T120000Z"
+  }
+}

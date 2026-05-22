@@ -1,0 +1,11 @@
+{
+  "signal_types": ["rfp_posted"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "RFP — District-Wide HVAC Replacement",
+    "reference": "RFP-2025-118",
+    "due_date": "2025-06-30",
+    "category": "Construction"
+  }
+}

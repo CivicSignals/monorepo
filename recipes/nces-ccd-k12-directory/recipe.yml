@@ -1,0 +1,49 @@
+# Example recipe — K-12 entity directory via NCES Common Core of Data
+# (doc 18 §5 wave 3 #16). Instantiates the `nces_ccd` bulk-import connector
+# (TODO D8). This is an ENTITY DIRECTORY, not a signal stream (doc 16 §6): each row
+# resolves to a K-12 Entity by its stable NCES LEAID (doc 18 §2.4 step 5), so
+# `signal_types` is empty. The fixture is one directory row projected to the same
+# `dd[data-key=...]` form the runner extracts. Public domain; checkpointed download.
+recipe_id: nces-ccd-k12-directory
+connector: nces_ccd
+version: 1
+
+entity:
+  entity_id: nces:4823640
+  name: Austin Independent School District
+  state: TX
+  kind: school_district
+
+schedule:
+  cron: "0 4 1 * *" # monthly (the CCD updates annually; checkpointing no-ops between)
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  nces_ccd:
+    # Defaults to the current CCD directory file; override to pin a school year.
+    checkpoint_strategy: etag
+
+fields:
+  name:
+    selectors:
+      - "dd[data-key='LEA_NAME']"
+    required: true
+  nces_id:
+    selectors:
+      - "dd[data-key='LEAID']"
+    required: true
+  state:
+    selectors:
+      - "dd[data-key='ST']"
+    required: false
+  city:
+    selectors:
+      - "dd[data-key='LCITY']"
+    required: false
+
+signal_types: []

@@ -242,6 +242,100 @@
             "platform": { "type": "string", "enum": ["civicweb", "civicplus", "civicclerk"], "default": "civicweb", "description": "Which CivicPlus host family the tenant uses." },
             "meeting_path": { "type": "string", "default": "Portal/MeetingTypeList.aspx", "description": "Index path appended to the tenant base when crawling for meeting links." }
           }
+        },
+        "usaspending": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "USAspending.gov award API (doc 18 §1 cat. A, §5 wave 3). Free, keyless federal spending API; discover() pages the award-search endpoint (results under `results`, advanced via `page_metadata.hasNext`) and emits one pointer per award projected to an HTML <dl> the recipe's `fields` extract with `dd[data-key='<field>']`.",
+          "properties": {
+            "base_url": { "type": "string", "default": "https://api.usaspending.gov", "description": "API base host (defaults to the public production host)." },
+            "endpoint": { "type": "string", "default": "/api/v2/search/spending_by_award/", "description": "Award-search endpoint path appended to base_url." },
+            "query_params": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Extra query params scoping the search (award_type_codes, recipient_id, …), passed verbatim." },
+            "page_size": { "type": "integer", "minimum": 1, "default": 100, "description": "`limit` per page." },
+            "max_pages": { "type": "integer", "minimum": 1, "default": 50, "description": "Safety cap on pages walked per run." },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." }
+          }
+        },
+        "gdelt": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "GDELT 2.0 DOC news API (doc 18 §1 cat. A, §5 wave 3). Free, keyless news-article search; discover() issues one time-windowed query (no pagination) and emits one pointer per article (under `articles`) projected to an HTML <dl> the recipe's `fields` extract with `dd[data-key='<field>']`.",
+          "required": ["query"],
+          "properties": {
+            "query": { "type": "string", "description": "GDELT boolean search expression (e.g. `\"school district\" sourcecountry:US`)." },
+            "base_url": { "type": "string", "default": "https://api.gdeltproject.org/api/v2/doc/doc", "description": "DOC 2.0 API endpoint." },
+            "timespan": { "type": "string", "description": "Recency window (GDELT `timespan`, e.g. `1d`, `3d`)." },
+            "max_records": { "type": "integer", "minimum": 1, "maximum": 250, "default": 75, "description": "Cap on articles returned by the single query (GDELT `maxrecords`)." },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." }
+          }
+        },
+        "bonfire_euna": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Bonfire / Euna Supplier Network procurement (doc 18 §1 cat. E, §5 wave 3). Multi-tenant e-procurement platform; this block selects a tenant portal. discover() pages the tenant's public opportunity-listing data API and emits one pointer per opportunity projected to an HTML <dl> the recipe's `fields` extract with `dd[data-key='<field>']`. Public listings only — login-gated tenants are rejected in PR review (doc 16 §18).",
+          "required": ["portal_url"],
+          "properties": {
+            "portal_url": { "type": "string", "description": "Tenant portal base URL, e.g. `https://cityofx.bonfirehub.com`." },
+            "listing_path": { "type": "string", "default": "/api/portal/opportunities", "description": "Public opportunity-listing API path appended to portal_url." },
+            "items_path": { "type": "string", "default": "opportunities", "description": "Dotted path to the opportunities array in the response envelope." },
+            "page_size": { "type": "integer", "minimum": 1, "default": 50, "description": "`limit` per page." },
+            "max_pages": { "type": "integer", "minimum": 1, "default": 50, "description": "Safety cap on pages walked per run." },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." }
+          }
+        },
+        "ionwave": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "IonWave e-procurement platform (doc 18 §1 cat. E, §5 wave 3). Multi-tenant platform popular with school districts and small local governments; this block selects a tenant portal. discover() pages the tenant's public bid-listing data API and emits one pointer per bid projected to an HTML <dl> the recipe's `fields` extract with `dd[data-key='<field>']`.",
+          "required": ["portal_url"],
+          "properties": {
+            "portal_url": { "type": "string", "description": "Tenant portal base URL, e.g. `https://cityofx.ionwave.net`." },
+            "listing_path": { "type": "string", "default": "/Bids/Public/List", "description": "Public bid-listing API path appended to portal_url." },
+            "items_path": { "type": "string", "default": "bids", "description": "Dotted path to the bids array in the response envelope." },
+            "page_size": { "type": "integer", "minimum": 1, "default": 50, "description": "`limit` per page." },
+            "max_pages": { "type": "integer", "minimum": 1, "default": 50, "description": "Safety cap on pages walked per run." },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." }
+          }
+        },
+        "nces_ccd": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NCES Common Core of Data — K-12 entity-directory bulk import (doc 18 §1 cat. G, §5 wave 3). An entity directory, not a signal stream; normalize() resolves rows to K-12 entities by NCES id. Checkpointed download (zero pointers when unchanged).",
+          "properties": {
+            "file_url": { "type": "string", "description": "Bulk file URL (defaults to the current CCD directory file); override to pin a school-year vintage." },
+            "format": { "type": "string", "enum": ["csv", "json", "zip"], "default": "zip", "description": "File format hint (federal directory dumps ship as zip)." },
+            "checkpoint_strategy": { "type": "string", "enum": ["etag", "last_modified", "content_hash"], "default": "etag", "description": "How discover() decides the file is unchanged (doc 18 §2.1 bulk)." }
+          }
+        },
+        "ipeds": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "IPEDS — higher-ed entity-directory bulk import (doc 18 §1 cat. G, §5 wave 3). An entity directory, not a signal stream; normalize() resolves rows to higher-ed entities by IPEDS unit id. Checkpointed download (zero pointers when unchanged).",
+          "properties": {
+            "file_url": { "type": "string", "description": "Bulk file URL (defaults to the current IPEDS HD directory file); override to pin a survey year." },
+            "format": { "type": "string", "enum": ["csv", "json", "zip"], "default": "zip", "description": "File format hint (federal directory dumps ship as zip)." },
+            "checkpoint_strategy": { "type": "string", "enum": ["etag", "last_modified", "content_hash"], "default": "etag", "description": "How discover() decides the file is unchanged (doc 18 §2.1 bulk)." }
+          }
+        },
+        "census_gov": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Census of Governments — all-government entity-directory bulk import (doc 18 §1 cat. G, §5 wave 3). ~90,000 entities; an entity directory, not a signal stream; normalize() resolves rows by FIPS code. Checkpointed download (zero pointers when unchanged).",
+          "properties": {
+            "file_url": { "type": "string", "description": "Bulk file URL (defaults to the published government-units file); override to pin a census-year vintage." },
+            "format": { "type": "string", "enum": ["csv", "json", "zip"], "default": "zip", "description": "File format hint (federal directory dumps ship as zip)." },
+            "checkpoint_strategy": { "type": "string", "enum": ["etag", "last_modified", "content_hash"], "default": "etag", "description": "How discover() decides the file is unchanged (doc 18 §2.1 bulk)." }
+          }
+        },
+        "samgov": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "SAM.gov opportunities — DEFERRED TO V2 (doc 18 §5 wave 3 #12). Federal coverage is out of MVP scope (TODO.md 'Out of scope'); this connector is registered but not wired for live fetching (discover() emits no pointers). The block is intentionally permissive so a forward-looking recipe documenting intended v2 coverage still validates. # TODO v2."
+        },
+        "grantsgov": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Grants.gov opportunities — DEFERRED TO V2 (doc 18 §5 wave 3 #13). Federal coverage is out of MVP scope (TODO.md 'Out of scope'); this connector is registered but not wired for live fetching (discover() emits no pointers). The block is intentionally permissive so a forward-looking recipe documenting intended v2 coverage still validates. # TODO v2."
         }
       }
     },

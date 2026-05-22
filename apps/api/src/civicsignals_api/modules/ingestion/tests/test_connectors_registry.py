@@ -61,6 +61,38 @@ def test_all_wave2_platform_connectors_registered() -> None:
     }
 
 
+def test_all_wave3_federal_and_niche_connectors_registered() -> None:
+    # The nine wave-3 federal + niche connectors (doc 18 §5 wave 3; D8). Includes
+    # the two deferred-to-v2 stubs (samgov/grantsgov) — registered but not wired.
+    assert set(registered_names()) >= {
+        "usaspending",
+        "gdelt",
+        "bonfire_euna",
+        "ionwave",
+        "nces_ccd",
+        "ipeds",
+        "census_gov",
+        "samgov",
+        "grantsgov",
+    }
+
+
+def test_deferred_federal_connectors_are_no_op_in_mvp() -> None:
+    # samgov/grantsgov are deferred to v2 (TODO.md "Out of scope"): registered, but
+    # discover() emits no pointers and the fetcher refuses any fetch.
+    from civicsignals_api.modules.ingestion.connectors._deferred_federal import (
+        DeferredConnectorError,
+    )
+
+    for name in ("samgov", "grantsgov"):
+        recipe = _recipe(connector=name, connector_config={name: {}})
+        connector = connector_for(recipe)
+        assert connector.discover(["https://example.gov/seed"]) == []
+        fetcher = connector.build_fetcher()
+        with pytest.raises(DeferredConnectorError, match="deferred to v2"):
+            fetcher.fetch("https://example.gov", user_agent="ua", max_redirects=5)
+
+
 def test_get_connector_resolves_by_name() -> None:
     assert get_connector("http_static") is HttpStaticConnector
 

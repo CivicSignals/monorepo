@@ -1,0 +1,49 @@
+# Example recipe — government entity directory via Census of Governments
+# (doc 18 §5 wave 3 #18). Instantiates the `census_gov` bulk-import connector
+# (TODO D8). An ENTITY DIRECTORY, not a signal stream (doc 16 §6): each row
+# resolves to an Entity by its stable FIPS code (doc 18 §2.4 step 5), so
+# `signal_types` is empty. The fixture is one directory row projected to the
+# `dd[data-key=...]` form the runner extracts. Public domain; checkpointed download.
+recipe_id: census-gov-units
+connector: census_gov
+version: 1
+
+entity:
+  entity_id: fips:4805000
+  name: City of Austin
+  state: TX
+  kind: city
+
+schedule:
+  cron: "0 4 1 1 *" # yearly (the Census of Governments runs every 5 years)
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  census_gov:
+    # Defaults to the published government-units file; override to pin a census year.
+    checkpoint_strategy: etag
+
+fields:
+  name:
+    selectors:
+      - "dd[data-key='NAME']"
+    required: true
+  fips:
+    selectors:
+      - "dd[data-key='FIPS']"
+    required: true
+  state:
+    selectors:
+      - "dd[data-key='STATE_AB']"
+    required: false
+  govt_type:
+    selectors:
+      - "dd[data-key='GOVT_TYPE']"
+    required: false
+
+signal_types: []
