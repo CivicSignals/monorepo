@@ -103,7 +103,7 @@ async function renderProfile(
     }) => Promise<React.ReactElement>
   )({ params: Promise.resolve({ id: "ent-abc" }) });
 
-  render(jsx);
+  return render(jsx);
 }
 
 // ---- Tests ----
@@ -207,6 +207,39 @@ describe("PublicEntityProfilePage", () => {
     await renderProfile(entityWithParent);
     const parentLink = screen.getByRole("link", { name: /View parent entity/i });
     expect(parentLink.getAttribute("href")).toBe("/directory/parent-001");
+  });
+
+  it("renders GovernmentOrganization JSON-LD with public-safe fields only (P3)", async () => {
+    // Spike internal-only fields onto the entity to prove they never leak.
+    const entity: EntityRead = {
+      ...BASE_ENTITY,
+      kind_id: "kind-secret",
+      geo_id: "geo-secret",
+      attributes: { internal_note: "DO_NOT_LEAK" },
+    };
+    const { container } = await renderProfile(entity);
+
+    const script = container.querySelector('script[type="application/ld+json"]');
+    expect(script).not.toBeNull();
+    const raw = script!.textContent ?? "{}";
+    const data = JSON.parse(raw) as Record<string, unknown>;
+
+    expect(data["@type"]).toBe("GovernmentOrganization");
+    expect(data.name).toBe("Northshore School District");
+    expect(data.url).toContain("/directory/ent-abc");
+
+    // No internal fields leak into the structured data.
+    for (const bad of [
+      "DO_NOT_LEAK",
+      "internal_note",
+      "kind-secret",
+      "kind_id",
+      "geo-secret",
+      "geo_id",
+      "content_hash",
+    ]) {
+      expect(raw).not.toContain(bad);
+    }
   });
 
   it("calls notFound when entity is null (404)", async () => {

@@ -150,6 +150,33 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Public-surface rate limiting (P4; doc 13 §4.6) ----------------------
+    # Per-client (IP) fixed-window cap on the *public, unauthenticated* read
+    # endpoints only: the public signal projection + source citations
+    # (``/signals/{id}/public``, ``/signals/{id}/sources``) and the public entity
+    # directory (list / get / children). Authenticated API routes are NOT rate
+    # limited here (they have their own quotas, e.g. the I5 smart-search budget).
+    #
+    # The default — 120 requests / 60s per IP — is generous for a human browsing
+    # the directory and for a crawler honouring the robots ``Crawl-delay`` (P4),
+    # while throttling a tight scrape loop. The window is keyed in Redis (the same
+    # store the D4 locks use) with an in-process fallback if Redis is unreachable.
+    #
+    # Env-vars: PUBLIC_RATE_LIMIT_PER_WINDOW / PUBLIC_RATE_LIMIT_WINDOW_SECONDS.
+    # Set PUBLIC_RATE_LIMIT_PER_WINDOW to 0 to disable (e.g. when fronting the API
+    # with your own WAF / edge rate limiting).
+    public_rate_limit_per_window: int = Field(
+        default=120,
+        description=(
+            "Max requests per window per client IP on the public unauthenticated "
+            "endpoints. 0 disables the public rate limiter."
+        ),
+    )
+    public_rate_limit_window_seconds: int = Field(
+        default=60,
+        description="Length of the public rate-limit fixed window, in seconds.",
+    )
+
     # --- Embeddings (I1, doc 19 §4/§7.4) ------------------------------------
     # Each extracted signal is embedded into ``signals_signal.vector_embedding``
     # (a pgvector column) for fuzzy dedupe (E10) + smart-search / hybrid retrieval

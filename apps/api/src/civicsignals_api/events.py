@@ -15,6 +15,9 @@ from typing import Any
 SIGNAL_CREATED = "signal.created"
 SIGNAL_SCORED = "signal.scored"
 SIGNAL_PUSHED = "signal.pushed"
+# G4: a per-workspace score row's status was transitioned (new/reviewed/pinned/
+# dismissed) by a member; B9 persists this via the admin audit listener.
+SIGNAL_STATUS_CHANGED = "signal.status_changed"
 MEMBER_INVITED = "member.invited"
 MEMBER_JOINED = "member.joined"
 # B3: password reset audit events; B9 persists these via the admin listener.

@@ -11,7 +11,7 @@
 // core content). Fully unauthenticated — the public API requires no auth.
 //
 // TODO P2: link signal teasers to public signal pages once G1+P2 ship.
-// TODO P3: add JSON-LD Organization/GovernmentOrganization structured data.
+// P3: server-rendered GovernmentOrganization JSON-LD structured data.
 // TODO P4: add Crawl-delay / rate-limit guards to fetchPublicEntity* helpers.
 
 import type { Metadata } from "next";
@@ -26,6 +26,8 @@ import {
   type PublicSignalRead,
 } from "@/lib/public-entities-api";
 import type { EntityRead } from "@/lib/entities-api";
+import { entityJsonLd } from "@/lib/jsonld";
+import { JsonLdScript } from "@/components/seo/json-ld";
 
 // ---- Revalidate at the page level (5 minutes). ----
 // Must be a literal — Next.js static analysis cannot resolve imported constants.
@@ -263,6 +265,9 @@ export default async function PublicEntityProfilePage({ params }: PageProps) {
 
   return (
     <main className="container py-8">
+      {/* P3: GovernmentOrganization structured data (public-safe fields only). */}
+      <JsonLdScript data={entityJsonLd(entity, SITE_URL, id)} />
+
       <div className="space-y-8">
         {/* Breadcrumb */}
         <nav aria-label="Breadcrumb">
@@ -502,8 +507,6 @@ export default async function PublicEntityProfilePage({ params }: PageProps) {
             .
           </p>
         </div>
-
-        {/* TODO P3: JSON-LD Organization/GovernmentOrganization structured data */}
       </div>
     </main>
   );

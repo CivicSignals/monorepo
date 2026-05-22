@@ -31,6 +31,22 @@ export interface PipelineReport {
   total_value: string | null;
 }
 
+/** A single pipeline stage returned by the API (J1). */
+export interface PipelineStage {
+  id: string;
+  workspace_id: string;
+  name: string;
+  position: number;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PipelineStagePage {
+  items: PipelineStage[];
+  next_cursor: string | null;
+}
+
 /** A single pipeline item returned by the API (J1, J4). */
 export interface PipelineItem {
   id: string;
@@ -59,6 +75,13 @@ export interface ManualPipelineItemCreate {
 export interface PipelineItemPage {
   items: PipelineItem[];
   next_cursor: string | null;
+}
+
+/** Request body for POST /pipeline/items/{id}/move (J2). */
+export interface MoveItemInput {
+  stage_id: string;
+  /** Optionally update status when moving (e.g. → "won" on a Won stage). */
+  status?: PipelineItem["status"];
 }
 
 // ---- Transport ----
@@ -96,6 +119,63 @@ export function getPipelineReport(
   workspaceId: string,
 ): Promise<PipelineReport> {
   return request<PipelineReport>("/pipeline/report", { token, workspaceId });
+}
+
+/**
+ * List the workspace's pipeline stages, ordered by position (J1, used by J2).
+ * The board has a small, fixed set of stages (default nine), so this fetches a
+ * generous page; cursor pagination is supported by the API but the Kanban board
+ * does not paginate columns.
+ */
+export function listPipelineStages(
+  token: string,
+  workspaceId: string,
+): Promise<PipelineStagePage> {
+  return request<PipelineStagePage>("/pipeline/stages?limit=100", {
+    token,
+    workspaceId,
+  });
+}
+
+/**
+ * List pipeline items (J1, used by J2). Optionally filter by stage. The board
+ * fetches a single page per workspace; for very large pipelines this should be
+ * extended to follow next_cursor — see the Kanban board hook for the TODO.
+ */
+export function listPipelineItems(
+  token: string,
+  workspaceId: string,
+  opts: { stageId?: string; cursor?: string; limit?: number } = {},
+): Promise<PipelineItemPage> {
+  const params = new URLSearchParams();
+  if (opts.stageId) params.set("stage_id", opts.stageId);
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  params.set("limit", String(opts.limit ?? 100));
+  return request<PipelineItemPage>(`/pipeline/items?${params.toString()}`, {
+    token,
+    workspaceId,
+  });
+}
+
+/**
+ * Move a pipeline item to a different stage (J2 Kanban DnD).
+ * Maps to POST /pipeline/items/{id}/move. Returns the updated item; a 404
+ * (item/stage gone) or 409 (conflict) surfaces as a ProblemError the caller
+ * inspects via `.problem.status` to drive conflict reconciliation.
+ */
+export function movePipelineItem(
+  token: string,
+  workspaceId: string,
+  itemId: string,
+  body: MoveItemInput,
+): Promise<PipelineItem> {
+  return request<PipelineItem>(`/pipeline/items/${itemId}/move`, {
+    method: "POST",
+    token,
+    workspaceId,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 /**

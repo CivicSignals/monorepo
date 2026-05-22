@@ -61,6 +61,21 @@ export const FEED_STATUS_LABELS: Record<FeedStatus, string> = {
   dismissed: "Dismissed",
 };
 
+// ---- Feedback verdicts (F5; mirrors models_feedback.FEEDBACK_KINDS) ---------
+
+/**
+ * The three F5 feedback verdicts (doc 14 §12). ``relevant`` / ``not_relevant``
+ * re-weight subsequent scoring for the workspace; ``wrong_extraction`` is an
+ * extraction-quality flag that does not alter scoring.
+ */
+export type FeedbackKind = "relevant" | "not_relevant" | "wrong_extraction";
+
+export const FEEDBACK_KIND_LABELS: Record<FeedbackKind, string> = {
+  relevant: "Relevant",
+  not_relevant: "Not relevant",
+  wrong_extraction: "Wrong extraction",
+};
+
 // ---- Response shapes (mirrors G1 FeedItemRead / FeedPage) ------------------
 
 export interface SignalRead {
@@ -100,6 +115,92 @@ export interface FeedPage {
     has_more: boolean;
     limit: number;
   };
+}
+
+// ---- Score breakdown shape (F4; mirrors workspace_scoring.score_signal_against_icp) --
+//
+// The per-workspace score_breakdown JSONB persisted on WorkspaceScore (F3). Every
+// field is optional on the client because the breakdown is a free-form JSONB blob —
+// older rows / non-pipeline inserts may carry a partial (or empty) map, so the F4
+// "Why this signal?" panel must degrade gracefully rather than assume the full shape.
+
+/** One scorer component's contribution toward the 0..100 blended score. */
+export interface ScoreComponent {
+  /** Raw component value in [0, 1] before weighting. */
+  value?: number;
+  /** Normalised weight in [0, 1] (renormalised when semantic is absent). */
+  weight?: number;
+  /** Points this component contributed toward the 0..100 total. */
+  points?: number;
+}
+
+/** Which ICP dimensions a signal satisfied (the matched flags). */
+export interface ScoreMatched {
+  signal_type?: boolean;
+  country?: boolean;
+  state?: boolean;
+  entity_kind?: boolean;
+  size_band?: boolean;
+  states?: string[];
+  keywords?: string[];
+}
+
+export interface ScoreBreakdown {
+  components?: Record<string, ScoreComponent>;
+  matched?: ScoreMatched;
+  /** Pre-formatted human-readable bullets seeded by the scorer (doc 14 §6.2). */
+  bullets?: string[];
+}
+
+/** Display labels for the scorer components (mirrors workspace_scoring weights). */
+export const SCORE_COMPONENT_LABELS: Record<string, string> = {
+  signal_type_weight: "Signal type",
+  dimensions: "ICP dimensions",
+  recency: "Recency",
+  confidence: "Extraction confidence",
+  keywords: "Keyword match",
+  semantic: "Semantic similarity",
+};
+
+// ---- Signal detail shapes (G2; mirrors signals.schemas.SignalDetailRead) ----
+
+export interface SourceDocumentRead {
+  raw_document_id: string;
+  recipe_id: string | null;
+  source_url: string | null;
+  fetched_at: string | null;
+  content_type: string | null;
+  missing: boolean;
+}
+
+export interface SuggestedContactRead {
+  contact_id: string;
+  name: string;
+  title: string | null;
+  department: string | null;
+  canonical_email: string | null;
+  status: string;
+  verified: boolean;
+}
+
+export interface RelatedSignalRead {
+  signal: SignalRead;
+}
+
+export interface SignalDetailRead {
+  signal: SignalRead;
+  entity_id: string | null;
+  entity_name: string | null;
+  score: number | null;
+  status: FeedStatus | null;
+  score_breakdown: Record<string, unknown> | null;
+  matched_keywords: string[];
+  extracted_fields: Record<string, unknown>;
+  source_documents: SourceDocumentRead[];
+  suggested_contacts: SuggestedContactRead[];
+  related_signals: RelatedSignalRead[];
+  /** The calling user's current F5 feedback verdict, or null (doc 14 §12). */
+  feedback: FeedbackKind | null;
 }
 
 // ---- Filter params (doc 08 §1.6) -------------------------------------------
@@ -171,4 +272,169 @@ export function listFeedSignals(
     token,
     workspaceId,
   });
+}
+
+/**
+ * Fetch one signal's full detail view in the workspace's context (G2).
+ *
+ * Returns the global signal + the calling workspace's score / breakdown (null
+ * when the signal did not score into this workspace's feed — the corpus is
+ * global), source documents, suggested contacts, and related signals.
+ * Workspace-scoped via X-Workspace-Id (doc 08 §1.4).
+ */
+export function getSignalDetail(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+): Promise<SignalDetailRead> {
+  return request<SignalDetailRead>(
+    `/signals/${encodeURIComponent(signalId)}/detail`,
+    { token, workspaceId },
+  );
+}
+
+// ---- Status transitions (G4) ------------------------------------------------
+
+/**
+ * The statuses the triage UI can request (G4). ``pushed`` is excluded — it is set
+ * by the K-epic CRM-push flow, never by this human-driven control (doc 14 §5.3).
+ */
+export type SettableStatus = "new" | "reviewed" | "pinned" | "dismissed";
+
+/** Response of the G4 PATCH: the transitioned score row's identity + new status. */
+export interface StatusChangeRead {
+  score_id: string;
+  signal_id: string;
+  status: FeedStatus;
+}
+
+/**
+ * Transition a signal's per-workspace status (G4).
+ *
+ * PATCHes ``signals_workspace_score.status`` for the (workspace, signal) pair via
+ * the validated transition graph. Workspace-scoped via X-Workspace-Id (doc 08 §1.4);
+ * member-gated server-side (B7). A 404 means the signal did not score into this
+ * workspace's feed; a 422 means the transition is illegal from the current status —
+ * both surface as a {@link ProblemError}.
+ */
+export function changeSignalStatus(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+  status: SettableStatus,
+): Promise<StatusChangeRead> {
+  return request<StatusChangeRead>(
+    `/signals/${encodeURIComponent(signalId)}/status`,
+    {
+      method: "PATCH",
+      token,
+      workspaceId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    },
+  );
+}
+
+// ---- Bulk status transitions (G3) -------------------------------------------
+
+/**
+ * The largest bulk-status batch the API accepts in one request (mirrors
+ * ``services.MAX_BULK_STATUS_BATCH``). The UI caps a multi-select at this: select-all
+ * clamps to the first {@link MAX_BULK_STATUS_BATCH} visible rows, and the bulk-action
+ * bar disables its actions (with a hint) above the cap, so a request is never rejected
+ * for size. The server still returns 422 as the backstop if one slips through.
+ */
+export const MAX_BULK_STATUS_BATCH = 200;
+
+/** One signal that could not be transitioned in a bulk request (G3). */
+export interface BulkStatusSkip {
+  signal_id: string;
+  /** Stable reason code: ``not_in_workspace`` | ``illegal_transition``. */
+  reason: string;
+  /** Current status when known (null when the signal had no score row here). */
+  current: string | null;
+}
+
+/** Response of the G3 bulk PATCH: the per-item outcome (succeeded + skipped). */
+export interface BulkStatusChangeRead {
+  status: FeedStatus;
+  succeeded: string[];
+  skipped: BulkStatusSkip[];
+}
+
+/**
+ * Bulk-transition many signals' per-workspace status in one request (G3, mass actions).
+ *
+ * POSTs ``{ signal_ids, status }`` to apply one target status to every selected signal's
+ * score row, reusing the G4 transition graph per item. Resilient: a signal with no score
+ * row in this workspace, or an illegal transition, is reported in ``skipped`` (with a
+ * reason) rather than failing the whole batch. The batch is bounded
+ * ({@link MAX_BULK_STATUS_BATCH}); an over-large / empty selection is a 422. Workspace-
+ * scoped via X-Workspace-Id (doc 08 §1.4); member-gated server-side (B7).
+ */
+export function changeSignalStatusBulk(
+  token: string,
+  workspaceId: string,
+  signalIds: string[],
+  status: SettableStatus,
+): Promise<BulkStatusChangeRead> {
+  return request<BulkStatusChangeRead>("/signals/bulk-status", {
+    method: "POST",
+    token,
+    workspaceId,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ signal_ids: signalIds, status }),
+  });
+}
+
+// ---- Feedback (F5; doc 14 §12) ----------------------------------------------
+
+/** Response of the F5 feedback POST/DELETE: the signal + its recorded kind. */
+export interface FeedbackRead {
+  signal_id: string;
+  /** Empty string on a retraction (DELETE); the kind otherwise. */
+  kind: string;
+}
+
+/**
+ * Record (or change) the calling user's relevance feedback on a signal (F5).
+ *
+ * POSTs ``{ kind }`` to record / change the verdict for the (workspace, signal, user)
+ * triple. ``relevant`` / ``not_relevant`` re-weight subsequent scoring;
+ * ``wrong_extraction`` flags extraction quality (no scoring change). Workspace-scoped
+ * via X-Workspace-Id (doc 08 §1.4); member-gated server-side (B7).
+ */
+export function submitSignalFeedback(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+  kind: FeedbackKind,
+): Promise<FeedbackRead> {
+  return request<FeedbackRead>(
+    `/signals/${encodeURIComponent(signalId)}/feedback`,
+    {
+      method: "POST",
+      token,
+      workspaceId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind }),
+    },
+  );
+}
+
+/**
+ * Retract the calling user's feedback verdict on a signal (F5).
+ *
+ * DELETEs the (workspace, signal, user) verdict. A 404 means there was nothing to
+ * retract — surfaced as a {@link ProblemError}. Workspace-scoped + member-gated.
+ */
+export function retractSignalFeedback(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+): Promise<FeedbackRead> {
+  return request<FeedbackRead>(
+    `/signals/${encodeURIComponent(signalId)}/feedback`,
+    { method: "DELETE", token, workspaceId },
+  );
 }

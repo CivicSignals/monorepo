@@ -57,8 +57,10 @@ class RedisClient(Protocol):
     """The minimal Redis surface the locks need (so tests can fake it).
 
     Matches ``redis.Redis`` for the calls used: ``set`` with ``nx``/``px`` and
-    ``eval``. ``decode_responses`` may be on or off — we only compare bytes/str
-    we wrote ourselves, and the Lua compare-and-delete handles the equality.
+    ``eval`` (the locks), plus ``incr``/``expire`` (the P4 public rate limiter,
+    ``civicsignals_api.ratelimit``). ``decode_responses`` may be on or off — we
+    only compare bytes/str we wrote ourselves, and the Lua compare-and-delete
+    handles the equality.
     """
 
     def set(
@@ -71,6 +73,10 @@ class RedisClient(Protocol):
     ) -> bool | None: ...
 
     def eval(self, script: str, numkeys: int, *keys_and_args: str) -> object: ...
+
+    def incr(self, name: str, amount: int = ...) -> int: ...
+
+    def expire(self, name: str, time: int) -> bool: ...
 
 
 def get_redis_client() -> RedisClient:

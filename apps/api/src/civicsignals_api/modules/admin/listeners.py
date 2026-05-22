@@ -134,6 +134,17 @@ async def _on_signal_created(payload: dict[str, object]) -> None:
     )
 
 
+async def _on_signal_status_changed(payload: dict[str, object]) -> None:
+    # G4/G3: a member transitioned a per-workspace score row's status (the new ``status``
+    # rides along in the payload; the G4/G3 routes do not currently carry the prior state).
+    await _persist(
+        action="signal.status_changed",
+        payload=payload,
+        target_type="signal",
+        target_id=str(payload.get("signal_id", "")),
+    )
+
+
 async def _on_integration_connection_created(payload: dict[str, object]) -> None:
     # K1: an admin started connecting an integration (doc 03 F16.1).
     await _persist(
@@ -172,6 +183,7 @@ def register_listeners() -> None:
     events.subscribe(events.MEMBER_INVITED, _on_member_invited)
     events.subscribe(events.MEMBER_ROLE_CHANGED, _on_member_role_changed)
     events.subscribe(events.SIGNAL_CREATED, _on_signal_created)
+    events.subscribe(events.SIGNAL_STATUS_CHANGED, _on_signal_status_changed)
     events.subscribe(events.INTEGRATION_CONNECTION_CREATED, _on_integration_connection_created)
     events.subscribe(events.INTEGRATION_CONNECTION_DELETED, _on_integration_connection_deleted)
     logger.info("admin_audit_listeners_registered")
@@ -186,5 +198,6 @@ def unregister_listeners() -> None:
     events.unsubscribe(events.MEMBER_INVITED, _on_member_invited)
     events.unsubscribe(events.MEMBER_ROLE_CHANGED, _on_member_role_changed)
     events.unsubscribe(events.SIGNAL_CREATED, _on_signal_created)
+    events.unsubscribe(events.SIGNAL_STATUS_CHANGED, _on_signal_status_changed)
     events.unsubscribe(events.INTEGRATION_CONNECTION_CREATED, _on_integration_connection_created)
     events.unsubscribe(events.INTEGRATION_CONNECTION_DELETED, _on_integration_connection_deleted)

@@ -10,12 +10,15 @@
 //
 // generateMetadata provides per-page <title>, description, OG, and canonical.
 //
-// TODO P3: add JSON-LD Organization/GovernmentOrganization structured data.
+// P3: server-rendered JSON-LD (WebSite + Organization + CollectionPage +
+// BreadcrumbList) for structured data / rich results.
 
 import type { Metadata } from "next";
 import Link from "next/link";
 import { fetchPublicEntities } from "@/lib/public-entities-api";
 import type { EntityRead } from "@/lib/entities-api";
+import { directoryJsonLd } from "@/lib/jsonld";
+import { JsonLdScript } from "@/components/seo/json-ld";
 
 // ---- Revalidate at the page level (5 minutes). ----
 // Must be a literal — Next.js static analysis cannot resolve imported constants.
@@ -146,6 +149,9 @@ export default async function PublicDirectoryPage() {
 
   return (
     <main className="container py-8">
+      {/* P3: structured data — WebSite + Organization + CollectionPage + breadcrumbs. */}
+      <JsonLdScript data={directoryJsonLd(SITE_URL)} />
+
       {/* Header */}
       <div className="mb-6">
         <h1 className="text-3xl font-bold tracking-tight">
@@ -229,8 +235,6 @@ export default async function PublicDirectoryPage() {
           .
         </p>
       </div>
-
-      {/* TODO P3: JSON-LD structured data (Organization/GovernmentOrganization) */}
     </main>
   );
 }
