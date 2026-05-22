@@ -6,6 +6,7 @@ import { AuthNav } from "@/components/auth/auth-nav";
 // Internal routes that exist in the App Router.
 const INTERNAL_LINKS = [
   { href: "/entities" as const, label: "Entities" },
+  { href: "/foia" as const, label: "FOIA" },
   { href: "/pricing" as const, label: "Pricing" },
 ];
 
