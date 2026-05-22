@@ -12,7 +12,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ItemStatus
+from .models import ActivityType, ItemStatus
 
 # ---------------------------------------------------------------------------
 # Stage schemas
@@ -155,6 +155,42 @@ class StageRollup(BaseModel):
     stage_position: int
     item_count: int
     total_value: Decimal | None
+
+
+# ---------------------------------------------------------------------------
+# Activity schemas (J3)
+# ---------------------------------------------------------------------------
+
+
+class CommentCreate(BaseModel):
+    """Request body for ``POST /pipeline/items/{item_id}/comments``."""
+
+    text: str = Field(min_length=1, max_length=10000, description="Comment text.")
+    actor_id: UUID | None = Field(
+        default=None,
+        description="accounts_member.id of the commenter; omit for system-generated entries.",
+    )
+
+
+class ActivityOut(BaseModel):
+    """Public representation of a single pipeline item activity entry (J3)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    item_id: UUID
+    workspace_id: UUID
+    actor_id: UUID | None
+    activity_type: ActivityType
+    payload: dict[str, object]
+    created_at: datetime
+
+
+class ActivityPage(BaseModel):
+    """Cursor-paginated activity timeline for a pipeline item (J3)."""
+
+    items: list[ActivityOut]
+    next_cursor: str | None = None
 
 
 class PipelineReport(BaseModel):
