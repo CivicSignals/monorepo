@@ -44,8 +44,13 @@ EMBEDDING_DIM = 1536
 # ``new`` — freshly promoted, confidence high enough to surface normally.
 # ``pending_review`` — low-confidence (doc 19 §6.3 0.4-0.6 band) or entity
 #   resolution pending (doc 19 §4.3); paid actions gated until reviewed.
+# ``merged`` — candidate signal that was folded into a surviving signal via fuzzy
+#   dedupe (E10; doc 19 §7.4). The row is kept for the audit trail (its
+#   raw_document_ids were merged into the surviving signal) but is excluded from
+#   all list/feed queries. ``merged_into`` points to the surviving signal.
 SIGNAL_STATUS_NEW = "new"
 SIGNAL_STATUS_PENDING_REVIEW = "pending_review"
+SIGNAL_STATUS_MERGED = "merged"
 
 
 class Signal(Base):
@@ -152,6 +157,13 @@ class Signal(Base):
     review_required: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+
+    # Soft-delete for fuzzy-merged candidates (E10; doc 19 §7.4). When a candidate
+    # signal is approved/auto-merged into a surviving signal, its status is set to
+    # ``merged`` and this field points to the surviving signal's id. The row is kept
+    # for the raw-document audit trail but excluded from list_signals / feed queries.
+    # Loose ref (no FK across signal rows) — the surviving row in the same table.
+    merged_into: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     # pgvector embedding for fuzzy dedupe (doc 19 §7.4) + smart search (doc 07).
     # Populated by I1; the ANN (ivfflat) index is added by I1 once there is data to
