@@ -8,12 +8,18 @@ TODO D1): loading + JSON-Schema-validating recipe YAML, and driving the
 ``discover -> fetch -> extract -> normalize`` lifecycle through an injectable
 fetcher. The ingestion module's Celery tasks (TODO D4/D6) call into here rather
 than reaching into the runner internals.
+
+The **authoring tooling** (TODO D5) layers on top: dry-run *preview* of a recipe
+against pasted HTML or a live URL, plus a *scaffold* helper. The CLI and the
+staff preview endpoint both go through the functions here.
 """
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,14 +28,18 @@ from .fixtures import (
     replay_fixture,
     replay_recipe,
 )
+from .http_fetcher import HttpxFetcher
 from .models import DeadLetter
+from .preview import preview_html, preview_url
 from .runner import (
     Clock,
     Fetcher,
+    FetchFailedError,
     GatewayFieldExtractor,
     LLMFieldExtractor,
     RealClock,
     RecipeError,
+    RecipeNotFoundError,
     RecipeRunner,
     RecipeValidationError,
     RequiredFieldMissingError,
@@ -37,15 +47,21 @@ from .runner import (
     load_recipe,
     load_recipe_file,
     parse_recipe,
+    parse_recipe_yaml,
+    recipes_dir,
     validate_recipe_data,
 )
+from .scaffold import render_recipe, scaffold_recipe
 from .schemas import (
     CanonicalRecord,
     DeadLetterEntry,
     DriftCounters,
     ExtractedDocument,
     FieldExtraction,
+    FieldPreview,
     FixtureReplayResult,
+    PreviewRequest,
+    PreviewResult,
     Recipe,
     SourcePointer,
 )
@@ -124,6 +140,83 @@ async def persist_dead_letters(
     return count
 
 
+# ----------------------------------------------------------------------------
+# Authoring preview (doc 18 §3, TODO D5)
+# ----------------------------------------------------------------------------
+
+
+def _validate_preview_url(url: str) -> None:
+    """Partial SSRF guard: require http/https and reject non-global IP literals.
+
+    **Scope**: This function blocks the most obvious SSRF vectors — non-http(s)
+    schemes, empty hostnames (``http:///path``), and IP literals that are not
+    globally routable (loopback, link-local, RFC-1918 / ULA private, unspecified
+    0.0.0.0/::, multicast, reserved). It does *not* resolve hostnames, so names
+    like ``localhost`` or internal DNS entries can still reach private addresses.
+    Network-level egress controls (firewall, egress proxy) or a hostname-resolving
+    validator are the second line of defense for hostname-based targets.
+
+    Redirect chains are handled by the caller's fetcher; ``HttpxFetcher`` follows
+    redirects automatically. A full SSRF fix would disable automatic redirects and
+    re-validate each hop, which is deferred to the production connector (D6).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise RecipeError("preview URL must use http or https")
+    host = parsed.hostname  # None for empty authority (e.g. http:///path)
+    if not host:
+        raise RecipeError("preview URL must have a non-empty hostname")
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return  # not an IP literal — hostname string, allow through
+    if not addr.is_global:
+        raise RecipeError(
+            f"preview URL targets a non-globally-routable address ({host!r}); "
+            "loopback, link-local, private, unspecified, multicast, and reserved "
+            "addresses are not allowed"
+        )
+
+
+def _resolve_recipe(request: PreviewRequest) -> Recipe:
+    """Resolve a :class:`PreviewRequest` to a parsed recipe (id XOR inline YAML)."""
+    if (request.recipe_id is None) == (request.recipe_yaml is None):
+        raise RecipeError("provide exactly one of recipe_id or recipe_yaml")
+    if request.recipe_id is not None:
+        return load_recipe(request.recipe_id)
+    assert request.recipe_yaml is not None  # narrowed by the XOR check above
+    return parse_recipe_yaml(request.recipe_yaml)
+
+
+def preview_recipe(
+    request: PreviewRequest,
+    *,
+    fetcher: Fetcher | None = None,
+) -> PreviewResult:
+    """Run a :class:`PreviewRequest` end to end and return a :class:`PreviewResult`.
+
+    Resolves the recipe (by id or inline YAML), validates the one-of input
+    constraint (html XOR url), then dry-runs it. URL mode goes through the
+    runner's ``fetch`` (robots + politeness honored, doc 18 §2.2) using
+    ``fetcher`` — defaulting to an :class:`HttpxFetcher` when none is injected.
+    A :class:`RecipeError` is raised for bad requests / posture failures; a
+    required-field miss is captured into the result's ``error`` (``ok=False``).
+    """
+    recipe = _resolve_recipe(request)
+    if (request.html is None) == (request.url is None):
+        raise RecipeError("provide exactly one of html or url")
+
+    if request.html is not None:
+        return preview_html(recipe, request.html)
+
+    assert request.url is not None  # narrowed by the XOR check above
+    _validate_preview_url(request.url)
+    if fetcher is not None:
+        return preview_url(recipe, request.url, fetcher)
+    with HttpxFetcher() as live_fetcher:
+        return preview_url(recipe, request.url, live_fetcher)
+
+
 __all__ = [
     "CanonicalRecord",
     "Clock",
@@ -131,14 +224,20 @@ __all__ = [
     "DeadLetterEntry",
     "DriftCounters",
     "ExtractedDocument",
+    "FetchFailedError",
     "Fetcher",
     "FieldExtraction",
+    "FieldPreview",
     "FixtureReplayResult",
     "GatewayFieldExtractor",
+    "HttpxFetcher",
     "LLMFieldExtractor",
+    "PreviewRequest",
+    "PreviewResult",
     "RealClock",
     "Recipe",
     "RecipeError",
+    "RecipeNotFoundError",
     "RecipeRunner",
     "RecipeValidationError",
     "RequiredFieldMissingError",
@@ -149,10 +248,17 @@ __all__ = [
     "load_recipe_file",
     "make_runner",
     "parse_recipe",
+    "parse_recipe_yaml",
     "persist_dead_letters",
+    "preview_html",
+    "preview_recipe",
+    "preview_url",
+    "recipes_dir",
+    "render_recipe",
     "replay_fixture",
     "replay_recipe",
     "run_recipe",
     "run_recipe_file",
+    "scaffold_recipe",
     "validate_recipe_data",
 ]

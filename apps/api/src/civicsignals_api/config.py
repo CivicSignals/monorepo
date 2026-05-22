@@ -155,6 +155,13 @@ class Settings(BaseSettings):
     # Sample ratio for OTel traces (1.0 = all; fraction = head-based sampling).
     otel_traces_sample_ratio: float = 1.0
 
+    # Staff-only recipe preview gate (TODO D5). Real RBAC is TODO B7; until that
+    # lands, the staff preview endpoint (POST /recipes/preview) is gated by a
+    # shared token. Unset means "development convenience": the endpoint is open
+    # only when `environment == "development"`. In staging/production an unset
+    # token disables the endpoint entirely (fail-closed). See recipes/routes.py.
+    recipe_preview_staff_token: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

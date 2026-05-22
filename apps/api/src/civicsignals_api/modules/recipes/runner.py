@@ -78,6 +78,21 @@ class RecipeValidationError(RecipeError):
         super().__init__(f"recipe {recipe_ref!r} is invalid: {joined}")
 
 
+class RecipeNotFoundError(RecipeError):
+    """No recipe exists for the requested id/path (distinct so callers can map
+    it to a 404 without parsing message text)."""
+
+
+class FetchFailedError(RecipeError):
+    """A fetch could not be completed (network/transport error). Distinct so
+    callers can map it to a 502 without parsing message text."""
+
+    def __init__(self, url: str, detail: str) -> None:
+        self.url = url
+        self.detail = detail
+        super().__init__(f"failed to fetch {url!r}: {detail}")
+
+
 class RobotsDisallowedError(RecipeError):
     """The fetch target is disallowed by the host's robots.txt (doc 18 §2.2)."""
 
@@ -173,6 +188,21 @@ def parse_recipe(data: object, *, recipe_ref: str = "<inline>") -> Recipe:
     return Recipe.model_validate(data)
 
 
+def parse_recipe_yaml(text: str, *, recipe_ref: str = "<inline>") -> Recipe:
+    """Validate + parse a recipe from a raw YAML string (doc 18 §3).
+
+    The authoring tooling (TODO D5) accepts an inline recipe (pasted into the
+    staff UI, or piped to the CLI) without it living on disk yet. A YAML parse
+    error is surfaced as a :class:`RecipeError` (not a bare ``yaml`` exception)
+    so callers handle one recipe-domain error type.
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RecipeError(f"recipe {recipe_ref!r} is not valid YAML: {exc}") from exc
+    return parse_recipe(data, recipe_ref=recipe_ref)
+
+
 def load_recipe_file(path: str | Path) -> Recipe:
     """Load + validate + parse a recipe YAML file."""
     path = Path(path)
@@ -180,15 +210,14 @@ def load_recipe_file(path: str | Path) -> Recipe:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:  # pragma: no cover - filesystem error
         raise RecipeError(f"cannot read recipe {path}: {exc}") from exc
-    data = yaml.safe_load(raw)
-    return parse_recipe(data, recipe_ref=str(path))
+    return parse_recipe_yaml(raw, recipe_ref=str(path))
 
 
 def load_recipe(recipe_id: str) -> Recipe:
     """Load the recipe ``recipes/<recipe_id>/recipe.yml`` by id."""
     path = recipes_dir() / recipe_id / "recipe.yml"
     if not path.exists():
-        raise RecipeError(f"no recipe {recipe_id!r} at {path}")
+        raise RecipeNotFoundError(f"no recipe {recipe_id!r} at {path}")
     return load_recipe_file(path)
 
 
@@ -787,15 +816,119 @@ class RecipeRunner:
         )
         return self.extract(raw)
 
+    def field_values(self, html: str) -> dict[str, str | None]:
+        """Per-field extracted values for ``html`` — public, never raises.
+
+        A **selector-only** sibling of :meth:`extract`: it runs only the
+        CSS-selector chain (primary → fallback selectors, via
+        :func:`_extract_field`) for each field and returns every declared
+        field's value (``None`` for a miss, including a missing required field).
+        It does *not* invoke the LLM-assisted rung (``llm_extractor``) or the
+        dead-letter path that :meth:`preview_extract` / :meth:`extract` use via
+        :meth:`_resolve_field`.
+
+        **Does not raise on missing required fields** — that is its key difference
+        from :meth:`extract`. However it can still raise :class:`RecipeError` for
+        unexpected extraction failures (e.g. a field using an unsupported selector
+        type). Use :meth:`preview_extract` when the full extraction picture —
+        including LLM-assisted fallback, per-field diagnostics, and structured
+        error capture — is required (D5 authoring preview). This method is useful
+        for fast, network-free selector smoke-tests where LLM assistance is not
+        needed.
+        """
+        doc = ParsedDocument(_parse_html(html), html)
+        return {
+            name: _extract_field(doc, name, spec).value for name, spec in self.recipe.fields.items()
+        }
+
+    def preview_extract(
+        self, html: str, *, source_url: str = "preview://pasted-html"
+    ) -> tuple[ExtractedDocument, str | None]:
+        """Extract from ``html`` through the full chain, never raising on required-field misses.
+
+        Returns ``(extracted, error_message)`` — a single extraction pass that
+        the authoring preview (D5) uses as the single source of truth for both
+        per-field diagnostics and canonical records. ``error_message`` is set when
+        a required field misses (otherwise ``None``); the returned
+        :class:`ExtractedDocument` always has ``field_extractions`` populated even
+        when a required field could not be extracted. This avoids the double-pass
+        that would occur if the caller ran :meth:`preview_field_extractions` and
+        :meth:`extract_html` separately.
+        """
+        doc = ParsedDocument(_parse_html(html), html)
+        page_text = doc.soup.get_text(" ", strip=True) if self._any_llm_assisted() else ""
+        raw = RawDocument(
+            recipe_id=self.recipe.recipe_id,
+            connector=self.recipe.connector,
+            url=source_url,
+            status_code=200,
+            content=html,
+            content_hash=_content_hash(html),
+            recipe_version=self.recipe.version,
+        )
+
+        field_extractions: list[FieldExtraction] = []
+        degraded_fields: list[str] = []
+        dead_letters: list[DeadLetterEntry] = []
+        drift = DriftCounters(fields_total=len(self.recipe.fields))
+        out: dict[str, str | None] = {}
+        error_message: str | None = None
+
+        for name, spec in self.recipe.fields.items():
+            result, dead_letter = self._resolve_field(
+                doc=doc, page_text=page_text, name=name, spec=spec, raw=raw
+            )
+            field_extractions.append(result)
+            out[name] = result.value
+
+            if result.method is ExtractionMethod.FALLBACK:
+                drift.selector_fallbacks += 1
+                drift.fallback_by_field[name] = drift.fallback_by_field.get(name, 0) + 1
+            elif result.method is ExtractionMethod.LLM_ASSISTED:
+                drift.llm_fallbacks += 1
+                drift.llm_by_field[name] = drift.llm_by_field.get(name, 0) + 1
+            if result.degraded:
+                degraded_fields.append(name)
+            if dead_letter is not None:
+                drift.dead_letters += 1
+                drift.dead_letter_by_field[name] = drift.dead_letter_by_field.get(name, 0) + 1
+                dead_letters.append(dead_letter)
+
+            # Capture the required-field miss but continue — the preview needs
+            # the full field picture even when a required field is absent.
+            if result.value is None and spec.required and error_message is None:
+                error_message = str(RequiredFieldMissingError(name))
+
+        method = ExtractionMethod.PRIMARY
+        for result in field_extractions:
+            if _METHOD_SEVERITY[result.method] > _METHOD_SEVERITY[method]:
+                method = result.method
+
+        extracted = ExtractedDocument(
+            recipe_id=self.recipe.recipe_id,
+            recipe_version=self.recipe.version,
+            signal_types=list(self.recipe.signal_types),
+            extraction_method=method,
+            degraded=bool(degraded_fields),
+            fields=out,
+            field_extractions=field_extractions,
+            degraded_fields=degraded_fields,
+            dead_letters=dead_letters,
+            drift=drift,
+        )
+        return extracted, error_message
+
 
 __all__ = [
     "Clock",
+    "FetchFailedError",
     "Fetcher",
     "GatewayFieldExtractor",
     "LLMFieldExtractor",
     "RealClock",
     "Recipe",
     "RecipeError",
+    "RecipeNotFoundError",
     "RecipeRunner",
     "RecipeValidationError",
     "RequiredFieldMissingError",
@@ -803,6 +936,7 @@ __all__ = [
     "load_recipe",
     "load_recipe_file",
     "parse_recipe",
+    "parse_recipe_yaml",
     "recipe_schema_dir",
     "recipes_dir",
     "validate_recipe_data",

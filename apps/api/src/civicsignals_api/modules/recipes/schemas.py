@@ -310,3 +310,66 @@ class FixtureReplayResult(BaseModel):
     expected: dict[str, object]
     actual: dict[str, object]
     diff: str | None = None
+
+
+# ----------------------------------------------------------------------------
+# Authoring preview (doc 18 §3, TODO D5)
+# ----------------------------------------------------------------------------
+
+
+class FieldPreview(BaseModel):
+    """Per-field diagnostic for a recipe authoring preview (doc 18 §3, §3.4).
+
+    Surfaces, for one declared field, what the dry-run extracted plus the
+    information an author needs to debug a miss: the ordered selector list that
+    *would* be tried, whether the field is required, and whether a required
+    field came back empty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: str | None
+    matched: bool
+    required: bool
+    attr: str | None = None
+    selectors: list[str] = Field(default_factory=list)
+    missing_required: bool = False
+
+
+class PreviewResult(BaseModel):
+    """Result of dry-running a recipe against a sample input (doc 18 §3).
+
+    Captures a required-field failure into ``error`` (with ``ok = False``)
+    rather than raising, so the authoring UI/CLI can render the partial result
+    — a failed extraction is exactly what an author needs to iterate on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str
+    recipe_version: int
+    source: str
+    ok: bool
+    degraded: bool = False
+    extraction_method: str | None = None
+    signal_types: list[str] = Field(default_factory=list)
+    fields: list[FieldPreview] = Field(default_factory=list)
+    records: list[CanonicalRecord] = Field(default_factory=list)
+    error: str | None = None
+
+
+class PreviewRequest(BaseModel):
+    """Staff preview request: a recipe (id or inline YAML) + a sample input.
+
+    Exactly one of ``recipe_id`` / ``recipe_yaml`` identifies the recipe, and
+    exactly one of ``html`` / ``url`` supplies the sample input. The endpoint
+    validates the one-of constraints and returns RFC 7807 problems otherwise.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str | None = None
+    recipe_yaml: str | None = None
+    html: str | None = None
+    url: str | None = None
