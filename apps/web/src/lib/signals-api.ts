@@ -275,3 +275,45 @@ export function getSignalDetail(
     { token, workspaceId },
   );
 }
+
+// ---- Status transitions (G4) ------------------------------------------------
+
+/**
+ * The statuses the triage UI can request (G4). ``pushed`` is excluded — it is set
+ * by the K-epic CRM-push flow, never by this human-driven control (doc 14 §5.3).
+ */
+export type SettableStatus = "new" | "reviewed" | "pinned" | "dismissed";
+
+/** Response of the G4 PATCH: the transitioned score row's identity + new status. */
+export interface StatusChangeRead {
+  score_id: string;
+  signal_id: string;
+  status: FeedStatus;
+}
+
+/**
+ * Transition a signal's per-workspace status (G4).
+ *
+ * PATCHes ``signals_workspace_score.status`` for the (workspace, signal) pair via
+ * the validated transition graph. Workspace-scoped via X-Workspace-Id (doc 08 §1.4);
+ * member-gated server-side (B7). A 404 means the signal did not score into this
+ * workspace's feed; a 422 means the transition is illegal from the current status —
+ * both surface as a {@link ProblemError}.
+ */
+export function changeSignalStatus(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+  status: SettableStatus,
+): Promise<StatusChangeRead> {
+  return request<StatusChangeRead>(
+    `/signals/${encodeURIComponent(signalId)}/status`,
+    {
+      method: "PATCH",
+      token,
+      workspaceId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    },
+  );
+}

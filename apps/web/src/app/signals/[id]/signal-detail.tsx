@@ -27,6 +27,7 @@ import {
 } from "@/lib/signals-api";
 import { useSignalDetail } from "@/hooks/use-signals";
 import { ProblemError } from "@/lib/auth-api";
+import { StatusControls } from "@/components/signals/status-controls";
 import { WhyThisSignal } from "./why-this-signal";
 
 // ---- Helpers ----------------------------------------------------------------
@@ -307,6 +308,12 @@ export function SignalDetail({ id }: SignalDetailProps) {
         <p className="text-muted-foreground">
           {[data.entity_name, formatDate(signal.occurred_at)].filter(Boolean).join(" · ")}
         </p>
+        {/* Status transition controls (G4). Only rendered when the signal scored into
+            this workspace's feed (data.status non-null) — otherwise there is no score
+            row to transition (the PATCH would 404). */}
+        {data.status && (
+          <StatusControls signalId={signal.id} status={data.status} />
+        )}
         {data.entity_id && (
           <Link
             href={`/entities/${data.entity_id}`}

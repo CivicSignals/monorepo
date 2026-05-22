@@ -14,6 +14,7 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   POST /signals/fuzzy-reviews/{id}/approve   — approve → merge candidate into match
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
   GET  /signals/{id}/detail                  — workspace-scoped signal detail (G2)
+  PATCH /signals/{id}/status                 — transition the per-workspace status (G4)
   GET  /signals/{id}                         — get one signal
 
 Route ordering note: ``/feed``, ``/fuzzy-reviews`` and their sub-paths MUST be
@@ -32,15 +33,21 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
+import structlog
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from civicsignals_api import events
 from civicsignals_api.db import get_session
-from civicsignals_api.modules.auth.dependencies import RequireAdmin, RequireViewer
+from civicsignals_api.modules.auth.dependencies import (
+    RequireAdmin,
+    RequireMember,
+    RequireViewer,
+)
 
 from . import services
 from .schemas import (
@@ -52,6 +59,8 @@ from .schemas import (
     SuggestedContactRead,
 )
 from .services import WorkspaceFeedPage, WorkspaceSignalDetail
+
+log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/signals", tags=["signals"])
 
@@ -184,7 +193,8 @@ async def get_workspace_feed(
     a query param, so one workspace cannot read another's feed (doc 08 §1.4).
 
     TODO G3: bulk actions (dismiss/pin batch) build on this feed.
-    TODO G4: status transitions (dismiss/pin/push single) will be PATCH endpoints.
+    G4: single-row status transitions are the ``PATCH /signals/{id}/status`` endpoint
+    below (``change_status``).
     TODO G5: polished loading/empty/error states (the UI leaves seams for these).
     """
     workspace_id = ctx.workspace.id
@@ -436,15 +446,11 @@ def _signal_detail(detail: WorkspaceSignalDetail) -> SignalDetailRead:
         score_breakdown=detail.score_breakdown,
         matched_keywords=detail.matched_keywords,
         extracted_fields=detail.extracted_fields,
-        source_documents=[
-            SourceDocumentRead.model_validate(d) for d in detail.source_documents
-        ],
+        source_documents=[SourceDocumentRead.model_validate(d) for d in detail.source_documents],
         suggested_contacts=[
             SuggestedContactRead.model_validate(c) for c in detail.suggested_contacts
         ],
-        related_signals=[
-            RelatedSignalRead(signal=r.signal) for r in detail.related_signals
-        ],
+        related_signals=[RelatedSignalRead(signal=r.signal) for r in detail.related_signals],
     )
 
 
@@ -472,7 +478,8 @@ async def get_signal_detail(
     404 (RFC 7807) when the signal does not exist or is a soft-deleted ``merged`` row.
 
     TODO F4: the "Why this signal?" panel renders bullets from ``score_breakdown``.
-    TODO G4: per-signal status transitions (dismiss/pin/push) will PATCH the score row.
+    G4: per-signal status transitions are the ``PATCH /signals/{id}/status`` endpoint
+    below, which PATCHes the same score row this view reads ``status`` from.
     """
     detail = await services.get_signal_detail(
         session, signal_id=signal_id, workspace_id=ctx.workspace.id
@@ -480,6 +487,115 @@ async def get_signal_detail(
     if detail is None:
         return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
     return _signal_detail(detail)
+
+
+# ---------------------------------------------------------------------------
+# G4 status-transition endpoint — workspace-scoped PATCH of the score row.
+#
+# Registered before the bare ``/{signal_id}`` (below): ``/{signal_id}/status`` is a
+# deeper path so FastAPI matches it first, but ordering it here keeps the convention
+# (more-specific routes precede the catch-all) explicit.
+# ---------------------------------------------------------------------------
+
+
+# The statuses the triage UI is allowed to request (G4, doc 14 §5.3). ``pushed`` is
+# excluded — it is set by the K-epic CRM-push flow, never by this human-driven PATCH;
+# the ``Literal`` makes that a 422 (request validation) at the schema layer so the
+# illegal target never reaches the service.
+SettableStatus = Literal["new", "reviewed", "pinned", "dismissed"]
+
+
+class StatusChangeIn(BaseModel):
+    """Request body for the G4 status transition (doc 14 §5.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: SettableStatus
+
+
+class StatusChangeRead(BaseModel):
+    """The transitioned score row's identity + new status (G4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score_id: uuid.UUID
+    signal_id: uuid.UUID
+    status: str
+
+
+@router.patch(
+    "/{signal_id}/status",
+    response_model=StatusChangeRead,
+    summary="Transition a signal's per-workspace status (G4)",
+)
+async def change_status(
+    signal_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+    body: Annotated[StatusChangeIn, Body()],
+) -> StatusChangeRead | JSONResponse:
+    """Transition the calling workspace's ``signals_workspace_score.status`` (G4).
+
+    Moves one score row through the feed lifecycle (``new`` → ``reviewed`` →
+    ``pinned``, plus ``dismissed`` / restore-to-``new``) per the allowed-transition
+    graph (``signals.services.STATUS_TRANSITIONS``, doc 14 §5.3). Member-gated
+    (``RequireMember``: viewers cannot mutate workspace data, B7) and workspace-scoped
+    — the row is read by ``(workspace_id, signal_id)`` from the resolved
+    :class:`WorkspaceContext` (never a body/query param), so one workspace can never
+    transition another's row (doc 08 §1.4).
+
+    The ``pushed`` state is *not* settable here — it is owned by the K-epic CRM-push
+    flow (doc 14 §5.3); the request schema's ``Literal`` rejects it as a 422 before
+    the service runs.
+
+    Errors (RFC 7807):
+    - 404 — the signal did not score into this workspace's feed (no score row), or
+      the signal does not exist.
+    - 422 — the requested transition is not allowed from the current status (the
+      ``detail`` names the current state + the allowed targets).
+
+    Emits :data:`~civicsignals_api.events.SIGNAL_STATUS_CHANGED` so B9's audit listener
+    records the change (best-effort; a failed audit never fails the transition).
+    """
+    try:
+        row = await services.change_workspace_score_status(
+            session,
+            workspace_id=ctx.workspace.id,
+            signal_id=signal_id,
+            target_status=body.status,
+        )
+    except services.WorkspaceScoreNotFoundError:
+        return _problem(
+            404,
+            "Signal not in feed",
+            f"Signal {signal_id} has no score row in this workspace; nothing to transition.",
+        )
+    except services.IllegalStatusTransitionError as exc:
+        return _problem(
+            422,
+            "Illegal status transition",
+            (
+                f"Cannot move status from {exc.current!r} to {exc.target!r}; "
+                f"allowed targets: {', '.join(sorted(exc.allowed)) or '(none)'}."
+            ),
+        )
+    await session.commit()
+
+    # Best-effort audit (B9 persists). A broken audit sink must not fail the action.
+    try:
+        await events.publish(
+            events.SIGNAL_STATUS_CHANGED,
+            {
+                "signal_id": str(signal_id),
+                "workspace_id": str(ctx.workspace.id),
+                "user_id": str(ctx.user.id),
+                "status": row.status,
+            },
+        )
+    except Exception:  # pragma: no cover - defensive; audit is fire-and-forget
+        log.warning("signal_status_changed_event_failed", signal_id=str(signal_id))
+
+    return StatusChangeRead(score_id=row.id, signal_id=signal_id, status=row.status)
 
 
 # ---------------------------------------------------------------------------

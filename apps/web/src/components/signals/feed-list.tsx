@@ -26,6 +26,7 @@ import type {
 } from "@/lib/signals-api";
 import { SIGNAL_TYPE_LABELS } from "@/lib/signals-api";
 import { useWorkspaceFeed } from "@/hooks/use-signals";
+import { StatusControls } from "@/components/signals/status-controls";
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -129,6 +130,10 @@ function FeedItemCard({ item }: { item: FeedItemRead }) {
               <span className="font-medium text-gray-600">Why:</span> {why}
             </p>
           )}
+          {/* Status transition controls (G4) — mark reviewed / pin / dismiss. */}
+          <div className="mt-2.5">
+            <StatusControls signalId={sig.id} status={item.status} size="sm" />
+          </div>
         </div>
         {/* Score badge */}
         <div className="flex-shrink-0 text-right">

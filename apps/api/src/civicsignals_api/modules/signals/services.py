@@ -111,6 +111,11 @@ from .scoring import (
 from .workspace_score_model import (
     FEED_VISIBLE_STATUSES,
     MATCHED_VIA_ICP,
+    SCORE_STATUS_DISMISSED,
+    SCORE_STATUS_NEW,
+    SCORE_STATUS_PINNED,
+    SCORE_STATUS_PUSHED,
+    SCORE_STATUS_REVIEWED,
     SCORE_STATUSES,
     WorkspaceScore,
 )
@@ -890,6 +895,131 @@ async def score_workspace_candidates(
 
 
 # ---------------------------------------------------------------------------
+# Per-workspace status transitions (G4, doc 14 §5.3)
+# ---------------------------------------------------------------------------
+#
+# A score row's ``status`` is the feed lifecycle the user drives:
+# ``new`` → ``reviewed`` → ``pinned`` (plus the terminal-ish ``dismissed`` and the
+# integration-set ``pushed``). G4 is the single-row PATCH that moves a row between
+# states; G3's bulk action builds on the same ``change_workspace_score_status`` seam.
+#
+# Allowed transitions (doc 14 §5.3). The map is intentionally small + explicit so an
+# illegal jump (e.g. ``new`` → ``pushed`` from the UI) is rejected rather than silently
+# applied — the ``pushed`` state is reachable only from the K-epic CRM-push flow
+# (``MATCHED_VIA``-agnostic), not from the human triage controls, so the UI surface
+# (member-gated PATCH) never targets it directly. Any state can be dismissed; a
+# dismissed row can be revived back to ``new`` (a "restore" from the hidden view).
+
+# Status set the human triage UI is allowed to request (G4). ``pushed`` is excluded:
+# it is set by the K-epic push flow, never by the triage PATCH (doc 14 §5.3).
+USER_SETTABLE_STATUSES: frozenset[str] = frozenset(
+    {
+        SCORE_STATUS_NEW,
+        SCORE_STATUS_REVIEWED,
+        SCORE_STATUS_PINNED,
+        SCORE_STATUS_DISMISSED,
+    }
+)
+
+# The transition graph (doc 14 §5.3). ``from`` → set of allowed ``to`` states.
+# A no-op (``to`` == current) is always allowed (idempotent re-set) and handled in
+# :func:`change_workspace_score_status` rather than encoded here.
+STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
+    SCORE_STATUS_NEW: frozenset(
+        {SCORE_STATUS_REVIEWED, SCORE_STATUS_PINNED, SCORE_STATUS_DISMISSED}
+    ),
+    SCORE_STATUS_REVIEWED: frozenset({SCORE_STATUS_PINNED, SCORE_STATUS_DISMISSED}),
+    SCORE_STATUS_PINNED: frozenset({SCORE_STATUS_REVIEWED, SCORE_STATUS_DISMISSED}),
+    # A pushed row can still be pinned / dismissed by the user (the push already
+    # happened; triage of the row continues). It cannot be sent back to ``new``.
+    SCORE_STATUS_PUSHED: frozenset({SCORE_STATUS_PINNED, SCORE_STATUS_DISMISSED}),
+    # Restoring a dismissed row brings it back to ``new`` (the default feed bucket).
+    SCORE_STATUS_DISMISSED: frozenset({SCORE_STATUS_NEW}),
+}
+
+
+class WorkspaceScoreNotFoundError(Exception):
+    """No score row exists for the (workspace, signal) pair (G4 → 404).
+
+    The signal did not score into the calling workspace's feed (the row is sparse —
+    doc 14 §5.2), so there is no status to transition. Distinct from "signal does not
+    exist": the route maps this to a 404 either way, but the detail message differs.
+    """
+
+    def __init__(self, signal_id: uuid.UUID) -> None:
+        self.signal_id = signal_id
+        super().__init__(f"no workspace score row for signal {signal_id}")
+
+
+class IllegalStatusTransitionError(Exception):
+    """A requested status transition is not allowed by the graph (G4 → 422).
+
+    Carries the ``current`` and requested ``target`` states + the ``allowed`` set so
+    the route can surface an explicit RFC 7807 422 the UI can act on (doc 14 §5.3).
+    """
+
+    def __init__(self, current: str, target: str, allowed: frozenset[str]) -> None:
+        self.current = current
+        self.target = target
+        self.allowed = allowed
+        super().__init__(
+            f"illegal status transition {current!r} -> {target!r}; "
+            f"allowed: {sorted(allowed) or '(none)'}"
+        )
+
+
+async def change_workspace_score_status(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    target_status: str,
+) -> WorkspaceScore:
+    """Transition one ``signals_workspace_score`` row's ``status`` (G4, doc 14 §5.3).
+
+    The single-row status PATCH the triage UI (feed row + detail page) drives. Reads
+    the score row **scoped to the calling workspace** via the ``(workspace_id,
+    signal_id)`` unique key — workspace A can never mutate workspace B's row (doc 14
+    §5.3) — then validates the move against :data:`STATUS_TRANSITIONS` and persists it.
+
+    Raises:
+    - :class:`ValueError` — ``target_status`` is not a known status (the route should
+      have rejected it at the schema layer; this is the defensive backstop).
+    - :class:`WorkspaceScoreNotFoundError` — no row for the pair (route → 404).
+    - :class:`IllegalStatusTransitionError` — the move is not in the graph (route →
+      422). A no-op (target == current) is allowed and returns the row unchanged.
+
+    The caller owns the transaction (this flushes, not commits). Cross-module callers
+    reach this through ``signals.services`` (never the model directly — doc 06 §3).
+    """
+    if target_status not in SCORE_STATUSES:
+        raise ValueError(f"unknown status {target_status!r}")
+
+    row = (
+        await session.execute(
+            select(WorkspaceScore)
+            .where(WorkspaceScore.workspace_id == workspace_id)
+            .where(WorkspaceScore.signal_id == signal_id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise WorkspaceScoreNotFoundError(signal_id)
+
+    current = row.status
+    if target_status == current:
+        # Idempotent re-set: no transition needed, the row already holds the target.
+        return row
+
+    allowed = STATUS_TRANSITIONS.get(current, frozenset())
+    if target_status not in allowed:
+        raise IllegalStatusTransitionError(current, target_status, allowed)
+
+    row.status = target_status
+    await session.flush()
+    return row
+
+
+# ---------------------------------------------------------------------------
 # Backfill candidate pre-filter (F6, doc 14 §7.1)
 # ---------------------------------------------------------------------------
 
@@ -1400,8 +1530,10 @@ __all__ = [
     "REVIEW_STATUS_PENDING",
     "REVIEW_STATUS_REJECTED",
     "SIGNAL_STATUS_MERGED",
+    "STATUS_TRANSITIONS",
     "SUGGESTED_CONTACTS_LIMIT",
     "UNUSABLE_CONTACT_STATUSES",
+    "USER_SETTABLE_STATUSES",
     "BandThresholds",
     "CandidateInput",
     "ConfidenceBand",
@@ -1414,6 +1546,7 @@ __all__ = [
     "FuzzyReviewNotFoundError",
     "FuzzyReviewSignalMissingError",
     "IcpCriteria",
+    "IllegalStatusTransitionError",
     "RelatedSignal",
     "ScoreResult",
     "ScoringConfig",
@@ -1429,12 +1562,14 @@ __all__ = [
     "WorkspaceFeedItem",
     "WorkspaceFeedPage",
     "WorkspaceScore",
+    "WorkspaceScoreNotFoundError",
     "WorkspaceScoreResult",
     "WorkspaceSignalDetail",
     "backfill_embeddings",
     "build_embedding_text",
     "candidate_icp_filter",
     "candidate_signal_ids_for_icp",
+    "change_workspace_score_status",
     "compute_dedupe_hash",
     "compute_dedupe_hash_for_payload",
     "config_from_recipe",

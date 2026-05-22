@@ -21,6 +21,14 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("@/hooks/use-signals", () => ({
   useWorkspaceFeed: vi.fn(),
+  // FeedItemCard renders StatusControls (G4), which calls useChangeSignalStatus —
+  // stub it as an idle mutation so the rows render without a real client.
+  useChangeSignalStatus: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
   feedKeys: {
     all: ["signals-feed"],
     workspace: (id: string | null) => ["signals-feed", id ?? "none"],

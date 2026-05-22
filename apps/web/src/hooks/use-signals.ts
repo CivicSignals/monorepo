@@ -9,12 +9,22 @@
 
 "use client";
 
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type InfiniteData,
+} from "@tanstack/react-query";
 import {
   type FeedFilters,
+  type FeedItemRead,
   type FeedPage,
+  type SettableStatus,
   type SignalDetailRead,
+  type StatusChangeRead,
   FEED_PAGE_LIMIT,
+  changeSignalStatus,
   getSignalDetail,
   listFeedSignals,
 } from "@/lib/signals-api";
@@ -104,5 +114,111 @@ export function useSignalDetail(signalId: string | undefined) {
       workspaceId !== null &&
       signalId !== undefined &&
       signalId !== "",
+  });
+}
+
+// ---- useChangeSignalStatus --------------------------------------------------
+
+/** Variables for the G4 status mutation: which signal, and the target status. */
+export interface ChangeStatusVars {
+  signalId: string;
+  status: SettableStatus;
+}
+
+/** Snapshot of cache entries we touched, kept so onError can roll the UI back. */
+interface StatusRollback {
+  feed: Array<[readonly unknown[], InfiniteData<FeedPage> | undefined]>;
+  detail: SignalDetailRead | undefined;
+}
+
+/** Apply ``status`` to every matching feed item across all cached feed pages. */
+function patchFeedStatus(
+  data: InfiniteData<FeedPage> | undefined,
+  signalId: string,
+  status: SettableStatus,
+): InfiniteData<FeedPage> | undefined {
+  if (!data) return data;
+  return {
+    ...data,
+    pages: data.pages.map((page) => ({
+      ...page,
+      data: page.data.map((item: FeedItemRead) =>
+        item.signal.id === signalId ? { ...item, status } : item,
+      ),
+    })),
+  };
+}
+
+/**
+ * Mutation hook for the G4 per-signal status transition (mark reviewed / pin /
+ * dismiss / restore). Optimistically updates the signal's status in the feed list
+ * caches *and* its detail cache, rolls back on error, and invalidates the feed +
+ * detail queries on settle so the server stays the source of truth (doc 06 §2).
+ *
+ * Server state only — the optimistic write lives in the TanStack Query cache, never
+ * Zustand. The PATCH is workspace-scoped + member-gated server-side (B7).
+ */
+export function useChangeSignalStatus() {
+  const { token, workspaceId } = useAuth();
+  const queryClient = useQueryClient();
+
+  return useMutation<StatusChangeRead, Error, ChangeStatusVars, StatusRollback>({
+    mutationFn: ({ signalId, status }) => {
+      if (!token || !workspaceId)
+        return Promise.reject(new Error("not authenticated"));
+      return changeSignalStatus(token, workspaceId, signalId, status);
+    },
+    onMutate: async ({ signalId, status }) => {
+      // Cancel in-flight feed/detail fetches so they can't clobber our optimistic write.
+      await queryClient.cancelQueries({
+        queryKey: feedKeys.workspace(workspaceId),
+      });
+
+      // Snapshot every feed-list cache for this workspace + the detail cache.
+      const feed = queryClient.getQueriesData<InfiniteData<FeedPage>>({
+        queryKey: [...feedKeys.workspace(workspaceId), "list"],
+      });
+      const detailKey = feedKeys.detail(workspaceId, signalId);
+      const detail = queryClient.getQueryData<SignalDetailRead>(detailKey);
+
+      // Optimistically patch the feed lists.
+      for (const [key] of feed) {
+        queryClient.setQueryData<InfiniteData<FeedPage>>(key, (old) =>
+          patchFeedStatus(old, signalId, status),
+        );
+      }
+      // Optimistically patch the detail cache.
+      if (detail) {
+        queryClient.setQueryData<SignalDetailRead>(detailKey, {
+          ...detail,
+          status,
+        });
+      }
+
+      return { feed, detail };
+    },
+    onError: (_err, { signalId }, context) => {
+      // Roll the optimistic writes back to the snapshots.
+      if (!context) return;
+      for (const [key, snapshot] of context.feed) {
+        queryClient.setQueryData(key, snapshot);
+      }
+      if (context.detail) {
+        queryClient.setQueryData(
+          feedKeys.detail(workspaceId, signalId),
+          context.detail,
+        );
+      }
+    },
+    onSettled: (_data, _err, { signalId }) => {
+      // Re-sync from the server: the feed ordering / visibility may have shifted
+      // (e.g. a dismissed row drops out of the default visible set).
+      void queryClient.invalidateQueries({
+        queryKey: feedKeys.workspace(workspaceId),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: feedKeys.detail(workspaceId, signalId),
+      });
+    },
   });
 }
