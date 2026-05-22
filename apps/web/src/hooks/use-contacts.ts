@@ -1,24 +1,31 @@
-// Contacts hooks (C4) — TanStack Query owns server state (doc 06 §2).
+// Contacts hooks (C4, C6) — TanStack Query owns server state (doc 06 §2).
 //
-// Contacts are global/not workspace-scoped; no auth or workspace header needed.
+// Contacts are global/not workspace-scoped; no auth or workspace header needed
+// for reads. The report-invalid mutation (C6) does require auth + workspace.
 //
-// useEntityContacts — infinite-scroll list of contacts for a given entity
-// useContact        — single contact by id
+// useEntityContacts         — infinite-scroll list of contacts for one entity
+// useContact                — single contact by id
+// useReportContactInvalid   — mutation: POST /contacts/{id}/report-invalid (C6)
 
 "use client";
 
 import {
   useInfiniteQuery,
+  useMutation,
   useQuery,
+  useQueryClient,
   type InfiniteData,
 } from "@tanstack/react-query";
 import {
+  type ContactCorrectionRequest,
+  type ContactCorrectionResponse,
   type ContactFilters,
   type ContactPage,
   type ContactRead,
   CONTACTS_PAGE_LIMIT,
   getContact,
   listContacts,
+  reportContactInvalid,
 } from "@/lib/contacts-api";
 
 // ---- Query keys ----
@@ -71,3 +78,55 @@ export function useContact(id: string | undefined) {
 
 // Re-export the filters type for convenience
 export type { ContactFilters };
+
+// ---- useReportContactInvalid: mutation for C6 correction endpoint ----
+
+/**
+ * TanStack Query mutation to report a contact as invalid/bounced (C6).
+ *
+ * On success:
+ * - Invalidates the contacts list query for the contact's entity so the badge
+ *   updates without a manual refresh.
+ * - Invalidates the single-contact detail query (if fetched).
+ *
+ * The mutation accepts a ``ContactCorrectionRequest`` + auth context and returns
+ * a ``ContactCorrectionResponse`` with the updated contact + the new audit row.
+ */
+export function useReportContactInvalid(options?: {
+  /** Entity id to invalidate after a successful report (for list invalidation). */
+  entityId?: string;
+}) {
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    ContactCorrectionResponse,
+    Error,
+    {
+      contactId: string;
+      body: ContactCorrectionRequest;
+      accessToken: string;
+      workspaceId: string;
+    }
+  >({
+    mutationFn: ({ contactId, body, accessToken, workspaceId }) =>
+      reportContactInvalid(contactId, body, { accessToken, workspaceId }),
+
+    onSuccess: (data) => {
+      // Invalidate the detail query for the affected contact.
+      void queryClient.invalidateQueries({
+        queryKey: contactsKeys.detail(data.contact.id),
+      });
+      // Invalidate the list query so the updated badge propagates immediately.
+      if (options?.entityId) {
+        void queryClient.invalidateQueries({
+          queryKey: contactsKeys.listForEntity(options.entityId),
+        });
+      } else {
+        // Broad invalidation when entity id is not known.
+        void queryClient.invalidateQueries({
+          queryKey: contactsKeys.lists(),
+        });
+      }
+    },
+  });
+}

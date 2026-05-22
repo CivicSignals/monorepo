@@ -1,15 +1,17 @@
-// Contacts API client for the web app (C4).
+// Contacts API client for the web app (C4, C6).
 //
 // Talks to the FastAPI contacts endpoints under NEXT_PUBLIC_API_BASE_URL
 // (e.g. http://localhost:8000/api/v1). TanStack Query owns the *server* state
 // (see src/hooks/use-contacts.ts); this module is the thin transport layer.
 //
 // Contacts are **global / not workspace-scoped** (doc 07 §3, C2 req 3):
-// no X-Workspace-Id header is needed, same as entities.
+// no X-Workspace-Id header is needed for reads.
 //
 // Endpoints mirrored:
-//   GET /contacts?entity_id=…&cursor=…&limit=…  — list contacts for entity
-//   GET /contacts/{contact_id}                   — get one contact
+//   GET  /contacts?entity_id=…&cursor=…&limit=…  — list contacts for entity
+//   GET  /contacts/{contact_id}                   — get one contact
+//   POST /contacts/{contact_id}/report-invalid    — report a contact as bad (C6,
+//        workspace-scoped; requires X-Workspace-Id + bearer auth)
 
 import { ProblemError, type Problem } from "@/lib/auth-api";
 
@@ -88,8 +90,43 @@ export interface ContactRead {
   observed_at: string | null;
   verified: boolean;
   last_verified_at: string | null;
+  // C6 correction/bounce tracking
+  reported_invalid_at: string | null;
+  bounce_count: number;
   created_at: string;
   updated_at: string;
+}
+
+// ---- C6 correction types ----
+
+/** Valid correction kinds (mirrors CORRECTION_KINDS in Python). */
+export type CorrectionKind =
+  | "bounced"
+  | "wrong_email"
+  | "wrong_phone"
+  | "wrong_person"
+  | "other";
+
+export interface ContactCorrectionRequest {
+  kind: CorrectionKind;
+  reason?: string | null;
+  correction?: string | null;
+}
+
+export interface ContactCorrectionRead {
+  id: string;
+  contact_id: string;
+  workspace_id: string;
+  reporter_id: string;
+  kind: string;
+  reason: string | null;
+  correction: string | null;
+  created_at: string;
+}
+
+export interface ContactCorrectionResponse {
+  contact: ContactRead;
+  correction: ContactCorrectionRead;
 }
 
 export interface ContactPage {
@@ -152,6 +189,32 @@ export async function getContact(id: string): Promise<ContactRead | null> {
   }
 }
 
+/**
+ * Report a contact as invalid/bounced (C6).
+ *
+ * Requires a valid bearer token (``Authorization`` header) and the active
+ * workspace id (``X-Workspace-Id`` header). Both are passed as parameters so
+ * the caller controls where the auth state comes from.
+ */
+export async function reportContactInvalid(
+  contactId: string,
+  body: ContactCorrectionRequest,
+  options: { accessToken: string; workspaceId: string },
+): Promise<ContactCorrectionResponse> {
+  return request<ContactCorrectionResponse>(
+    `/contacts/${contactId}/report-invalid`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${options.accessToken}`,
+        "X-Workspace-Id": options.workspaceId,
+      },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
 // ---- Verification status helpers ----
 
 /** Number of days after which a verified contact is considered stale. */
@@ -160,12 +223,18 @@ export const STALE_DAYS = 180;
 /**
  * Derive the verification status label for a contact.
  *
- * - "Verified"  — verified=true and last_verified_at within STALE_DAYS days.
- * - "Stale"     — verified=false, or last_verified_at is older than STALE_DAYS days.
+ * - "Bounced"  — contact.status is "bounced" (C6 report confirmed email bounce).
+ * - "Invalid"  — contact.status is "invalid" (C6 report: wrong person/email/phone).
+ * - "Verified" — verified=true and last_verified_at within STALE_DAYS days.
+ * - "Stale"    — verified=false, or last_verified_at is older than STALE_DAYS days.
  */
-export type VerificationStatus = "Verified" | "Stale";
+export type VerificationStatus = "Bounced" | "Invalid" | "Verified" | "Stale";
 
-export function getVerificationStatus(contact: Pick<ContactRead, "verified" | "last_verified_at">): VerificationStatus {
+export function getVerificationStatus(
+  contact: Pick<ContactRead, "verified" | "last_verified_at" | "status">,
+): VerificationStatus {
+  if (contact.status === "bounced") return "Bounced";
+  if (contact.status === "invalid") return "Invalid";
   if (!contact.verified) return "Stale";
   if (!contact.last_verified_at) return "Stale";
   const verifiedAt = new Date(contact.last_verified_at).getTime();
