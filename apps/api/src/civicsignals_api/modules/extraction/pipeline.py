@@ -20,7 +20,9 @@ clear seam:
 - **extract**: emits permissive :class:`CandidateRecord` dicts; the **strict typed
   per-signal-type schema + required-field hard gate** (doc 19 §6.1; E4) runs in the
   store stage when a candidate is promoted into a signal.
-- **score**: ``# TODO E6`` confidence blend — passthrough now.
+- **score**: the E6 banded confidence blend (doc 19 §6.2-§6.3) — assigns each
+  candidate a blended confidence + band; a ``rejected``-band candidate is dropped
+  before store.
 - **dedupe**: ``# TODO E5`` per-type dedup key + merge — passthrough now.
 - **store**: persists candidates to ``extraction_candidate`` (the staging row E5
   reads) **and** promotes each validated candidate into a global
@@ -45,7 +47,15 @@ from civicsignals_api.llm_gateway import TASK_EXTRACTION, LLMGateway, get_gatewa
 from civicsignals_api.modules.ingestion import services as ingestion_services
 from civicsignals_api.modules.ingestion.services import RawDocumentStorage, StoredRawDocument
 from civicsignals_api.modules.signals import services as signals_services
-from civicsignals_api.modules.signals.services import CandidateInput, SignalValidationError
+from civicsignals_api.modules.signals.services import (
+    DEFAULT_CONFIG,
+    CandidateInput,
+    ConfidenceBand,
+    ConfidenceConfig,
+    SignalType,
+    SignalValidationError,
+    score_candidate_confidence,
+)
 
 from .models import ExtractionCandidate
 from .relevance import RelevanceClassifier
@@ -425,22 +435,77 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: score (confidence) — passthrough stub
+# Stage 5: score (confidence) — banded weighted blend (E6)
 # ---------------------------------------------------------------------------
 
 
-def score_candidate(candidate: CandidateRecord) -> CandidateRecord:
-    """Assign an extraction-confidence score (doc 19 §6.2).
+def score_candidate(
+    candidate: CandidateRecord,
+    *,
+    config: ConfidenceConfig = DEFAULT_CONFIG,
+    entity_resolved: bool = False,
+) -> CandidateRecord:
+    """Assign the banded extraction-confidence score (doc 19 §6.2-§6.3; E6).
 
-    # TODO E6: the real weighted blend (field-level confidences, LLM self-report,
-    # source quality, schema completeness, cross-validation — doc 19 §6.2) plus the
-    # confidence-band thresholds (doc 19 §6.3). Passthrough now: keep the model's
-    # self-reported confidence (already capped at 0.95), defaulting to a neutral
-    # mid value when the model didn't report one.
+    Runs the weighted blend (field-level confidences 40%, LLM self-report 20%,
+    source quality 15%, schema completeness 15%, cross-validation 10% — doc 19 §6.2)
+    over the candidate's typed ``signal_type`` + ``fields``, and maps the score to a
+    band (doc 19 §6.3). The blended ``confidence`` and the ``band`` are written back
+    onto the candidate; the store step lifts the band onto the signal row, and the
+    orchestrator drops a ``rejected``-band candidate before store (doc 19 §6.3).
+
+    ``config`` is the recipe-configurable scoring config (thresholds + source-quality
+    tier + weights, doc 19 §6.3); ``entity_resolved`` feeds the cross-validation
+    component (doc 19 §6.2). When the candidate's ``signal_type`` is unknown/absent
+    (a malformed extract — the E4 strict gate will reject it at store anyway), the
+    schema-completeness component cannot be computed, so we fall back to carrying the
+    self-reported confidence and band it against the configured thresholds.
     """
-    if candidate.confidence is not None:
-        return candidate
-    return candidate.model_copy(update={"confidence": 0.5})
+    signal_type = _coerce_signal_type(candidate.signal_type)
+    if signal_type is None:
+        # Cannot run the typed blend without a known type. Keep the self-reported
+        # confidence (defaulting neutral) and band it; the strict gate rejects it at
+        # store regardless, so this only governs whether we bother promoting it.
+        confidence = (
+            candidate.confidence if candidate.confidence is not None else NEUTRAL_CONFIDENCE
+        )
+        band = config.thresholds.band_for(confidence)
+        return candidate.model_copy(update={"confidence": confidence, "band": band.value})
+
+    result = score_candidate_confidence(
+        signal_type,
+        candidate.fields,
+        llm_confidence=candidate.confidence,
+        entity_resolved=entity_resolved,
+        config=config,
+    )
+    return candidate.model_copy(update={"confidence": result.score, "band": result.band.value})
+
+
+# Neutral confidence used when a candidate has no usable signal type and the model
+# reported nothing (mirrors ``signals.scoring.NEUTRAL``).
+NEUTRAL_CONFIDENCE: Final = 0.5
+
+
+def _coerce_signal_type(raw: str | None) -> SignalType | None:
+    """Map a candidate's coarse ``signal_type`` string to the typed enum, or None."""
+    if raw is None:
+        return None
+    try:
+        return SignalType(raw)
+    except ValueError:
+        return None
+
+
+def candidate_is_rejected(candidate: CandidateRecord) -> bool:
+    """Whether a scored candidate fell in the ``rejected`` band (doc 19 §6.3).
+
+    A ``rejected`` candidate is **not surfaced**: the orchestrator drops it before
+    the store step (it is still logged via the dropped-count, doc 19 §6.3 "logged
+    for retrospective analysis"). Used by :func:`run_extraction_pipeline` to filter
+    the scored candidates.
+    """
+    return candidate.band == ConfidenceBand.REJECTED.value
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +632,10 @@ async def store_candidates(
             entity_id=None,
             entity_name=_candidate_entity_name(candidate),
             confidence=candidate.confidence,
+            # The E6 band the score stage computed (doc 19 §6.3) drives the row's
+            # status/degraded/review flags. A ``rejected``-band candidate never
+            # reaches here — the orchestrator filters it before store.
+            band=_coerce_band(candidate.band),
             extraction_job_id=job_id,
             source_candidate_id=row.id,
         )
@@ -623,6 +692,16 @@ def _candidate_entity_name(candidate: CandidateRecord) -> str | None:
     return str(raw) if isinstance(raw, str) and raw.strip() else None
 
 
+def _coerce_band(raw: str | None) -> ConfidenceBand | None:
+    """Map the candidate's banded-string back to the typed enum for the store step."""
+    if raw is None:
+        return None
+    try:
+        return ConfidenceBand(raw)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -638,6 +717,7 @@ async def run_extraction_pipeline(
     gateway: LLMGateway | None = None,
     prefilter: str,
     workspace_id: str | None = None,
+    confidence_config: ConfidenceConfig = DEFAULT_CONFIG,
 ) -> PipelineResult:
     """Run the full funnel for one document (doc 19 §1; E1).
 
@@ -646,6 +726,12 @@ async def run_extraction_pipeline(
     + retry/dead-letter; this function just runs the stages and reports the result.
     On an irrelevant verdict it short-circuits before any extract call (the cost
     lever, doc 19 §3.1) and reports ``skipped=True``.
+
+    The score stage (E6, doc 19 §6.2-§6.3) computes each candidate's banded
+    confidence using ``confidence_config`` (the recipe-configurable thresholds +
+    source-quality tier; defaults to the documented §6.2/§6.3 baseline). A candidate
+    that lands in the ``rejected`` band is **dropped before store** — it is not
+    surfaced (doc 19 §6.3) — so ``result.candidates`` is the survivors only.
 
     The embed step (I1) runs after store: each promoted signal is embedded into its
     ``signals_signal.vector_embedding`` pgvector column for fuzzy dedupe (doc 19 §7.4)
@@ -674,18 +760,31 @@ async def run_extraction_pipeline(
         )
 
     raw_candidates = await extract_candidates(gateway, parsed, workspace_id=workspace_id)
-    scored = [dedupe_candidate(score_candidate(c)) for c in raw_candidates]
+    scored = [
+        dedupe_candidate(score_candidate(c, config=confidence_config)) for c in raw_candidates
+    ]
+    # Drop ``rejected``-band candidates (< pending-review floor): they are not
+    # surfaced (doc 19 §6.3). The rejected count is logged for retrospective analysis.
+    survivors = [c for c in scored if not candidate_is_rejected(c)]
+    rejected_count = len(scored) - len(survivors)
+    if rejected_count:
+        log.info(
+            "extraction.score.rejected_low_confidence",
+            raw_document_id=str(raw_document_id),
+            recipe_id=parsed.recipe_id,
+            rejected=rejected_count,
+        )
     _rows, signal_ids = await store_candidates(
         session,
         job_id=job_id,
         raw_document_id=raw_document_id,
         recipe_id=parsed.recipe_id,
-        candidates=scored,
+        candidates=survivors,
     )
     await embed_signals(session, signal_ids, gateway=gateway, workspace_id=workspace_id)
     return PipelineResult(
         raw_document_id=raw_document_id,
         relevant=True,
         skipped=False,
-        candidates=scored,
+        candidates=survivors,
     )

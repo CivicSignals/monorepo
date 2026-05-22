@@ -52,16 +52,20 @@ from .schemas import (
     SignalValidationError,
     parse_signal_payload,
 )
+from .scoring import (
+    DEFAULT_CONFIG,
+    BandThresholds,
+    ConfidenceBand,
+    ConfidenceConfig,
+    ConfidenceWeights,
+    ScoreResult,
+    config_from_recipe,
+    score_candidate_confidence,
+)
 
 # Pagination defaults (doc 06 §5, doc 08 §1.5).
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 100
-
-# Confidence band below which a promoted signal is held for review (doc 19 §6.3:
-# the 0.4-0.6 ``pending_review`` band). Above it, the signal is stored ``new``.
-# # TODO E6: the real per-recipe-configurable thresholds + degraded flag come with
-# the confidence blend; E4 applies the documented default band here.
-REVIEW_CONFIDENCE_FLOOR = 0.6
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +114,13 @@ class CandidateInput:
     entity_id: uuid.UUID | None = None
     entity_name: str | None = None
     confidence: float | None = None
+    # The confidence band the E6 scorer assigned (doc 19 §6.3). When the score stage
+    # computed it, the band drives the row's status/degraded/review flags directly.
+    # When ``None`` (a non-pipeline caller that only set ``confidence``), the band is
+    # derived from the confidence against the default thresholds — so the documented
+    # §6.3 banding still applies. A ``rejected``-band candidate must not reach here:
+    # the pipeline drops it before the store step (doc 19 §6.3).
+    band: ConfidenceBand | None = None
     occurred_at: datetime | None = None
     extraction_job_id: uuid.UUID | None = None
     source_candidate_id: uuid.UUID | None = None
@@ -138,10 +149,14 @@ async def promote_candidate_to_signal(
 
     The caller owns the transaction (this flushes, not commits).
 
+    The confidence band (doc 19 §6.2-§6.3; E6) is supplied on ``candidate.band``
+    when the extraction score stage computed it, or derived from
+    ``candidate.confidence`` against the default thresholds otherwise; it sets the
+    row's ``status``/``is_degraded``/``review_required`` flags. A ``rejected``-band
+    candidate must not reach here — the pipeline drops it before store (doc 19 §6.3).
+
     # TODO E5: real per-type dedup key + windowed lookup + full merge logic (doc 19
     # §7). E4 upserts on the exact key only — fuzzy/embedding dedupe is E5/I1.
-    # TODO E6: the real confidence blend + recipe-configurable bands (doc 19 §6.2-3);
-    # E4 applies the documented default ``pending_review`` band below.
     """
     payload = parse_signal_payload(candidate.signal_type, candidate.fields)
     return await store_signal(session, payload, candidate)
@@ -158,7 +173,9 @@ async def store_signal(
     holds a validated :class:`SignalPayload` (e.g. a backfill or a test) can store
     it directly. Upserts on the dedupe key; the caller commits.
     """
-    review = _needs_review(candidate)
+    band = _resolve_band(candidate)
+    review = band is ConfidenceBand.PENDING_REVIEW or candidate.entity_id is None
+    degraded = band is ConfidenceBand.DEGRADED
     details = payload.model_dump(mode="json")
     raw_doc_ids = _ordered_unique([candidate.raw_document_id, *candidate.extra_raw_document_ids])
 
@@ -179,6 +196,7 @@ async def store_signal(
         "details": details,
         "confidence": candidate.confidence,
         "status": SIGNAL_STATUS_PENDING_REVIEW if review else SIGNAL_STATUS_NEW,
+        "is_degraded": degraded,
         "review_required": review,
     }
 
@@ -209,17 +227,21 @@ async def store_signal(
     return existing
 
 
-def _needs_review(candidate: CandidateInput) -> bool:
-    """Whether a promoted signal is held for review (doc 19 §6.3, §4.3).
+def _resolve_band(candidate: CandidateInput) -> ConfidenceBand:
+    """Resolve the confidence band for a candidate at store time (doc 19 §6.3).
 
-    Two documented triggers: (a) a low extraction confidence in the 0.4-0.6
-    ``pending_review`` band (doc 19 §6.3) — a ``None`` confidence is treated as not
-    triggering review on its own; (b) entity resolution pending (doc 19 §4.3: no
-    resolved ``entity_id``).
+    Prefers the band the E6 score stage already computed (``candidate.band``). When
+    absent (a non-pipeline caller that set only ``confidence``), derive it from the
+    confidence against the default thresholds so the documented §6.3 banding still
+    applies. A ``None`` confidence with no band is treated as ``normal`` — a missing
+    score does not by itself hold a signal for review; the separate
+    entity-resolution trigger (doc 19 §4.3) still forces review in the caller.
     """
-    if candidate.entity_id is None:
-        return True
-    return candidate.confidence is not None and candidate.confidence < REVIEW_CONFIDENCE_FLOOR
+    if candidate.band is not None:
+        return candidate.band
+    if candidate.confidence is None:
+        return ConfidenceBand.NORMAL
+    return DEFAULT_CONFIG.thresholds.band_for(candidate.confidence)
 
 
 def _ordered_unique(ids: list[uuid.UUID]) -> list[uuid.UUID]:
@@ -334,11 +356,17 @@ async def list_signals(
 
 
 __all__ = [
+    "DEFAULT_CONFIG",
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
     "PAYLOAD_BY_TYPE",
+    "BandThresholds",
     "CandidateInput",
+    "ConfidenceBand",
+    "ConfidenceConfig",
+    "ConfidenceWeights",
     "EmbeddingDimMismatchError",
+    "ScoreResult",
     "SignalPage",
     "SignalPayload",
     "SignalRead",
@@ -346,6 +374,7 @@ __all__ = [
     "SignalValidationError",
     "backfill_embeddings",
     "build_embedding_text",
+    "config_from_recipe",
     "decode_cursor",
     "embed_signals",
     "embedding_text_for_signal",
@@ -354,5 +383,6 @@ __all__ = [
     "list_signals",
     "parse_signal_payload",
     "promote_candidate_to_signal",
+    "score_candidate_confidence",
     "store_signal",
 ]

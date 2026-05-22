@@ -114,6 +114,7 @@ async def _process_document_async(
 
     async with SessionLocal() as session:
         prefilter = await _resolve_prefilter_for_job(session, raw_document_id)
+        confidence_config = await _resolve_confidence_config_for_job(session, raw_document_id)
         await services.mark_job_running(session, job_id, stage=STAGE_EXTRACT)
         await session.commit()
 
@@ -123,6 +124,7 @@ async def _process_document_async(
             job_id=job_id,
             raw_document_id=raw_document_id,
             prefilter=prefilter,
+            confidence_config=confidence_config,
         )
         await services.mark_job_done(session, job_id, stage=STAGE_STORE, skipped=result.skipped)
         await session.commit()
@@ -171,6 +173,24 @@ async def _resolve_prefilter_for_job(session, raw_document_id: uuid.UUID) -> str
     except Exception:  # any load failure -> safe default
         return services.PREFILTER_CLASSIFIER
     return recipe.prefilter
+
+
+async def _resolve_confidence_config_for_job(session, raw_document_id: uuid.UUID):  # type: ignore[no-untyped-def]
+    """Resolve the recipe's confidence-scoring config for a document (doc 19 §6.3).
+
+    The recipe-configurable thresholds + source-quality tier (E6, doc 19 §6.3): an
+    authoritative source raises the band floors, a noisy aggregator lowers them.
+
+    # TODO E6 (recipe plumbing): the ``Recipe`` schema (recipes module +
+    # packages/recipe-schema) has no typed ``confidence:`` block yet, so there is no
+    # per-recipe override to read — every job uses the documented §6.2/§6.3 default.
+    # This is the seam: once the typed recipe field lands, read it here and pass it to
+    # ``signals.services.config_from_recipe``. Defaults to the documented baseline
+    # whenever the recipe can't be resolved.
+    """
+    from civicsignals_api.modules.signals.services import DEFAULT_CONFIG
+
+    return DEFAULT_CONFIG
 
 
 # Page size for one keyset discovery batch (and one claim+dispatch batch).
