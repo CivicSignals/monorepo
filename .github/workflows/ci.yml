@@ -257,6 +257,9 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "apps/api/uv.lock"
 
+      # Defense-in-depth: validate raw recipe YAML against the canonical
+      # draft-07 schema in packages/recipe-schema (the shared TS/Python source of
+      # truth) before the runner — catches schema drift independently of the API.
       - name: Validate recipes against JSON Schema
         run: |
           set -euo pipefail
@@ -270,7 +273,13 @@ jobs:
             --schemafile packages/recipe-schema/schema/recipe.schema.json \
             "${recipes[@]}"
 
+      - name: Install API deps (recipe runner)
+        working-directory: apps/api
+        run: uv sync --frozen
+
+      # Replay every recipe's golden fixtures through the D1 lifecycle runner and
+      # diff against the committed *.expected.json (doc 18 §3.3). Exit is non-zero
+      # on any extraction divergence (recipe/connector/prompt drift).
       - name: Replay golden fixtures
-        # Pure-stdlib harness; runs on the runner's preinstalled Python 3.
-        # TODO D1/QA-4: wire the recipe runner so this asserts extraction output.
-        run: python3 scripts/replay_fixtures.py recipes
+        working-directory: apps/api
+        run: uv run python -m civicsignals_api.modules.recipes.cli

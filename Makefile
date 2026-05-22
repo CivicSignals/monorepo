@@ -74,4 +74,4 @@ check-recipes: ## Validate recipes against the JSON Schema + replay golden fixtu
 				--schemafile packages/recipe-schema/schema/recipe.schema.json \
 				"$${recipes[@]}"; \
 		fi'
-	python3 scripts/replay_fixtures.py recipes
+	cd apps/api && uv run python -m civicsignals_api.modules.recipes.cli
