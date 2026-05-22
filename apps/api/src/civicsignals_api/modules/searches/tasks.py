@@ -1,18 +1,17 @@
-"""Celery tasks for the searches module (doc 06 §8)."""
+"""Celery tasks for the searches module (doc 06 §8).
+
+The saved-search **digest scheduler** (H3) does not live here. Notifications owns
+delivery and the per-(saved-search, user) digest subscription table, so the beat
+dispatcher + per-subscription delivery are
+``notifications.dispatch_digests`` / ``notifications.send_digest`` (see
+``modules/notifications/tasks.py``). It reads the saved search's stored ``filters``
+back through this module's public ``searches.services`` surface
+(``get_saved_search``) — the sanctioned cross-module seam (doc 06 §3).
+
+This module currently registers no beat tasks of its own; importing
+``celery_app`` keeps it discoverable by ``autodiscover_tasks`` for future work.
+"""
 
 from __future__ import annotations
 
-from civicsignals_api.celery_app import celery_app
-
-
-@celery_app.task(name="searches.dispatch_digests")
-def dispatch_digests() -> None:
-    """Hourly tick: send digests due in the next hour (TODO H3).
-
-    # TODO H3: enumerate saved searches with an attached digest schedule (via
-    #   ``searches.services``), re-run each one's stored ``filters`` against the
-    #   owning workspace's feed (``signals.list_workspace_signals``), and enqueue a
-    #   notification when there are new matches. The H1 saved-search row is the
-    #   anchor this scheduler hangs off — deleting a search must cancel its digest
-    #   (see the ``delete_saved_search`` seam).
-    """
+from civicsignals_api.celery_app import celery_app  # noqa: F401

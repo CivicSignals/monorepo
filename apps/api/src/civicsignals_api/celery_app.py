@@ -71,8 +71,15 @@ celery_app.conf.beat_schedule = {
         "task": "signals.dedupe_recent",
         "schedule": 300.0,
     },
-    "searches.dispatch_digests": {
-        "task": "searches.dispatch_digests",
+    # H3: saved-search digest scheduler. Hourly tick on the singleton scheduler
+    # (leader-locked in the task body); each tick finds digest subscriptions due in
+    # the recipient's local time (daily at send-hour; weekly on a weekday at
+    # send-hour) and enqueues one ``notifications.send_digest`` per due subscription.
+    # The hourly cadence is the *scan*; the per-subscription frequency + local
+    # send-hour govern when a recipient actually receives a digest. Lives in the
+    # notifications module (it owns delivery + the subscription table).
+    "notifications.dispatch_digests": {
+        "task": "notifications.dispatch_digests",
         "schedule": crontab(minute=0),
     },
     "integrations.retry_failed_pushes": {

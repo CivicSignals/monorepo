@@ -21,6 +21,7 @@ import {
   useSavedSearches,
   useUpdateSavedSearch,
 } from "@/hooks/use-searches";
+import { DigestFrequencySelect } from "@/components/searches/digest-frequency-select";
 
 // Saved-search management UI (H1).
 //
@@ -294,6 +295,8 @@ function SavedSearchRow({ search }: { search: SavedSearchOut }) {
         </div>
       </div>
       <div className="flex items-center gap-2">
+        {/* H3: per-saved-search digest schedule (off / daily / weekly). */}
+        <DigestFrequencySelect savedSearchId={search.id} />
         <button
           type="button"
           onClick={() => setEditing(true)}

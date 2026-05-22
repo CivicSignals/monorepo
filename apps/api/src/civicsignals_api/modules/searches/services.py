@@ -241,8 +241,10 @@ async def delete_saved_search(
     Raises :class:`SavedSearchNotFoundError` (cannot see it) or
     :class:`SavedSearchForbiddenError` (visible but not owner).
 
-    # TODO H3: when a digest schedule is attached to a saved search, deletion must
-    #   also cancel/clean up the schedule row so the scheduler stops dispatching.
+    H3: any attached digest subscriptions (``notifications_digest_subscription``)
+    are removed automatically — that table's FK to ``searches_saved_search`` is
+    ``ON DELETE CASCADE``, so deleting the search stops the digest scheduler from
+    dispatching it.
     """
     search = await _get_owned(
         session, workspace_id=workspace_id, user_id=user_id, search_id=search_id
