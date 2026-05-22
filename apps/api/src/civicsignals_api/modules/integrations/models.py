@@ -388,6 +388,53 @@ class PushLog(Base):
     )
 
 
+class PushIdempotency(Base):
+    """Canonical external-id registry for idempotent pushes (K4).
+
+    One row per ``(connection_id, idempotency_key)`` — the stable mapping from
+    a logical push identity to the provider's external id.  This table is
+    **upserted** on each successful push so that:
+
+    - Sequential re-pushes look up the existing ``external_id`` before calling
+      the provider and route through the provider's update path (no duplicate
+      CRM objects).
+    - Concurrent duplicate pushes race on the unique primary key: the winner's
+      INSERT succeeds; the loser's INSERT hits a conflict, raises
+      ``IntegrityError``, and is retried as an UPDATE.
+
+    ``push_log`` remains a pure append-only audit trail (no uniqueness
+    constraint on it) while this table is the single source of truth for
+    which external id belongs to each (connection, idempotency_key) pair.
+    """
+
+    __tablename__ = "integrations_push_idempotency"
+    # No extra indexes needed: (connection_id, idempotency_key) is the PK.
+
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("integrations_connection.id", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(255),
+        primary_key=True,
+        nullable=False,
+    )
+
+    # The provider-side id of the created CRM object.  Presence proves the
+    # push succeeded; the push service passes it back as ``external_id`` on
+    # re-push so the provider routes the call as an update.
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 # ---------------------------------------------------------------------------
 # L3: Outbound webhook subscriber + delivery log
 # ---------------------------------------------------------------------------
