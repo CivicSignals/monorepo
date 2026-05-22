@@ -12,6 +12,7 @@ is TODO B7; see the stub for the seam.
 
 from __future__ import annotations
 
+import secrets
 from typing import Annotated
 
 from fastapi import APIRouter, Header
@@ -58,7 +59,8 @@ def staff_problem(x_staff_token: str | None) -> JSONResponse | None:
             "Forbidden",
             "recipe preview is disabled (set RECIPE_PREVIEW_STAFF_TOKEN to enable)",
         )
-    if x_staff_token != expected:
+    # Constant-time compare to avoid timing side-channels leaking the token length.
+    if not secrets.compare_digest(x_staff_token or "", expected):
         return _problem(403, "Forbidden", "a valid X-Staff-Token header is required")
     return None
 

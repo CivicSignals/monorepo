@@ -70,7 +70,13 @@ class HttpxFetcher:
         return response.status_code, response.text, dict(response.headers)
 
     def robots_txt(self, url: str, *, user_agent: str) -> str | None:
-        """Fetch ``<scheme>://<host>/robots.txt``; ``None`` if absent (4xx)."""
+        """Fetch ``<scheme>://<host>/robots.txt``; ``None`` on any non-2xx/3xx response.
+
+        Both 4xx (not found / forbidden) and 5xx (server error) return ``None``,
+        which the runner treats as permissive (no robots.txt ⇒ allow). This matches
+        the widely-used convention: an unreachable robots.txt should not block
+        crawling, and a 5xx is typically transient rather than a hard disallow.
+        """
         robots_url = urljoin(url, "/robots.txt")
         try:
             response = self._client.get(

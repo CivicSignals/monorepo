@@ -26,10 +26,13 @@ export interface EntityRef {
 /**
  * Mirrors `CanonicalRecord` in `apps/api/.../modules/recipes/schemas.py`.
  *
- * `dead_letters` and `degraded_fields` are present in the API model (added by
- * D11) but the preview endpoint surfaces them only via the top-level `degraded`
- * flag and `FieldPreview.missing_required` — they are included here for type
- * completeness so callers are not surprised by unexpected JSON keys.
+ * `dead_letters` and `degraded_fields` are fully populated by the preview
+ * endpoint (added by D11): `degraded_fields` lists the field names that fell
+ * back to a non-primary selector or LLM rung, and `dead_letters` carries the
+ * per-field structured diagnostic entries for any field nothing could extract.
+ * These are the primary diagnostic signals for recipe authors; they are also
+ * summarised at the response top level via `degraded: boolean` and per field via
+ * `FieldPreview.missing_required`.
  */
 export interface CanonicalRecord {
   record_type: string;

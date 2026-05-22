@@ -146,25 +146,33 @@ async def persist_dead_letters(
 
 
 def _validate_preview_url(url: str) -> None:
-    """Guard against SSRF: only allow http/https, reject loopback/link-local/private IPs.
+    """Guard against SSRF: only allow http/https to globally-routable IP literals.
 
-    Hostname targets (non-IP) are allowed through; network-level egress controls
-    or a dedicated egress proxy are the second line of defense for those. We block
-    obvious numeric IP targets to prevent accidental access to the cloud metadata
-    endpoint (169.254.169.254), loopback (127.x / ::1), RFC-1918, and ULA ranges.
+    Hostname targets (non-IP strings) are allowed through; network-level egress
+    controls or a dedicated egress proxy are the second line of defense for those.
+    For IP literals we require the address to be globally routable — this rejects
+    loopback (127.x / ::1), link-local (169.254.x, fe80::), RFC-1918 / ULA private,
+    unspecified (0.0.0.0 / ::), multicast, and reserved ranges, covering cloud
+    metadata endpoints, internal services, and other SSRF targets.
+
+    Also requires the URL to have a non-empty hostname so malformed URLs such as
+    ``http:///path`` (empty authority) are rejected before reaching the fetcher.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise RecipeError("preview URL must use http or https")
-    host = parsed.hostname or ""
+    host = parsed.hostname  # None for empty authority (e.g. http:///path)
+    if not host:
+        raise RecipeError("preview URL must have a non-empty hostname")
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
-        return  # not an IP literal — hostname, allow through
-    if addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_reserved:
+        return  # not an IP literal — hostname string, allow through
+    if not addr.is_global:
         raise RecipeError(
-            f"preview URL targets a non-routable address ({host!r}); "
-            "internal / loopback / link-local / private addresses are not allowed"
+            f"preview URL targets a non-globally-routable address ({host!r}); "
+            "loopback, link-local, private, unspecified, multicast, and reserved "
+            "addresses are not allowed"
         )
 
 
