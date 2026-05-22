@@ -107,13 +107,21 @@ class WorkspacePage:
     next_cursor: str | None
 
 
-def encode_cursor(workspace_id: uuid.UUID) -> str:
-    """Encode a keyset cursor (the last row's id) as an opaque base64 token."""
-    return base64.urlsafe_b64encode(workspace_id.bytes).decode("ascii")
+def encode_cursor(row_id: uuid.UUID) -> str:
+    """Encode a keyset cursor (the last row's UUID v7 id) as an opaque base64 token.
+
+    Id-agnostic: used for both the workspace list (workspace id) and the member
+    list (membership id) — any keyset paginated on a UUID v7 primary key.
+    """
+    return base64.urlsafe_b64encode(row_id.bytes).decode("ascii")
 
 
 def decode_cursor(cursor: str) -> uuid.UUID:
-    """Decode a cursor token back to the workspace id, or raise ``ValueError``."""
+    """Decode a cursor token back to the row id, or raise ``ValueError``.
+
+    Counterpart to :func:`encode_cursor`; returns the opaque token's UUID v7 id
+    regardless of which table it paginates.
+    """
     try:
         return uuid.UUID(bytes=base64.urlsafe_b64decode(cursor.encode("ascii")))
     except (binascii.Error, ValueError) as exc:  # malformed token
@@ -298,3 +306,82 @@ async def set_last_active_workspace(
     user.last_active_workspace_id = workspace_id
     await session.flush()
     return user
+
+
+# --- Membership management (B7 RBAC; B6 invitations build on this) ----------
+# Adding members and changing roles are *admin*-gated actions (doc 06 §6); the
+# routes enforce that via ``require_role`` and these services do the writes. B6
+# (invitations) reuses ``add_member`` to materialize an accepted invite.
+
+
+async def add_member(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    role: MembershipRole = MembershipRole.MEMBER,
+    invited_by: uuid.UUID | None = None,
+) -> Membership:
+    """Add ``user_id`` to ``workspace_id`` with ``role`` (default ``member``).
+
+    ``joined_at`` is stamped now (direct add); B6 sets ``invited_at`` separately
+    on the invite path. Uniqueness on ``(workspace_id, user_id)`` is enforced by a
+    DB constraint, so a duplicate surfaces as an ``IntegrityError`` for the route
+    to map to ``409``. The caller commits.
+    """
+    membership = Membership(
+        workspace_id=workspace_id,
+        user_id=user_id,
+        role=role,
+        invited_by=invited_by,
+        joined_at=datetime.now(UTC),
+    )
+    session.add(membership)
+    await session.flush()
+    return membership
+
+
+async def set_member_role(
+    session: AsyncSession, *, membership: Membership, role: MembershipRole
+) -> Membership:
+    """Update an existing membership's ``role`` (an admin action). The caller commits."""
+    membership.role = role
+    await session.flush()
+    return membership
+
+
+@dataclass(slots=True)
+class MembershipPage:
+    """A page of memberships plus the cursor for the next page (``None`` = last)."""
+
+    items: list[Membership]
+    next_cursor: str | None
+
+
+async def list_members(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    *,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> MembershipPage:
+    """Cursor-paginated list of memberships in ``workspace_id`` (keyset on id).
+
+    Ordered by the time-ordered UUID v7 id so the cursor gives a stable total
+    order (doc 06 §5). Fetches ``limit + 1`` rows to decide ``has_more``.
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    stmt = (
+        select(Membership)
+        .join(Workspace, Workspace.id == Membership.workspace_id)
+        .where(Membership.workspace_id == workspace_id, Workspace.deleted_at.is_(None))
+    )
+    if cursor is not None:
+        stmt = stmt.where(Membership.id > decode_cursor(cursor))
+    stmt = stmt.order_by(Membership.id).limit(limit + 1)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = encode_cursor(items[-1].id) if has_more and items else None
+    return MembershipPage(items=items, next_cursor=next_cursor)

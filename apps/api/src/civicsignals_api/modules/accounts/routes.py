@@ -27,12 +27,23 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
-from civicsignals_api.modules.auth.dependencies import CurrentUser
+from civicsignals_api.modules.auth.dependencies import (
+    CurrentUser,
+    RequireAdmin,
+    WorkspaceContext,
+)
 from civicsignals_api.problems import ProblemException
 
 from . import services
 from .models import MembershipRole, Workspace
-from .schemas import WorkspaceCreate, WorkspaceOut, WorkspacePage
+from .schemas import (
+    MemberOut,
+    MemberPage,
+    MemberRoleUpdate,
+    WorkspaceCreate,
+    WorkspaceOut,
+    WorkspacePage,
+)
 
 # Module namespace (account-level endpoints attach here in later epics).
 router = APIRouter()
@@ -191,6 +202,98 @@ async def switch_workspace(
     workspace = await services.get_workspace(session, workspace_id)
     assert workspace is not None  # membership guarantees a live workspace
     return _workspace_out(workspace, membership.role)
+
+
+# --- Member management (B7 RBAC) -------------------------------------------
+# These endpoints are workspace-scoped via the path (``/workspaces/{id}/members``,
+# doc 08 §2) AND admin-gated. They use ``RequireAdmin`` to resolve the active
+# workspace (header/last-active) and assert the caller is an admin there, then
+# require the path ``workspace_id`` to match — so the active-workspace context and
+# the addressed workspace can't diverge. This is the canonical admin-gated CRUD
+# pattern other modules (B8 tokens, K1 integrations) copy.
+
+
+def _require_active_workspace_matches_path(ctx: WorkspaceContext, workspace_id: uuid.UUID) -> None:
+    """403 if the path workspace differs from the RBAC-resolved active workspace.
+
+    The role floor is already enforced by ``RequireAdmin`` against the active
+    workspace; this guards against addressing a *different* workspace via the path
+    than the one the role was checked in.
+    """
+    if ctx.workspace_id != workspace_id:
+        raise ProblemException(
+            status=status.HTTP_403_FORBIDDEN,
+            code="forbidden",
+            title="Workspace mismatch",
+            detail="The path workspace does not match the active (X-Workspace-Id) workspace.",
+        )
+
+
+@workspaces_router.get(
+    "/{workspace_id}/members",
+    response_model=MemberPage,
+    summary="List workspace members (admin only)",
+)
+async def list_members(
+    workspace_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = services.DEFAULT_LIMIT,
+) -> MemberPage:
+    """List the members of a workspace. Requires the ``admin`` role (doc 06 §6)."""
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    try:
+        page = await services.list_members(session, workspace_id, cursor=cursor, limit=limit)
+    except ValueError as exc:
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="bad_request",
+            title="Invalid cursor",
+            detail="The supplied cursor is malformed.",
+        ) from exc
+    return MemberPage(
+        items=[MemberOut.model_validate(m) for m in page.items],
+        next_cursor=page.next_cursor,
+    )
+
+
+@workspaces_router.patch(
+    "/{workspace_id}/members/{user_id}",
+    response_model=MemberOut,
+    summary="Change a member's role (admin only)",
+)
+async def update_member_role(
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    body: MemberRoleUpdate,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> MemberOut:
+    """Set a member's role to admin/member/viewer. Requires the ``admin`` role.
+
+    The workspace ``owner``'s role cannot be changed here (ownership is a single
+    seat); attempting it returns ``403``. A non-member target is ``404``.
+    """
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    target = await services.get_membership(session, workspace_id=workspace_id, user_id=user_id)
+    if target is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Member not found",
+            detail="No such member in this workspace.",
+        )
+    if target.role is MembershipRole.OWNER:
+        raise ProblemException(
+            status=status.HTTP_403_FORBIDDEN,
+            code="forbidden",
+            title="Cannot change owner role",
+            detail="The workspace owner's role cannot be changed.",
+        )
+    await services.set_member_role(session, membership=target, role=body.role)
+    await session.commit()
+    return MemberOut.model_validate(target)
 
 
 router.include_router(accounts_router)
