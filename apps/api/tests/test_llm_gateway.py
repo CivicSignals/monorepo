@@ -1,4 +1,4 @@
-"""Tests for the LLM gateway (TODO E2).
+"""Tests for the LLM gateway (E2).
 
 Cover task routing, token accounting accumulation, retry/backoff behaviour, and
 the lazy-import guard — all without network or API keys via the FakeBackend.
@@ -184,9 +184,16 @@ def test_estimate_cost_haiku_cheaper_than_sonnet() -> None:
     assert 0 < haiku < sonnet
 
 
-def test_estimate_cost_local_models_free() -> None:
+def test_estimate_cost_ollama_models_free() -> None:
+    # Only the OllamaBackend's "ollama/<name>" tags (and bare "ollama") are free.
     assert estimate_cost_usd("ollama/llama3", 1000, 1000) == 0.0
-    assert estimate_cost_usd("qwen/qwen2", 1000, 1000) == 0.0
+    assert estimate_cost_usd("ollama", 1000, 1000) == 0.0
+
+
+def test_estimate_cost_unknown_hosted_model_not_free() -> None:
+    # A slash in the id is NOT a free signal; unknown hosted models are charged
+    # at the conservative default rate so accounting isn't silently bypassed.
+    assert estimate_cost_usd("vendor/some-model", 1000, 1000) > 0.0
 
 
 def test_in_memory_accountant_returns_independent_copy() -> None:
@@ -360,6 +367,46 @@ async def test_ollama_does_not_close_injected_client() -> None:
     await backend.aclose()  # no-op for injected clients
     assert not injected.is_closed
     await injected.aclose()
+
+
+async def test_ollama_wraps_non_json_body_as_transient() -> None:
+    # A misbehaving server returning a non-JSON body must surface as a gateway
+    # error, never a raw JSONDecodeError.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not json")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = OllamaBackend(base_url="http://localhost:11434", client=client)
+    with pytest.raises(TransientLLMError):
+        await backend.complete(prompt="p", model="llama3", max_tokens=10)
+    await client.aclose()
+
+
+async def test_ollama_parses_valid_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"response": "hi", "prompt_eval_count": 5, "eval_count": 2},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = OllamaBackend(base_url="http://localhost:11434", client=client)
+    result = await backend.complete(prompt="p", model="llama3", max_tokens=10)
+    assert result.text == "hi"
+    assert result.model == "ollama/llama3"
+    assert (result.input_tokens, result.output_tokens) == (5, 2)
+    await client.aclose()
+
+
+async def test_ollama_4xx_is_permanent() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="model not found")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    backend = OllamaBackend(base_url="http://localhost:11434", client=client)
+    with pytest.raises(PermanentLLMError):
+        await backend.complete(prompt="p", model="missing", max_tokens=10)
+    await client.aclose()
 
 
 async def test_gateway_aclose_closes_backends() -> None:

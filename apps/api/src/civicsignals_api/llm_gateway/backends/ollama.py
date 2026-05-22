@@ -78,12 +78,21 @@ class OllamaBackend:
             # TransportError covers timeouts, connection, and protocol errors.
             raise TransientLLMError(f"ollama transport error: {exc}") from exc
 
-        data = response.json()
+        # A misbehaving server may return non-JSON or a wrong shape; wrap that as
+        # transient so the raw ValueError/TypeError never crosses the boundary.
+        try:
+            data = response.json()
+            text = str(data.get("response", ""))
+            input_tokens = int(data.get("prompt_eval_count", 0) or 0)
+            output_tokens = int(data.get("eval_count", 0) or 0)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise TransientLLMError(f"ollama returned an unexpected body: {exc}") from exc
+
         # Ollama prefixes model ids with "ollama/" in accounting so cost is $0.
         return LLMResult(
-            text=data.get("response", ""),
+            text=text,
             model=f"ollama/{model}" if not model.startswith("ollama") else model,
             provider=self.provider,
-            input_tokens=int(data.get("prompt_eval_count", 0)),
-            output_tokens=int(data.get("eval_count", 0)),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )

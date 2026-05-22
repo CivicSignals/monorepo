@@ -95,8 +95,8 @@ namespace_packages = true
 
 [[tool.mypy.overrides]]
 # anthropic + openai live in the `extraction` optional extra and are imported
-# lazily by the LLM gateway backends (TODO E2), so the core api type-checks
-# without them installed. spacy is in the same extra.
+# lazily by the LLM gateway backends (E2), so the core api type-checks without
+# them installed. spacy is in the same extra.
 module = [
     "pgvector.*",
     "feedparser.*",

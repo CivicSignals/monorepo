@@ -6,8 +6,8 @@ per-workspace daily token budgets described in doc 18 §6.6 within a single
 worker process and to surface "LLM token consumption by task and workspace"
 metrics (doc 06 §9).
 
-TODO N3 / TODO E2: persistent, cross-process accounting (usage metering) will
-attach behind this same :class:`TokenAccountant` protocol — swap the in-memory
+TODO N3: persistent, cross-process accounting (usage metering) will attach
+behind this same :class:`TokenAccountant` protocol — swap the in-memory
 implementation for one backed by Postgres/Redis without touching the gateway.
 """
 
@@ -36,10 +36,12 @@ _DEFAULT_PRICING = (0.003, 0.015)  # Sonnet-class; conservative for unknowns.
 def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     """Estimate the USD cost of a call from token counts.
 
-    Local/Ollama models price at zero. Unknown hosted models fall back to a
-    conservative Sonnet-class rate so budget alerts err on the safe side.
+    Local Ollama models (the OllamaBackend tags them ``ollama/<name>``) price at
+    zero. Everything else is a hosted provider: known models use their published
+    rate, unknown ones fall back to a conservative Sonnet-class rate so budget
+    alerts err on the safe side (we never silently treat a hosted model as free).
     """
-    if model.startswith("ollama") or "/" in model:
+    if model.startswith("ollama/") or model == "ollama":
         return 0.0
     input_rate, output_rate = _DEFAULT_PRICING
     for prefix, rates in _PRICING_PER_1K.items():
