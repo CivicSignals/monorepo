@@ -12,8 +12,9 @@ import { useDigest, useSetDigest } from "@/hooks/use-digests";
 // at the user's local send-hour without a separate tz picker. Changing the value
 // PUTs the new schedule through TanStack Query.
 //
-// TODO H5: a fuller preferences surface (send-hour, weekday, explicit timezone,
-//   one-click unsubscribe) replaces this minimal selector.
+// H5 adds the consolidated /settings/notifications preferences surface (list all
+// subscriptions, change/unsubscribe per row) plus a one-click email unsubscribe;
+// this minimal inline selector remains the in-context per-row control.
 
 const FREQUENCIES: { value: DigestFrequency; label: string }[] = [
   { value: "off", label: "Off" },

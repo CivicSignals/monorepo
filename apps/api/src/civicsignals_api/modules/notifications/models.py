@@ -45,9 +45,10 @@ class DigestSubscription(Base):
     dispatch sweep only enqueues a subscription whose current local period differs
     from ``last_sent_period``, so a double-fired hourly beat never double-sends.
 
-    # TODO H5: an unsubscribe / preferences surface flips ``frequency`` to ``off``
-    #   (and a one-click unsubscribe token lands here) rather than deleting the row,
-    #   so the recipient's last choice is remembered.
+    # H5: the unsubscribe / preferences surface flips ``frequency`` to ``off``
+    # (the one-click unsubscribe is a stateless HMAC token over this row's id;
+    # see ``unsubscribe.py``) rather than deleting the row, so the recipient's
+    # last choice is remembered.
     """
 
     __tablename__ = "notifications_digest_subscription"

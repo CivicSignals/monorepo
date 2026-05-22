@@ -42,6 +42,7 @@ from civicsignals_api.db import SessionLocal
 from civicsignals_api.modules.ingestion.locks import RedisLock, get_redis_client
 
 from . import services, templates
+from .unsubscribe import make_unsubscribe_token
 
 logger = structlog.get_logger(__name__)
 
@@ -131,11 +132,19 @@ async def _send_digest_async(
         )
         return False
 
+    # H5: mint a signed one-click unsubscribe token bound to *this* subscription and
+    # thread both the human confirm link (footer + List-Unsubscribe) and the API
+    # one-click POST URL (List-Unsubscribe-Post, RFC 8058) into the rendered email.
     settings = get_settings()
+    token = make_unsubscribe_token(subscription_id, settings=settings)
     message = templates.render_digest_email(
         payload,
         web_base_url=settings.web_base_url,
         to=str(recipient_email),
+        unsubscribe_url=templates.unsubscribe_landing_url(settings.web_base_url, token),
+        unsubscribe_post_url=templates.unsubscribe_post_url(
+            settings.api_base_url, settings.api_v1_prefix, token
+        ),
     )
     services.send_email(message, sender=sender)
 

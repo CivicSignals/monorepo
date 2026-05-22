@@ -24,9 +24,14 @@ Design notes
   matches this period" note rather than skipping: a predictable cadence is the
   point of a digest, and silence is indistinguishable from a broken pipeline. The
   caller (``send_digest``) therefore always sends.
-* **Unsubscribe footer (H5 seam).** A placeholder "Manage your digest preferences"
-  footer link points at the web preferences page; H5 will swap it for a functional
-  one-click unsubscribe token. Kept here so the layout already accounts for it.
+* **Unsubscribe (H5).** Every digest carries a signed one-click unsubscribe token
+  (:mod:`notifications.unsubscribe`). The footer shows two links: a one-click
+  *Unsubscribe* (the web confirm landing, ``unsubscribe_url``) and *Manage your
+  digest preferences* (the authed ``/settings/notifications`` page). The same token
+  also drives the RFC 8058 ``List-Unsubscribe`` / ``List-Unsubscribe-Post`` headers
+  so a mail client renders a native unsubscribe button (``unsubscribe_post_url``,
+  a POST endpoint on the API). The renderer is still pure — the caller
+  (``send_digest``) mints the token and passes the URLs in.
 """
 
 from __future__ import annotations
@@ -79,8 +84,29 @@ def _search_url(web_base_url: str, saved_search_id: str | None) -> str:
 
 
 def _preferences_url(web_base_url: str) -> str:
-    """Placeholder digest-preferences link (H5 will make this a real unsubscribe)."""
+    """Authed digest-preferences page link (the H4 footer target; H5 prefs UI)."""
     return f"{web_base_url.rstrip('/')}/settings/notifications"
+
+
+def unsubscribe_landing_url(web_base_url: str, token: str) -> str:
+    """The web one-click unsubscribe confirm page link (footer + List-Unsubscribe).
+
+    Points at the web app's ``/settings/notifications/unsubscribe`` page, which
+    shows a confirmation and POSTs the token to the API (so a link prefetch / scan
+    cannot silently unsubscribe — the destructive action is a deliberate POST).
+    """
+    return f"{web_base_url.rstrip('/')}/settings/notifications/unsubscribe?token={quote(token, safe='')}"
+
+
+def unsubscribe_post_url(api_base_url: str, api_v1_prefix: str, token: str) -> str:
+    """The API one-click unsubscribe POST endpoint (RFC 8058 List-Unsubscribe-Post).
+
+    Mail clients POST here directly with no session; the endpoint flips the
+    subscription identified by the signed token to ``off``.
+    """
+    base = api_base_url.rstrip("/")
+    prefix = api_v1_prefix.rstrip("/")
+    return f"{base}{prefix}/notifications/digests/unsubscribe?token={quote(token, safe='')}"
 
 
 def _format_date(value: Any) -> str | None:
@@ -100,7 +126,12 @@ def _digest_subject(saved_search_name: str | None, count: int) -> str:
     return f"{_BRAND_NAME}: {count} new signal{plural} for '{name}'"
 
 
-def render_digest_text(payload: dict[str, Any], *, web_base_url: str) -> str:
+def render_digest_text(
+    payload: dict[str, Any],
+    *,
+    web_base_url: str,
+    unsubscribe_url: str | None = None,
+) -> str:
     """Plaintext fallback body for a digest (deep links inline)."""
     name = payload.get("saved_search_name") or "your saved search"
     signals: list[dict[str, Any]] = list(payload.get("signals") or [])
@@ -141,8 +172,10 @@ def render_digest_text(payload: dict[str, Any], *, web_base_url: str) -> str:
         "",
         "--",
         f"You're receiving this because you subscribed to digests for '{name}'.",
-        f"Manage your digest preferences: {_preferences_url(web_base_url)}",
     ]
+    if unsubscribe_url:
+        lines.append(f"Unsubscribe from this digest: {unsubscribe_url}")
+    lines.append(f"Manage your digest preferences: {_preferences_url(web_base_url)}")
     return "\n".join(lines)
 
 
@@ -176,12 +209,18 @@ def _render_signal_row(sig: dict[str, Any], *, web_base_url: str) -> str:
     )
 
 
-def render_digest_html(payload: dict[str, Any], *, web_base_url: str) -> str:
+def render_digest_html(
+    payload: dict[str, Any],
+    *,
+    web_base_url: str,
+    unsubscribe_url: str | None = None,
+) -> str:
     """Branded, mobile-friendly HTML body for a digest (inline CSS, table layout)."""
     name = html.escape(str(payload.get("saved_search_name") or "your saved search"))
     signals: list[dict[str, Any]] = list(payload.get("signals") or [])
     search_url = html.escape(_search_url(web_base_url, payload.get("saved_search_id")), quote=True)
     prefs_url = html.escape(_preferences_url(web_base_url), quote=True)
+    unsub_url = html.escape(unsubscribe_url, quote=True) if unsubscribe_url else None
 
     if signals:
         plural = "s" if len(signals) != 1 else ""
@@ -225,12 +264,18 @@ def render_digest_html(payload: dict[str, Any], *, web_base_url: str) -> str:
         "</td></tr>"
         # Body
         f'<tr><td style="padding:24px;">{body}</td></tr>'
-        # Footer / unsubscribe (H5 seam)
+        # Footer / unsubscribe (H5)
         f'<tr><td style="padding:18px 24px;border-top:1px solid {_BORDER_COLOR};'
         f'color:{_MUTED_COLOR};font-size:12px;line-height:1.5;">'
         f"You're receiving this because you subscribed to digests for "
         f"<strong>{name}</strong>.<br>"
-        f'<a href="{prefs_url}" style="color:{_MUTED_COLOR};text-decoration:underline;">'
+        + (
+            f'<a href="{unsub_url}" style="color:{_MUTED_COLOR};text-decoration:underline;">'
+            "Unsubscribe</a> &middot; "
+            if unsub_url
+            else ""
+        )
+        + f'<a href="{prefs_url}" style="color:{_MUTED_COLOR};text-decoration:underline;">'
         "Manage your digest preferences</a>"
         "</td></tr>"
         "</table></td></tr></table></body></html>"
@@ -242,20 +287,46 @@ def render_digest_email(
     *,
     web_base_url: str,
     to: str,
+    unsubscribe_url: str | None = None,
+    unsubscribe_post_url: str | None = None,
 ) -> OutboundEmail:
-    """Render a digest payload into a ready-to-send :class:`OutboundEmail` (H4).
+    """Render a digest payload into a ready-to-send :class:`OutboundEmail` (H4/H5).
 
     Pure: takes the ``build_digest_payload`` dict + the recipient address + the web
     base URL, returns subject/text/html. Always returns a sendable email (the empty
     case is a "no new signals" note, not a skip — see module docstring).
+
+    H5: when ``unsubscribe_url`` is given it is rendered in the footer; when
+    ``unsubscribe_post_url`` is given the email also gets the RFC 8058
+    ``List-Unsubscribe`` + ``List-Unsubscribe-Post`` headers so mail clients show a
+    native one-click unsubscribe button. The ``List-Unsubscribe`` value lists the
+    one-click POST URL (and the human ``unsubscribe_url`` as a mailto-less https
+    fallback) per RFC 2369 angle-bracket syntax.
     """
     # Local import keeps this rendering module free of any service/DB import cycle.
     from .services import OutboundEmail
 
     signals = list(payload.get("signals") or [])
+
+    headers: dict[str, str] = {}
+    if unsubscribe_post_url:
+        # RFC 8058 one-click: List-Unsubscribe lists the POST URL; the human-facing
+        # confirm URL (if any) is included as an additional <https://…> entry so a
+        # client that does not support one-click still has a link to open.
+        targets = [f"<{unsubscribe_post_url}>"]
+        if unsubscribe_url:
+            targets.append(f"<{unsubscribe_url}>")
+        headers["List-Unsubscribe"] = ", ".join(targets)
+        headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+
     return OutboundEmail(
         to=to,
         subject=_digest_subject(payload.get("saved_search_name"), len(signals)),
-        text_body=render_digest_text(payload, web_base_url=web_base_url),
-        html_body=render_digest_html(payload, web_base_url=web_base_url),
+        text_body=render_digest_text(
+            payload, web_base_url=web_base_url, unsubscribe_url=unsubscribe_url
+        ),
+        html_body=render_digest_html(
+            payload, web_base_url=web_base_url, unsubscribe_url=unsubscribe_url
+        ),
+        headers=headers,
     )

@@ -65,9 +65,36 @@ class DigestSubscriptionOut(BaseModel):
     updated_at: datetime
 
 
+class DigestSubscriptionListItem(DigestSubscriptionOut):
+    """One row of the per-user preferences list (H5): a subscription + search name."""
+
+    saved_search_name: str
+
+
+class DigestSubscriptionList(BaseModel):
+    """The caller's digest subscriptions in the active workspace (H5 prefs list)."""
+
+    items: list[DigestSubscriptionListItem]
+
+
+class UnsubscribeResult(BaseModel):
+    """Outcome of a one-click unsubscribe (H5).
+
+    ``unsubscribed`` is always ``True`` on a 200 (the action is idempotent). The
+    optional ``saved_search_name`` lets the confirm page tell the recipient which
+    digest they just turned off.
+    """
+
+    unsubscribed: bool = True
+    saved_search_name: str | None = None
+
+
 __all__ = [
     "DigestFrequency",
+    "DigestSubscriptionList",
+    "DigestSubscriptionListItem",
     "DigestSubscriptionOut",
     "DigestSubscriptionUpsert",
+    "UnsubscribeResult",
     "resolve_tz",
 ]

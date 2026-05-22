@@ -143,3 +143,50 @@ def test_signal_type_label_humanizes_initialisms() -> None:
     assert templates.signal_type_label("rfi_rfq") == "RFI RFQ"
     assert templates.signal_type_label("contract_awarded") == "Contract Awarded"
     assert templates.signal_type_label(None) == "Signal"
+
+
+# --- H5: one-click unsubscribe link + List-Unsubscribe headers --------------- #
+
+_UNSUB_LANDING = "http://localhost:3000/settings/notifications/unsubscribe?token=tok123"
+_UNSUB_POST = "http://localhost:8000/api/v1/notifications/digests/unsubscribe?token=tok123"
+
+
+def test_unsubscribe_link_rendered_in_footer_when_provided() -> None:
+    msg = templates.render_digest_email(
+        _payload(),
+        web_base_url=_WEB,
+        to="buyer@example.com",
+        unsubscribe_url=_UNSUB_LANDING,
+        unsubscribe_post_url=_UNSUB_POST,
+    )
+    assert msg.html_body is not None
+    # The token landing link appears in both bodies, alongside the prefs link.
+    assert _UNSUB_LANDING in msg.html_body
+    assert _UNSUB_LANDING in msg.text_body
+    assert "Unsubscribe" in msg.html_body
+    # The authed prefs link is still present.
+    assert "http://localhost:3000/settings/notifications" in msg.html_body
+
+
+def test_list_unsubscribe_headers_present_rfc8058() -> None:
+    msg = templates.render_digest_email(
+        _payload(),
+        web_base_url=_WEB,
+        to="buyer@example.com",
+        unsubscribe_url=_UNSUB_LANDING,
+        unsubscribe_post_url=_UNSUB_POST,
+    )
+    # RFC 8058 one-click headers.
+    assert "List-Unsubscribe" in msg.headers
+    assert msg.headers["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
+    list_unsub = msg.headers["List-Unsubscribe"]
+    # The POST URL is the one-click target; angle-bracket wrapped (RFC 2369).
+    assert f"<{_UNSUB_POST}>" in list_unsub
+    assert f"<{_UNSUB_LANDING}>" in list_unsub
+
+
+def test_no_list_unsubscribe_headers_without_token() -> None:
+    """The H4 (no-token) render path emits no unsubscribe headers."""
+    msg = templates.render_digest_email(_payload(), web_base_url=_WEB, to="buyer@example.com")
+    assert "List-Unsubscribe" not in msg.headers
+    assert "List-Unsubscribe-Post" not in msg.headers

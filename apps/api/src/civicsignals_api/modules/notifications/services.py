@@ -35,12 +35,18 @@ logger = structlog.get_logger(__name__)
 
 @dataclass(frozen=True)
 class OutboundEmail:
-    """A rendered transactional email ready to send."""
+    """A rendered transactional email ready to send.
+
+    ``headers`` carries extra RFC 5322 headers (H5 uses it for ``List-Unsubscribe``
+    / ``List-Unsubscribe-Post`` so mail clients show a native one-click unsubscribe
+    button — RFC 8058). Empty by default; the SMTP transport sets each entry.
+    """
 
     to: str
     subject: str
     text_body: str
     html_body: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class EmailSender(Protocol):
@@ -68,6 +74,10 @@ class SMTPEmailSender:
         msg["From"] = self._from_addr
         msg["To"] = message.to
         msg["Subject"] = message.subject
+        # Extra headers (H5: List-Unsubscribe / List-Unsubscribe-Post) before the
+        # body so the mail client sees them at the top of the message.
+        for name, value in message.headers.items():
+            msg[name] = value
         msg.set_content(message.text_body)
         if message.html_body is not None:
             msg.add_alternative(message.html_body, subtype="html")
@@ -270,6 +280,93 @@ async def mark_sent(
     )
     result = cast(CursorResult[Any], await session.execute(stmt))
     return result.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# H5: unsubscribe + per-user preferences                                       #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class UserSubscription:
+    """A digest subscription joined with its saved-search name (prefs list, H5)."""
+
+    subscription: DigestSubscription
+    saved_search_name: str
+
+
+async def list_user_subscriptions(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> list[UserSubscription]:
+    """The caller's digest subscriptions in one workspace, with search names (H5).
+
+    Powers the consolidated ``/settings/notifications`` preferences page: one row
+    per saved search the caller has a subscription for (any frequency, including
+    ``off`` so a previously-disabled digest can be re-enabled). Joined to
+    ``searches_saved_search`` for the display name; workspace-scoped so a member
+    only ever sees their own subscriptions in the active workspace.
+    """
+    from civicsignals_api.modules.searches.models import SavedSearch
+
+    stmt = (
+        select(DigestSubscription, SavedSearch.name)
+        .join(SavedSearch, SavedSearch.id == DigestSubscription.saved_search_id)
+        .where(
+            DigestSubscription.user_id == user_id,
+            DigestSubscription.workspace_id == workspace_id,
+        )
+        .order_by(SavedSearch.name)
+    )
+    rows = await session.execute(stmt)
+    return [UserSubscription(subscription=sub, saved_search_name=name) for sub, name in rows.all()]
+
+
+@dataclass(frozen=True)
+class UnsubscribeOutcome:
+    """Result of a token-driven unsubscribe (H5): whether a row matched + its name."""
+
+    unsubscribed: bool
+    saved_search_name: str | None
+
+
+async def unsubscribe_by_id(
+    session: AsyncSession,
+    *,
+    subscription_id: uuid.UUID,
+) -> UnsubscribeOutcome:
+    """Flip one subscription's frequency to ``off`` (the one-click unsubscribe, H5).
+
+    Idempotent: setting an already-``off`` subscription to ``off`` is a no-op that
+    still reports ``unsubscribed=True`` (the recipient's intent is satisfied either
+    way). Keeps the row so re-subscribing later remembers nothing was deleted.
+    Reports ``unsubscribed=False`` only when no such subscription exists. Also
+    returns the saved-search name (best effort) so the confirm page can name the
+    digest. The caller commits.
+
+    Unlike the B3 reset, the unsubscribe *token* is stateless (no DB consume step):
+    the action is idempotent, so there is nothing to mark used.
+    """
+    from civicsignals_api.modules.searches.models import SavedSearch
+
+    sub = await session.get(DigestSubscription, subscription_id)
+    if sub is None:
+        return UnsubscribeOutcome(unsubscribed=False, saved_search_name=None)
+
+    name = await session.scalar(
+        select(SavedSearch.name).where(SavedSearch.id == sub.saved_search_id)
+    )
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            update(DigestSubscription)
+            .where(DigestSubscription.id == subscription_id)
+            .values(frequency=DigestFrequency.OFF.value)
+        ),
+    )
+    return UnsubscribeOutcome(unsubscribed=result.rowcount > 0, saved_search_name=name)
 
 
 async def build_digest_payload(

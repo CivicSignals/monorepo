@@ -39,6 +39,18 @@ export interface DigestSubscriptionUpsert {
   timezone?: string;
 }
 
+// Mirrors notifications.schemas.DigestSubscriptionListItem (H5): a subscription
+// plus the saved-search display name, for the consolidated preferences page.
+export interface DigestSubscriptionListItem extends DigestSubscription {
+  saved_search_name: string;
+}
+
+// Mirrors notifications.schemas.UnsubscribeResult (H5).
+export interface UnsubscribeResult {
+  unsubscribed: boolean;
+  saved_search_name: string | null;
+}
+
 async function request<T>(
   path: string,
   init: RequestInit & { token?: string; workspaceId?: string } = {},
@@ -101,5 +113,33 @@ export function setDigest(
       token,
       workspaceId,
     },
+  );
+}
+
+/**
+ * The current user's digest subscriptions in the active workspace (H5) — one row
+ * per saved search they've configured a digest for, with the search name and
+ * current frequency. Powers the consolidated /settings/notifications page.
+ */
+export async function listUserDigests(
+  token: string,
+  workspaceId: string,
+): Promise<DigestSubscriptionListItem[]> {
+  const res = await request<{ items: DigestSubscriptionListItem[] }>(
+    "/notifications/digests",
+    { token, workspaceId },
+  );
+  return res.items;
+}
+
+/**
+ * One-click unsubscribe via the signed token from a digest email (H5). Public —
+ * no auth/workspace header (the token is the authorization). Uses POST so a link
+ * prefetch/scanner cannot silently unsubscribe.
+ */
+export function unsubscribeWithToken(token: string): Promise<UnsubscribeResult> {
+  return request<UnsubscribeResult>(
+    `/notifications/digests/unsubscribe?token=${encodeURIComponent(token)}`,
+    { method: "POST" },
   );
 }

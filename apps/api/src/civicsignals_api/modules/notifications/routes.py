@@ -10,8 +10,14 @@ digest). The digest hangs off a saved search the caller can *see* (own or shared
 the H1 rule); the subscription is always per-recipient, so a member can subscribe
 to a search shared by someone else. A search the caller cannot see is ``404``.
 
-# TODO H5: an unauthenticated one-click unsubscribe endpoint (token-signed) lands
-#   here so a digest email's footer can flip ``frequency`` to ``off`` without login.
+H5 adds the unsubscribe + preferences surface:
+
+  GET  /notifications/digests                    — list the caller's subscriptions (authed)
+  GET  /notifications/digests/unsubscribe?token= — confirm landing (public, no auth)
+  POST /notifications/digests/unsubscribe?token= — one-click unsubscribe (public, RFC 8058)
+
+The unsubscribe endpoints take the signed one-click token minted into each digest
+email; they require no login and flip exactly that one subscription to ``off``.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
@@ -29,7 +35,14 @@ from civicsignals_api.problems import ProblemException
 
 from . import services
 from .digest import DigestFrequency
-from .schemas import DigestSubscriptionOut, DigestSubscriptionUpsert
+from .schemas import (
+    DigestSubscriptionList,
+    DigestSubscriptionListItem,
+    DigestSubscriptionOut,
+    DigestSubscriptionUpsert,
+    UnsubscribeResult,
+)
+from .unsubscribe import InvalidUnsubscribeToken, verify_unsubscribe_token
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -70,6 +83,99 @@ async def _require_visible_search(
     )
     if search is None:
         raise _search_not_found()
+
+
+def _bad_token() -> ProblemException:
+    return ProblemException(
+        status=status.HTTP_400_BAD_REQUEST,
+        code="invalid_token",
+        title="Invalid unsubscribe link",
+        detail="This unsubscribe link is invalid or has expired.",
+    )
+
+
+async def _do_unsubscribe(session: AsyncSession, token: str) -> UnsubscribeResult:
+    """Verify the token and flip the identified subscription to ``off`` (H5).
+
+    Shared by the GET (confirm landing) and POST (one-click) handlers. A bad,
+    tampered, expired, or wrong-scope token is a ``400``; an unknown subscription
+    (CASCADE-deleted) is also a ``400`` so the endpoint never reveals which ids
+    exist. The token alone is the authorization — no login, no workspace header.
+    """
+    try:
+        subscription_id = verify_unsubscribe_token(token)
+    except InvalidUnsubscribeToken as exc:
+        raise _bad_token() from exc
+
+    outcome = await services.unsubscribe_by_id(session, subscription_id=subscription_id)
+    if not outcome.unsubscribed:
+        # Valid signature but no such subscription (e.g. the saved search was
+        # deleted, cascading the subscription away). Treat as a bad link.
+        raise _bad_token()
+    await session.commit()
+    return UnsubscribeResult(unsubscribed=True, saved_search_name=outcome.saved_search_name)
+
+
+@router.get(
+    "/digests",
+    response_model=DigestSubscriptionList,
+    summary="List the caller's digest subscriptions in the active workspace",
+)
+async def list_digests(
+    ctx: RequireMember,
+    session: SessionDep,
+) -> DigestSubscriptionList:
+    """The caller's digest subscriptions (any frequency) in the active workspace (H5).
+
+    Powers the consolidated ``/settings/notifications`` preferences page: one row per
+    saved search the member has a subscription for, with the search name and the
+    current frequency so they can change or unsubscribe per row.
+    """
+    rows = await services.list_user_subscriptions(
+        session, workspace_id=ctx.workspace_id, user_id=ctx.user.id
+    )
+    items = [
+        DigestSubscriptionListItem(
+            **DigestSubscriptionOut.model_validate(row.subscription).model_dump(),
+            saved_search_name=row.saved_search_name,
+        )
+        for row in rows
+    ]
+    return DigestSubscriptionList(items=items)
+
+
+@router.get(
+    "/digests/unsubscribe",
+    response_model=UnsubscribeResult,
+    summary="One-click unsubscribe — confirm landing (public, no auth)",
+)
+async def unsubscribe_landing(
+    session: SessionDep,
+    token: Annotated[str, Query(description="The signed one-click unsubscribe token.")],
+) -> UnsubscribeResult:
+    """Confirm + apply a one-click unsubscribe from a digest-email link (H5).
+
+    Public (no auth): the signed token is the authorization. The web confirm page
+    calls this to action the unsubscribe and show which digest was turned off.
+    """
+    return await _do_unsubscribe(session, token)
+
+
+@router.post(
+    "/digests/unsubscribe",
+    response_model=UnsubscribeResult,
+    summary="One-click unsubscribe — RFC 8058 List-Unsubscribe-Post (public)",
+)
+async def unsubscribe_one_click(
+    session: SessionDep,
+    token: Annotated[str, Query(description="The signed one-click unsubscribe token.")],
+) -> UnsubscribeResult:
+    """RFC 8058 one-click unsubscribe target for the ``List-Unsubscribe`` header (H5).
+
+    Mail clients POST here (``List-Unsubscribe=One-Click``) with no session; the
+    signed token flips exactly that one subscription to ``off``.
+    """
+    return await _do_unsubscribe(session, token)
 
 
 @router.get(

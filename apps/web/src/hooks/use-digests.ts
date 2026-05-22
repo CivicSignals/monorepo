@@ -12,9 +12,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type DigestSubscription,
+  type DigestSubscriptionListItem,
   type DigestSubscriptionUpsert,
+  type UnsubscribeResult,
   getDigest,
+  listUserDigests,
   setDigest,
+  unsubscribeWithToken,
 } from "@/lib/digests-api";
 import { useSessionStore } from "@/store/session";
 import { useUiStore } from "@/store/ui";
@@ -31,7 +35,25 @@ export const digestKeys = {
     [...digestKeys.all, workspaceId ?? "none"] as const,
   detail: (workspaceId: string | null, savedSearchId: string) =>
     [...digestKeys.workspace(workspaceId), savedSearchId] as const,
+  list: (workspaceId: string | null) =>
+    [...digestKeys.workspace(workspaceId), "list"] as const,
 };
+
+/**
+ * The current user's digest subscriptions in the active workspace (H5). Powers the
+ * consolidated /settings/notifications preferences page.
+ */
+export function useUserDigests() {
+  const { token, workspaceId } = useAuth();
+  return useQuery<DigestSubscriptionListItem[]>({
+    queryKey: digestKeys.list(workspaceId),
+    queryFn: () => {
+      if (!token || !workspaceId) return Promise.resolve([]);
+      return listUserDigests(token, workspaceId);
+    },
+    enabled: token !== null && workspaceId !== null,
+  });
+}
 
 /** Read the caller's digest schedule for one saved search (null = none/off). */
 export function useDigest(savedSearchId: string) {
@@ -62,6 +84,21 @@ export function useSetDigest(savedSearchId: string) {
         digestKeys.detail(workspaceId, savedSearchId),
         data,
       );
+      // Keep the consolidated prefs list (H5) in sync after a per-row change.
+      void queryClient.invalidateQueries({
+        queryKey: digestKeys.list(workspaceId),
+      });
     },
+  });
+}
+
+/**
+ * One-click unsubscribe via the signed token from a digest email (H5). No auth /
+ * workspace context — the token is the authorization. The confirm page calls
+ * `mutate(token)` after the recipient confirms.
+ */
+export function useUnsubscribe() {
+  return useMutation<UnsubscribeResult, Error, string>({
+    mutationFn: (token) => unsubscribeWithToken(token),
   });
 }
