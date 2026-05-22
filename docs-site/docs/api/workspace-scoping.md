@@ -57,15 +57,15 @@ X-Workspace-Id: 0190f3c2-7b8d-7c84-9c1a-2f6e8d4b1a01
 
 ```bash
 curl -s https://api.civicsignals.io/api/v1/icp \
-  -H "Authorization: Bearer cs_pat_abc123..." \
-  -H "X-Workspace-Id: 0190f3c2-7b8d-7c84-9c1a-2f6e8d4b1a01"
+  -H "Authorization: Bearer $PAT_TOKEN" \
+  -H "X-Workspace-Id: $WORKSPACE_ID"
 ```
 
 **With a workspace API token (no header needed):**
 
 ```bash
 curl -s https://api.civicsignals.io/api/v1/icp \
-  -H "Authorization: Bearer cs_live_abc123..."
+  -H "Authorization: Bearer $API_TOKEN"
 ```
 
 ---

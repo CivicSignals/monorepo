@@ -117,7 +117,7 @@ Content-Type: application/json
 {
   "id": "...",
   "name": "Salesforce push",
-  "token": "cs_live_abc123...",
+  "token": "cs_live_<redacted>",
   "scopes": ["signals:read", "pipeline:write"],
   "expires_at": "2027-01-01T00:00:00Z",
   "created_at": "2026-05-16T10:00:00Z"
@@ -164,8 +164,8 @@ PATs are attached to your user account and span all your workspace memberships. 
 Use exactly like a workspace API token:
 
 ```bash
-curl -H "Authorization: Bearer cs_pat_abc123..." \
-     -H "X-Workspace-Id: <workspace_id>" \
+curl -H "Authorization: Bearer $PAT_TOKEN" \
+     -H "X-Workspace-Id: $WORKSPACE_ID" \
      https://api.civicsignals.io/api/v1/signals
 ```
 

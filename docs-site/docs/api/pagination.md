@@ -84,7 +84,7 @@ done
 ```python
 from civicsignals import CivicSignals
 
-client = CivicSignals(token="cs_live_...")
+client = CivicSignals(token=os.environ["CIVICSIGNALS_TOKEN"])
 
 # Automatically walks pages
 for signal in client.signals.iter(entity_kind="k12_district", state="WA"):
@@ -98,7 +98,7 @@ for signal in client.signals.iter(entity_kind="k12_district", state="WA"):
 ```typescript
 import { CivicSignals } from "@civicsignals/sdk";
 
-const client = new CivicSignals({ token: "cs_live_..." });
+const client = new CivicSignals({ token: process.env.CIVICSIGNALS_TOKEN! });
 
 // Async iterator — walks pages automatically
 for await (const signal of client.signals.iter({ entity_kind: "k12_district", state: "WA" })) {

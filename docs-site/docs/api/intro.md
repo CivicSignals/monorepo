@@ -60,7 +60,7 @@ For long-lived integrations, generate a workspace API token (go to **Settings â†
 
 ```bash
 curl -s "https://api.civicsignals.io/api/v1/signals?limit=25" \
-  -H "Authorization: Bearer cs_live_abc123..."
+  -H "Authorization: Bearer $API_TOKEN"
 ```
 
 ---
