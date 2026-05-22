@@ -92,6 +92,11 @@ class ParsedDocument(BaseModel):
     ``char_count`` are carried for downstream decisions (e.g. the OCR trigger,
     doc 19 §2.2 — E9). ``degraded`` flags a lossy parse (an unrecognised content
     type fell back to a best-effort decode).
+
+    ``ocr_used`` is set when the OCR fallback ran (E9; doc 19 §2.2) — i.e. pdfplumber
+    returned < 200 chars for a > 5-page PDF and OCR was invoked.
+    ``ocr_truncated`` is set when the PDF exceeded the 100-page cap and only the
+    first-50 + last-25 pages were OCR'd (doc 19 §2.2).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -103,6 +108,9 @@ class ParsedDocument(BaseModel):
     text: str = ""
     char_count: int = 0
     degraded: bool = False
+    # E9 OCR flags (doc 19 §2.2). Both default False for non-PDF / non-OCR paths.
+    ocr_used: bool = False
+    ocr_truncated: bool = False
 
 
 class CandidateRecord(BaseModel):

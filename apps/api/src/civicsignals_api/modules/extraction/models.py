@@ -201,6 +201,17 @@ class ExtractionCandidate(Base):
     # Dedupe-stage output (doc 19 §7.1). TODO E5: real per-type key; passthrough now.
     dedup_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # E9 OCR flags (doc 19 §2.2): set when the OCR fallback ran during parse.
+    # ``ocr_used`` — OCR was invoked (pdfplumber returned < 200 chars for > 5 page PDF).
+    # ``ocr_truncated`` — document exceeded the 100-page cap; only first-50 + last-25
+    # pages were OCR'd (doc 19 §2.2).
+    ocr_used: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    ocr_truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'new'"))
 
     # How the extract stage produced this candidate: ``llm`` (gateway extraction),

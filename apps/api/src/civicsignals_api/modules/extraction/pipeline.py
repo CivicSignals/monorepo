@@ -16,7 +16,10 @@ content-addressable storage (``ingestion.get_raw_document`` + ``storage``), and
 the E8 :class:`RelevanceClassifier`. Several stages are intentional stubs with a
 clear seam:
 
-- **parse**: handles text/html/pdf; ``# TODO E9`` OCR hook for short PDFs.
+- **parse**: handles text/html/pdf; OCR fallback (E9) for short PDFs (doc 19 §2.2).
+  When ``pdfplumber`` yields < 200 chars for a PDF with > 5 pages, the pluggable OCR
+  backend (Tesseract/Textract/Fake, doc 19 §2.2) is invoked. The result carries
+  ``ocr_used`` and (for > 100 page docs) ``ocr_truncated`` flags.
 - **extract**: emits permissive :class:`CandidateRecord` dicts; the **strict typed
   per-signal-type schema + required-field hard gate** (doc 19 §6.1; E4) runs in the
   store stage when a candidate is promoted into a signal.
@@ -62,6 +65,7 @@ from civicsignals_api.modules.signals.services import (
 )
 
 from .models import ExtractionCandidate
+from .ocr import OcrBackend, get_ocr_backend
 from .relevance import RelevanceClassifier
 from .schemas import CandidateRecord, DocumentRef, ParsedDocument, RelevanceVerdict
 
@@ -73,10 +77,11 @@ log = structlog.get_logger(__name__)
 # until then a low-confidence relevant verdict is dropped (conservative on cost).
 RELEVANCE_CONFIDENCE_FLOOR: Final = 0.6
 
-# Stage-1 OCR trigger (doc 19 §2.2): a PDF yielding < this many chars is almost
-# certainly scanned/image-only and needs OCR (E9). Until E9 lands we flag the
-# parse degraded and carry whatever text we got rather than dropping the doc.
+# Stage-1 OCR trigger thresholds (doc 19 §2.2; E9).
+# A PDF yielding < OCR_MIN_PDF_CHARS chars AND having > OCR_MIN_PDF_PAGES pages
+# is almost certainly scanned/image-only — trigger the OCR fallback.
 OCR_MIN_PDF_CHARS: Final = 200
+OCR_MIN_PDF_PAGES: Final = 5
 
 # Prompt identity for the extract stage. TODO E3/E4: the per-signal-type prompts
 # (doc 19 §5.3) supersede this single permissive prompt; pinned here so candidates
@@ -145,13 +150,29 @@ class DocumentNotFoundError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def parse_document(doc: StoredRawDocument, content: bytes) -> ParsedDocument:
-    """Extract clean text from the raw bytes (doc 19 §2.1).
+def parse_document(
+    doc: StoredRawDocument,
+    content: bytes,
+    *,
+    ocr_backend: OcrBackend | None = None,
+) -> ParsedDocument:
+    """Extract clean text from the raw bytes (doc 19 §2.1-§2.2; E9).
 
     Dispatches on ``content_type``: PDF -> ``pdfplumber`` (lazy-imported; it lives
     in the ``extraction`` extra so the api image never pays for it), HTML ->
     BeautifulSoup main-text, JSON/XML/text -> decoded text. Anything unrecognised
     falls back to a best-effort UTF-8 decode and is flagged ``degraded``.
+
+    **OCR fallback (E9, doc 19 §2.2):** when pdfplumber yields < 200 chars for a PDF
+    with > 5 pages, the parse invokes the OCR backend (Tesseract by default; Textract
+    on the cloud tier; Fake for tests). The result carries ``ocr_used=True`` and, for
+    documents longer than 100 pages where only the first-50 + last-25 pages were
+    OCR'd, ``ocr_truncated=True``. OCR failure is non-fatal — the parse degrades to
+    whatever text exists rather than losing the document.
+
+    ``ocr_backend`` may be injected for tests (overrides the ``OCR_BACKEND`` env var).
+    When ``None``, :func:`~.ocr.get_ocr_backend` is called lazily (only when the OCR
+    trigger fires) so processes that never process scanned PDFs pay zero import cost.
 
     Whitespace is collapsed to paragraph boundaries (doc 19 §2.4). Returns a
     :class:`ParsedDocument`; never raises on empty text (a relevance gate /
@@ -159,19 +180,35 @@ def parse_document(doc: StoredRawDocument, content: bytes) -> ParsedDocument:
     """
     content_type = (doc.content_type or "").lower()
     degraded = False
+    ocr_used = False
+    ocr_truncated = False
 
     if "pdf" in content_type:
-        text = _parse_pdf(content)
-        # TODO E9: OCR decision (doc 19 §2.2). A PDF yielding < OCR_MIN_PDF_CHARS is
-        # almost certainly scanned/image-only and needs OCR (Tesseract/Textract).
-        # Until E9 lands we flag the parse degraded rather than dropping the doc, so
-        # the snapshot is still replayable once OCR ships.
-        if len(text) < OCR_MIN_PDF_CHARS:
-            degraded = True
+        text, page_count = _parse_pdf(content)
+        # E9 OCR decision (doc 19 §2.2): a PDF yielding < OCR_MIN_PDF_CHARS chars
+        # AND having > OCR_MIN_PDF_PAGES pages is almost certainly scanned/image-only.
+        if len(text) < OCR_MIN_PDF_CHARS and page_count > OCR_MIN_PDF_PAGES:
             log.info(
-                "extraction.parse.pdf_below_ocr_threshold",
+                "extraction.parse.pdf_ocr_triggered",
                 raw_document_id=str(doc.id),
                 chars=len(text),
+                pages=page_count,
+            )
+            text, ocr_used, ocr_truncated = _run_ocr(
+                content,
+                ocr_backend=ocr_backend,
+                doc_id=str(doc.id),
+                fallback_text=text,
+            )
+        elif len(text) < OCR_MIN_PDF_CHARS:
+            # Short PDF but ≤ 5 pages — too small to bother with OCR; flag degraded
+            # so downstream can weight it lower (the doc may simply be near-empty).
+            degraded = True
+            log.info(
+                "extraction.parse.pdf_short_no_ocr",
+                raw_document_id=str(doc.id),
+                chars=len(text),
+                pages=page_count,
             )
     elif "html" in content_type:
         text = _parse_html(content)
@@ -192,7 +229,47 @@ def parse_document(doc: StoredRawDocument, content: bytes) -> ParsedDocument:
         text=text,
         char_count=len(text),
         degraded=degraded,
+        ocr_used=ocr_used,
+        ocr_truncated=ocr_truncated,
     )
+
+
+def _run_ocr(
+    content: bytes,
+    *,
+    ocr_backend: OcrBackend | None,
+    doc_id: str,
+    fallback_text: str = "",
+) -> tuple[str, bool, bool]:
+    """Invoke the OCR backend and return ``(text, ocr_used, ocr_truncated)``.
+
+    Non-fatal: a backend failure (or a backend that returns empty text) falls back
+    to ``fallback_text`` (the pdfplumber extract, which was < 200 chars but possibly
+    non-empty) with ``ocr_used=True`` (the attempt was made) and ``ocr_truncated=False``.
+    This ensures pdfplumber text is never silently discarded.
+    """
+    backend = ocr_backend if ocr_backend is not None else get_ocr_backend()
+    try:
+        result = backend.run(content)
+        log.info(
+            "extraction.parse.ocr_complete",
+            doc_id=doc_id,
+            backend=result.backend,
+            pages_processed=result.pages_processed,
+            ocr_truncated=result.ocr_truncated,
+            chars=len(result.text),
+        )
+        # If the backend returned no text, preserve the original pdfplumber extract
+        # rather than silently discarding whatever it found (doc 19 §2.2 best-effort).
+        ocr_text = result.text if result.text.strip() else fallback_text
+        return ocr_text, result.ocr_used, result.ocr_truncated
+    except Exception as exc:
+        # Best-effort: OCR failure must not lose the document (doc 19 §2.2 §12.1).
+        # Include the stack trace so operators can diagnose backend issues.
+        log.warning(
+            "extraction.parse.ocr_failed", doc_id=doc_id, error=str(exc), exc_info=True
+        )
+        return fallback_text, True, False
 
 
 def _is_texty(content_type: str) -> bool:
@@ -221,8 +298,11 @@ def _parse_html(content: bytes) -> str:
     return soup.get_text(separator="\n")
 
 
-def _parse_pdf(content: bytes) -> str:
+def _parse_pdf(content: bytes) -> tuple[str, int]:
     """Extract the text layer from a PDF via ``pdfplumber`` (doc 19 §2.1).
+
+    Returns ``(text, page_count)`` — the page count is needed by the OCR trigger
+    (doc 19 §2.2; E9) to decide whether to fall back to OCR (> 5 pages + < 200 chars).
 
     ``pdfplumber`` lives in the ``extraction`` extra (installed on
     ``worker_extract``, not the api image), so it is imported lazily. If it is
@@ -233,25 +313,27 @@ def _parse_pdf(content: bytes) -> str:
         import pdfplumber
     except ImportError:  # pragma: no cover - depends on the extraction extra
         log.warning("extraction.parse.pdfplumber_unavailable")
-        return ""
+        return "", 0
 
     import io
 
     # A malformed/encrypted/truncated PDF can make pdfplumber (pdfminer under it)
     # raise on open or per-page extraction. Parse is best-effort (doc 19 §2.1): a
-    # bad PDF must degrade to empty text — which the caller flags degraded and the
-    # # TODO E9 OCR hook later re-attempts — not crash the whole job.
+    # bad PDF must degrade to empty text — the OCR hook re-attempts if the page
+    # count warrants it — not crash the whole job.
     try:
         parts: list[str] = []
+        page_count = 0
         with pdfplumber.open(io.BytesIO(content)) as pdf:
+            page_count = len(pdf.pages)
             for page in pdf.pages:
                 page_text = page.extract_text() or ""
                 if page_text:
                     parts.append(page_text)
-        return "\n\n".join(parts)
+        return "\n\n".join(parts), page_count
     except Exception as exc:  # pdfminer raises a broad family of parse errors
         log.warning("extraction.parse.pdf_failed", error=str(exc))
-        return ""
+        return "", 0
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -587,6 +669,8 @@ async def store_candidates(
     raw_document_id: uuid.UUID,
     recipe_id: str,
     candidates: list[CandidateRecord],
+    ocr_used: bool = False,
+    ocr_truncated: bool = False,
 ) -> tuple[list[ExtractionCandidate], list[uuid.UUID]]:
     """Persist candidates + promote validated ones into ``signals_signal`` (E1/E4).
 
@@ -614,6 +698,10 @@ async def store_candidates(
     documents into a surviving signal (doc 19 §7; E5) — the same RFP seen on the
     portal, a newspaper and the entity's own site collapses to one signal.
 
+    ``ocr_used`` / ``ocr_truncated`` are the E9 OCR flags from the parse stage
+    (doc 19 §2.2); both candidates from the same document share the same values and
+    are recorded on each candidate row for the audit trail.
+
     # TODO E6: the real confidence blend feeds ``confidence`` (doc 19 §6.2).
     """
     rows: list[ExtractionCandidate] = []
@@ -627,6 +715,8 @@ async def store_candidates(
             confidence=candidate.confidence,
             dedup_key=candidate.dedup_key,
             extraction_method=candidate.extraction_method,
+            ocr_used=ocr_used,
+            ocr_truncated=ocr_truncated,
         )
         session.add(row)
         rows.append(row)
@@ -733,6 +823,7 @@ async def run_extraction_pipeline(
     prefilter: str,
     workspace_id: str | None = None,
     confidence_config: ConfidenceConfig = DEFAULT_CONFIG,
+    ocr_backend: OcrBackend | None = None,
 ) -> PipelineResult:
     """Run the full funnel for one document (doc 19 §1; E1).
 
@@ -752,12 +843,16 @@ async def run_extraction_pipeline(
     ``signals_signal.vector_embedding`` pgvector column for fuzzy dedupe (doc 19 §7.4)
     + smart search (doc 14 §6.2). It is **best-effort** — an embed failure is logged
     and the column left NULL (the signal is never lost) — so it never fails the job.
+
+    ``ocr_backend`` is injected for tests (overrides ``OCR_BACKEND`` env var) and
+    forwarded to :func:`parse_document` so tests can use :class:`~.ocr.FakeOcrBackend`
+    without installing Tesseract. Pass ``None`` in production (the default).
     """
     gateway = gateway or get_gateway()
     classifier = classifier or RelevanceClassifier(gateway=gateway)
 
     doc, content = await fetch_document(session, storage, raw_document_id)
-    parsed = parse_document(doc, content)
+    parsed = parse_document(doc, content, ocr_backend=ocr_backend)
 
     verdict = await run_relevance_gate(
         classifier,
@@ -795,6 +890,8 @@ async def run_extraction_pipeline(
         raw_document_id=raw_document_id,
         recipe_id=parsed.recipe_id,
         candidates=survivors,
+        ocr_used=parsed.ocr_used,
+        ocr_truncated=parsed.ocr_truncated,
     )
     await embed_signals(session, signal_ids, gateway=gateway, workspace_id=workspace_id)
     return PipelineResult(

@@ -77,6 +77,11 @@ extraction = [
     "anthropic>=0.39",
     "openai>=1.51",
     "spacy>=3.8",
+    # E9 OCR pipeline (doc 19 §2.2). Both are lazy-imported (only the extract
+    # worker installs the ``extraction`` extra). ``pdf2image`` requires Poppler
+    # to be installed in the OS layer (the worker Docker image).
+    "pytesseract>=0.3",
+    "pdf2image>=1.17",
 ]
 
 [dependency-groups]
@@ -166,6 +171,10 @@ module = [
     "boto3.*",
     "botocore.*",
     "moto.*",
+    # E9 OCR deps: pytesseract and pdf2image ship no py.typed / inline stubs;
+    # both are lazy-imported (extraction extra only, never in the api image).
+    "pytesseract.*",
+    "pdf2image.*",
 ]
 ignore_missing_imports = true
 
