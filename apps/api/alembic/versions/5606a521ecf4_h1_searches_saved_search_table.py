@@ -32,9 +32,7 @@ def upgrade() -> None:
             server_default=sa.text("'{}'::jsonb"),
             nullable=False,
         ),
-        sa.Column(
-            "is_shared", sa.Boolean(), server_default=sa.text("false"), nullable=False
-        ),
+        sa.Column("is_shared", sa.Boolean(), server_default=sa.text("false"), nullable=False),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
