@@ -8,12 +8,14 @@
 // QA-5: Browser matrix — three desktop engine projects (Chromium, Firefox,
 // WebKit/Safari). All existing specs are browser-agnostic and run unchanged on
 // every engine. If a future spec targets Chromium-only behaviour, gate it with
-// a project annotation: `test.use({ ...devices['Desktop Chrome'] })` inside the
-// spec, or add a `grep`/`grepInvert` to the relevant project below.
+// `test.skip(({ browserName }) => browserName !== 'chromium', 'Chromium only')`
+// inside the spec body, or use `testInfo.project.name` for project-name checks,
+// or add `grep`/`grepInvert` to the relevant project entry below.
 //
-// Mobile-viewport sanity: NOT automated here — run manually on real devices or
-// with `playwright test --project=mobile-chrome` in a local environment before
-// any release that changes responsive layout. (QA-5 scope decision.)
+// Mobile-viewport sanity: NOT automated here (QA-5 scope decision). To run
+// manually, add a mobile project (e.g. `use: { ...devices['Pixel 5'] }`) to
+// this config locally and run `playwright test --project=<mobile-project-name>`
+// before any release that changes responsive layout.
 import { defineConfig, devices } from "@playwright/test";
 
 // The base URL is overridable via env so CI can point at a pre-built `next start`

@@ -159,18 +159,23 @@ jobs:
   # Covers the static marketing surface that exists today (landing page, /pricing,
   # nav, 404). CUF-1..9 fixme scaffolds auto-skip until feature tasks merge.
   #
-  # Browser matrix strategy (QA-5): three browser engines in one job.
-  # All three browsers are installed and the smoke projects run sequentially.
-  # This is simpler than a strategy.matrix approach and avoids three web builds.
+  # Browser matrix strategy (QA-5): strategy.matrix over [chromium, firefox,
+  # webkit] — each matrix leg runs as a separate job in parallel, builds the
+  # Next.js app independently, installs its own browser binary with OS deps,
+  # and uploads a per-browser Playwright report artifact. The three legs run
+  # concurrently so total wall-clock time is roughly one browser's worth.
   #
-  # NON-BLOCKING: continue-on-error: true is intentional — this is the slowest
-  # CI job (web build + multi-browser install) and concurrency cancel-in-progress
-  # frequently cancels it on rebases/force-pushes. Real coverage lives in the
-  # nightly full suite (e2e-nightly.yml). Do NOT remove continue-on-error until
-  # the browser cache is stable and the job completes consistently.
+  # NON-BLOCKING: continue-on-error: true is intentional — this is a slow CI
+  # job (web build + browser install per leg) and concurrency cancel-in-progress
+  # frequently cancels it on rebases/force-pushes. WebKit system deps may also
+  # be absent on minimal runners. Real coverage lives in the nightly full suite
+  # (e2e-nightly.yml). Do NOT remove continue-on-error until the browser cache
+  # is stable and all legs complete consistently.
   #
-  # Mobile-viewport sanity: manual only (QA-5 scope decision). Run locally with
-  # `playwright test --project=mobile-chrome` before any responsive-layout change.
+  # Mobile-viewport sanity: manual only (QA-5 scope decision). To test locally,
+  # add a mobile project to playwright.config.ts (e.g. `devices['Pixel 5']`)
+  # and run `playwright test --project=<mobile-project-name>` before any
+  # responsive-layout change.
   # ---------------------------------------------------------------------------
   e2e-smoke:
     name: E2E smoke
