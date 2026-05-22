@@ -834,6 +834,42 @@ class RecipeRunner:
             for name, spec in self.recipe.fields.items()
         }
 
+    def preview_field_extractions(
+        self, html: str, *, source_url: str = "preview://pasted-html"
+    ) -> list[FieldExtraction]:
+        """Per-field :class:`FieldExtraction` results — public, never raises.
+
+        Like :meth:`field_values` but returns the full :class:`FieldExtraction`
+        objects (including method, selector_index, and selector) so the authoring
+        preview (D5) can build a faithful ``FieldPreview`` list that is consistent
+        with the records produced by the full extraction chain (selectors + LLM
+        rung). Required-field misses are captured in the returned
+        :class:`FieldExtraction` (value ``None``, method ``dead_letter``) rather
+        than raised as :class:`RequiredFieldMissingError`, so the preview always
+        shows the full field picture regardless of extraction outcome.
+        """
+        doc = ParsedDocument(_parse_html(html), html)
+        page_text = doc.soup.get_text(" ", strip=True) if self._any_llm_assisted() else ""
+        # Build a minimal RawDocument shell so _resolve_field can construct
+        # DeadLetterEntry objects (the entries are discarded by the preview, but
+        # the method signature requires them).
+        raw = RawDocument(
+            recipe_id=self.recipe.recipe_id,
+            connector=self.recipe.connector,
+            url=source_url,
+            status_code=200,
+            content=html,
+            content_hash=_content_hash(html),
+            recipe_version=self.recipe.version,
+        )
+        extractions: list[FieldExtraction] = []
+        for name, spec in self.recipe.fields.items():
+            result, _dead_letter = self._resolve_field(
+                doc=doc, page_text=page_text, name=name, spec=spec, raw=raw
+            )
+            extractions.append(result)
+        return extractions
+
 
 __all__ = [
     "Clock",

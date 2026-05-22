@@ -6,8 +6,9 @@ return a rich, per-field view of what the runner extracted, plus the
 
 This is the engine behind both the authoring CLI ``preview`` subcommand and the
 staff ``POST /recipes/preview`` endpoint. It is **additive**: it consumes the
-runner only through its public lifecycle (``extract_html`` / ``run``) and never
-touches the extraction internals (``_extract_field`` / the selector chain) or
+runner only through its public lifecycle (``extract_html`` /
+``preview_field_extractions`` / ``run``) and never touches the extraction
+internals (``_extract_field`` / ``_resolve_field`` / the selector chain) or
 the DSL schema — those belong to D11.
 
 Two input modes:
@@ -33,6 +34,7 @@ from .runner import (
 )
 from .schemas import (
     CanonicalRecord,
+    FieldExtraction,
     FieldPreview,
     PreviewResult,
 )
@@ -61,19 +63,24 @@ class _PreviewNoopFetcher:
         return None
 
 
-def _field_previews(recipe: Recipe, values: dict[str, str | None]) -> list[FieldPreview]:
-    """Build the per-field diagnostic view from extracted ``values``.
+def _field_previews(recipe: Recipe, extractions: list[FieldExtraction]) -> list[FieldPreview]:
+    """Build the per-field diagnostic view from full-chain :class:`FieldExtraction` results.
 
-    ``values`` comes from the runner's public :meth:`RecipeRunner.field_values`
-    (one value per declared field), so the preview stays on a supported runner
-    surface rather than the extraction internals (D11's domain). We pair each
-    value with its :class:`FieldSpec` (which the recipe exposes publicly) to
-    surface required-ness, the read attribute, and the ordered selector list an
-    author would debug against.
+    ``extractions`` come from :meth:`RecipeRunner.preview_field_extractions`
+    (the public non-raising surface that covers the full selector→LLM chain),
+    so the per-field picture is consistent with the records produced by the full
+    extraction: a field that the LLM rung fills will show ``matched=True`` here
+    just as it appears in the canonical record, rather than ``False`` (which
+    would happen if we only ran the selector chain). We pair each extraction
+    with its :class:`FieldSpec` (which the recipe exposes publicly) to surface
+    required-ness, the read attribute, and the ordered selector list an author
+    would debug against.
     """
+    by_name = {fe.name: fe for fe in extractions}
     previews: list[FieldPreview] = []
     for name, spec in recipe.fields.items():
-        value = values.get(name)
+        fe = by_name.get(name)
+        value = fe.value if fe is not None else None
         previews.append(
             FieldPreview(
                 name=name,
@@ -95,9 +102,17 @@ def preview_html(recipe: Recipe, html: str, *, source_url: str = HTML_SOURCE_URL
     missing — a failed extraction is the *most* useful thing for an author to
     see, so we capture the :class:`RequiredFieldMissingError` into the result's
     ``error`` rather than raising. ``ok`` is ``False`` in that case.
+
+    Per-field results are derived from
+    :meth:`RecipeRunner.preview_field_extractions` (full selector→LLM chain,
+    never raises) so they are consistent with the records produced by
+    ``extract_html`` + ``normalize``.
     """
     runner = RecipeRunner(recipe, _PreviewNoopFetcher())
-    fields = _field_previews(recipe, runner.field_values(html))
+    # Run the full chain (selector → LLM) for every field without raising on
+    # required-field misses; this is the source of truth for FieldPreview.
+    field_extractions = runner.preview_field_extractions(html, source_url=source_url)
+    fields = _field_previews(recipe, field_extractions)
 
     error: str | None = None
     records: list[CanonicalRecord] = []

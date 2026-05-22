@@ -54,15 +54,25 @@ function RadioGroup<T extends string>({
 }
 
 export function RecipePreviewForm({
-  staffToken,
+  defaultStaffToken = "",
 }: {
-  staffToken?: string;
+  /**
+   * The default X-Staff-Token value. The page injects this from the
+   * `NEXT_PUBLIC_RECIPE_PREVIEW_STAFF_TOKEN` env var so staff don't have to
+   * type it on every load. An inline text input lets them override it in
+   * environments where the env var is not set (TODO B7: remove once real RBAC
+   * is in place and the token gate is retired).
+   */
+  defaultStaffToken?: string;
 }) {
   const [state, setState] = useState<PreviewFormState>(INITIAL_STATE);
+  // Inline token override: starts from the server-injected env default and lets
+  // staff paste a value directly in non-development environments.
+  const [staffToken, setStaffToken] = useState<string>(defaultStaffToken);
 
   const mutation = useMutation<PreviewResult, Error, PreviewFormState>({
     mutationFn: (formState) =>
-      fetchRecipePreview(formState, { staffToken }),
+      fetchRecipePreview(formState, { staffToken: staffToken || undefined }),
   });
 
   function set<K extends keyof PreviewFormState>(
@@ -80,6 +90,28 @@ export function RecipePreviewForm({
   return (
     <div className="space-y-6">
       <form onSubmit={onSubmit} className="space-y-5" aria-label="Recipe preview">
+        {/* Staff token gate (TODO B7). Hidden when the env var supplies it so the
+            common case is frictionless; always editable for non-dev environments
+            where the API returns 403 without a valid token. */}
+        <div className="space-y-1">
+          <label
+            htmlFor="staff-token"
+            className="block text-xs font-medium text-muted-foreground"
+          >
+            Staff token{" "}
+            <span className="font-normal">(X-Staff-Token; TODO B7)</span>
+          </label>
+          <input
+            id="staff-token"
+            type="password"
+            autoComplete="off"
+            className="w-full rounded-md border px-3 py-2 text-sm font-mono"
+            placeholder="leave blank in development"
+            value={staffToken}
+            onChange={(e) => setStaffToken(e.target.value)}
+          />
+        </div>
+
         <div className="space-y-2">
           <RadioGroup
             legend="Recipe source"

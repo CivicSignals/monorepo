@@ -6,7 +6,9 @@
 //
 // TODO B7: this is a staff/admin surface. Real route-level RBAC gating lands
 // with auth (B1) + roles (B7); the API endpoint enforces the interim staff
-// token gate today.
+// token gate today. Until B7 lands, the staff token can be injected via the
+// NEXT_PUBLIC_RECIPE_PREVIEW_STAFF_TOKEN env var or entered directly in the
+// form below.
 import { RecipePreviewForm } from "@/components/admin/recipe-preview-form";
 
 export const metadata = {
@@ -14,6 +16,12 @@ export const metadata = {
 };
 
 export default function RecipePreviewPage() {
+  // Read the token from the build-time env var so staff don't have to type it
+  // on every page load. An operator sets this in the Next.js runtime env; if
+  // absent (local dev or when the API gate is open), the form still works with
+  // an empty token (the API allows it in `environment == "development"`).
+  const envToken = process.env.NEXT_PUBLIC_RECIPE_PREVIEW_STAFF_TOKEN ?? "";
+
   return (
     <main className="container max-w-4xl py-12">
       <header className="mb-8">
@@ -30,7 +38,10 @@ export default function RecipePreviewPage() {
         </p>
       </header>
 
-      <RecipePreviewForm />
+      {/* Pass the env token as the default; the form lets staff override it inline
+          so the page stays usable in environments where the env var is not set
+          (TODO B7: remove once real RBAC is in place). */}
+      <RecipePreviewForm defaultStaffToken={envToken} />
     </main>
   );
 }

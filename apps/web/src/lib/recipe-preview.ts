@@ -15,13 +15,32 @@ export interface FieldPreview {
   missing_required: boolean;
 }
 
+/** Mirrors `EntityRef` in `apps/api/.../modules/recipes/schemas.py`. */
+export interface EntityRef {
+  entity_id: string | null;
+  name: string | null;
+  state: string | null;
+  kind: string | null;
+}
+
+/**
+ * Mirrors `CanonicalRecord` in `apps/api/.../modules/recipes/schemas.py`.
+ *
+ * `dead_letters` and `degraded_fields` are present in the API model (added by
+ * D11) but the preview endpoint surfaces them only via the top-level `degraded`
+ * flag and `FieldPreview.missing_required` — they are included here for type
+ * completeness so callers are not surprised by unexpected JSON keys.
+ */
 export interface CanonicalRecord {
   record_type: string;
   recipe_id: string;
   recipe_version: number;
   source_url: string;
+  entity: EntityRef;
   signal_types: string[];
   degraded: boolean;
+  degraded_fields: string[];
+  dead_letters: unknown[];
   fields: Record<string, string | null>;
 }
 
