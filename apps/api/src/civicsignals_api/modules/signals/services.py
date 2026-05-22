@@ -34,9 +34,9 @@ import base64
 import binascii
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 from sqlalchemy import and_, delete, func, or_, select
@@ -46,6 +46,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.ids import uuid7
 from civicsignals_api.modules.entities.models import Entity
 from civicsignals_api.modules.icp.models import IcpDefinition
+
+if TYPE_CHECKING:
+    from sqlalchemy import CursorResult
 
 from .dedupe import (
     DEDUPE_WINDOWS,
@@ -83,6 +86,14 @@ from .models import (
     SIGNAL_STATUS_PENDING_REVIEW,
     Signal,
 )
+from .models_feedback import (
+    FEEDBACK_KINDS,
+    FEEDBACK_NOT_RELEVANT,
+    FEEDBACK_RELEVANT,
+    FEEDBACK_SCORING_KINDS,
+    FEEDBACK_WRONG_EXTRACTION,
+    SignalFeedback,
+)
 from .models_fuzzy_review import (
     REVIEW_STATUS_APPROVED,
     REVIEW_STATUS_PENDING,
@@ -116,6 +127,11 @@ from .scoring import (
 from .workspace_score_model import (
     FEED_VISIBLE_STATUSES,
     MATCHED_VIA_ICP,
+    SCORE_STATUS_DISMISSED,
+    SCORE_STATUS_NEW,
+    SCORE_STATUS_PINNED,
+    SCORE_STATUS_PUSHED,
+    SCORE_STATUS_REVIEWED,
     SCORE_STATUSES,
     WorkspaceScore,
 )
@@ -126,6 +142,7 @@ from .workspace_scoring import (
     ScoringConfig,
     SignalDimensions,
     WorkspaceScoreResult,
+    derive_signal_type_overrides,
     score_signal_against_icp,
     signal_matches_icp,
 )
@@ -928,12 +945,18 @@ async def score_signal_for_all_workspaces(
 
     written = 0
     for icp in candidates:
+        # F5: each candidate workspace scores through its own feedback-nudged config
+        # (doc 14 §12). A no-op when the caller passed a non-default config or the
+        # workspace has no feedback — the override map is empty → baseline scoring.
+        ws_config = config
+        if config is DEFAULT_SCORING_CONFIG:
+            ws_config = await scoring_config_for_workspace(session, workspace_id=icp.workspace_id)
         result = await score_signal_for_workspace(
             session,
             signal_id=signal_id,
             workspace_id=icp.workspace_id,
             icp=icp,
-            config=config,
+            config=ws_config,
             now=now,
         )
         if result is not None:
@@ -974,6 +997,13 @@ async def score_workspace_candidates(
     if icp is None:
         return 0
 
+    # F5: fold the workspace's accumulated feedback into the config once for the whole
+    # batch (the backfill direction, doc 14 §7 + §12). A no-op when the caller already
+    # passed a non-default config (an explicit override wins) or the workspace has no
+    # feedback. Done once here — not per signal — so a long backfill stays cheap.
+    if config is DEFAULT_SCORING_CONFIG:
+        config = await scoring_config_for_workspace(session, workspace_id=workspace_id)
+
     written = 0
     for signal_id in signal_ids:
         result = await score_signal_for_workspace(
@@ -988,6 +1018,521 @@ async def score_workspace_candidates(
         if result is not None:
             written += 1
     return written
+
+
+# ---------------------------------------------------------------------------
+# Per-workspace status transitions (G4, doc 14 §5.3)
+# ---------------------------------------------------------------------------
+#
+# A score row's ``status`` is the feed lifecycle the user drives:
+# ``new`` → ``reviewed`` → ``pinned`` (plus the terminal-ish ``dismissed`` and the
+# integration-set ``pushed``). G4 is the single-row PATCH that moves a row between
+# states; G3's bulk action builds on the same ``change_workspace_score_status`` seam.
+#
+# Allowed transitions (doc 14 §5.3). The map is intentionally small + explicit so an
+# illegal jump (e.g. ``new`` → ``pushed`` from the UI) is rejected rather than silently
+# applied — the ``pushed`` state is reachable only from the K-epic CRM-push flow
+# (``MATCHED_VIA``-agnostic), not from the human triage controls, so the UI surface
+# (member-gated PATCH) never targets it directly. Any state can be dismissed; a
+# dismissed row can be revived back to ``new`` (a "restore" from the hidden view).
+
+# Status set the human triage UI is allowed to request (G4). ``pushed`` is excluded:
+# it is set by the K-epic push flow, never by the triage PATCH (doc 14 §5.3).
+USER_SETTABLE_STATUSES: frozenset[str] = frozenset(
+    {
+        SCORE_STATUS_NEW,
+        SCORE_STATUS_REVIEWED,
+        SCORE_STATUS_PINNED,
+        SCORE_STATUS_DISMISSED,
+    }
+)
+
+# The transition graph (doc 14 §5.3). ``from`` → set of allowed ``to`` states.
+# A no-op (``to`` == current) is always allowed (idempotent re-set) and handled in
+# :func:`change_workspace_score_status` rather than encoded here.
+STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
+    SCORE_STATUS_NEW: frozenset(
+        {SCORE_STATUS_REVIEWED, SCORE_STATUS_PINNED, SCORE_STATUS_DISMISSED}
+    ),
+    SCORE_STATUS_REVIEWED: frozenset({SCORE_STATUS_PINNED, SCORE_STATUS_DISMISSED}),
+    SCORE_STATUS_PINNED: frozenset({SCORE_STATUS_REVIEWED, SCORE_STATUS_DISMISSED}),
+    # A pushed row can still be pinned / dismissed by the user (the push already
+    # happened; triage of the row continues). It cannot be sent back to ``new``.
+    SCORE_STATUS_PUSHED: frozenset({SCORE_STATUS_PINNED, SCORE_STATUS_DISMISSED}),
+    # Restoring a dismissed row brings it back to ``new`` (the default feed bucket).
+    SCORE_STATUS_DISMISSED: frozenset({SCORE_STATUS_NEW}),
+}
+
+
+class WorkspaceScoreNotFoundError(Exception):
+    """No score row exists for the (workspace, signal) pair (G4 → 404).
+
+    The signal did not score into the calling workspace's feed (the row is sparse —
+    doc 14 §5.2), so there is no status to transition. Distinct from "signal does not
+    exist": the route maps this to a 404 either way, but the detail message differs.
+    """
+
+    def __init__(self, signal_id: uuid.UUID) -> None:
+        self.signal_id = signal_id
+        super().__init__(f"no workspace score row for signal {signal_id}")
+
+
+class IllegalStatusTransitionError(Exception):
+    """A requested status transition is not allowed by the graph (G4 → 422).
+
+    Carries the ``current`` and requested ``target`` states + the ``allowed`` set so
+    the route can surface an explicit RFC 7807 422 the UI can act on (doc 14 §5.3).
+    """
+
+    def __init__(self, current: str, target: str, allowed: frozenset[str]) -> None:
+        self.current = current
+        self.target = target
+        self.allowed = allowed
+        super().__init__(
+            f"illegal status transition {current!r} -> {target!r}; "
+            f"allowed: {sorted(allowed) or '(none)'}"
+        )
+
+
+async def change_workspace_score_status(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    target_status: str,
+) -> WorkspaceScore:
+    """Transition one ``signals_workspace_score`` row's ``status`` (G4, doc 14 §5.3).
+
+    The single-row status PATCH the triage UI (feed row + detail page) drives. Reads
+    the score row **scoped to the calling workspace** via the ``(workspace_id,
+    signal_id)`` unique key — workspace A can never mutate workspace B's row (doc 14
+    §5.3) — then validates the move against :data:`STATUS_TRANSITIONS` and persists it.
+
+    Raises:
+    - :class:`ValueError` — ``target_status`` is not a known status (the route should
+      have rejected it at the schema layer; this is the defensive backstop).
+    - :class:`WorkspaceScoreNotFoundError` — no row for the pair (route → 404).
+    - :class:`IllegalStatusTransitionError` — the move is not in the graph (route →
+      422). A no-op (target == current) is allowed and returns the row unchanged.
+
+    The caller owns the transaction (this flushes, not commits). Cross-module callers
+    reach this through ``signals.services`` (never the model directly — doc 06 §3).
+    """
+    if target_status not in SCORE_STATUSES:
+        raise ValueError(f"unknown status {target_status!r}")
+
+    row = (
+        await session.execute(
+            select(WorkspaceScore)
+            .where(WorkspaceScore.workspace_id == workspace_id)
+            .where(WorkspaceScore.signal_id == signal_id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise WorkspaceScoreNotFoundError(signal_id)
+
+    current = row.status
+    if target_status == current:
+        # Idempotent re-set: no transition needed, the row already holds the target.
+        return row
+
+    allowed = STATUS_TRANSITIONS.get(current, frozenset())
+    if target_status not in allowed:
+        raise IllegalStatusTransitionError(current, target_status, allowed)
+
+    row.status = target_status
+    await session.flush()
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Bulk per-workspace status transitions (G3, doc 14 §5.3 — "mass dismiss / pin")
+# ---------------------------------------------------------------------------
+#
+# G3 is multi-select triage: the user selects N feed rows and mass-applies one status
+# (dismiss / pin / …). It reuses the G4 transition rules per item but is **resilient** —
+# a single bad id (not in the workspace, or an illegal transition from its current
+# state) is reported in the result rather than aborting the whole batch. The batch is
+# bounded (:data:`MAX_BULK_STATUS_BATCH`) so one request can't fan out unboundedly.
+#
+# Efficiency: all candidate rows are read in **one** indexed query (the
+# ``(workspace_id, signal_id)`` set), the legal transitions are applied in memory, and
+# a single ``flush`` persists them — N transitions, one round-trip + one transaction.
+
+# The largest bulk status batch we accept in one request (G3). A request over this is
+# rejected before any row is touched (the route maps it to a 422). Keeps the single
+# read query + the in-memory transition pass bounded.
+MAX_BULK_STATUS_BATCH: int = 200
+
+# Per-item skip reasons surfaced in the bulk result (stable string codes the UI/SDK can
+# branch on without parsing prose).
+BULK_SKIP_NOT_IN_WORKSPACE = "not_in_workspace"
+BULK_SKIP_ILLEGAL_TRANSITION = "illegal_transition"
+
+
+class BulkStatusBatchTooLargeError(Exception):
+    """A bulk status request exceeded :data:`MAX_BULK_STATUS_BATCH` (G3 → 422).
+
+    Carries the offending ``count`` + the ``limit`` so the route can surface an explicit
+    RFC 7807 422 the UI can act on (trim the selection) before any row is mutated.
+    """
+
+    def __init__(self, count: int, limit: int) -> None:
+        self.count = count
+        self.limit = limit
+        super().__init__(f"bulk status batch of {count} exceeds the limit of {limit}")
+
+
+@dataclass(slots=True)
+class BulkStatusSkip:
+    """One signal that could not be transitioned in a bulk request (G3).
+
+    ``reason`` is a stable code (:data:`BULK_SKIP_NOT_IN_WORKSPACE` /
+    :data:`BULK_SKIP_ILLEGAL_TRANSITION`); ``current`` is the row's current status when
+    known (``None`` when the signal has no score row in the workspace).
+    """
+
+    signal_id: uuid.UUID
+    reason: str
+    current: str | None = None
+
+
+@dataclass(slots=True)
+class BulkStatusResult:
+    """The per-item outcome of a bulk status transition (G3, doc 14 §5.3).
+
+    ``succeeded`` lists the signal ids whose score row now holds ``target_status``
+    (including idempotent no-ops — the row already held it). ``moved`` is the subset of
+    ``succeeded`` whose status **actually changed** (a no-op is in ``succeeded`` but not
+    in ``moved``), so the route can emit one audit event per real transition only.
+    ``skipped`` carries the ids that could not be transitioned, each with a reason. A
+    duplicate id in the request is collapsed (de-duplicated) before processing, so each
+    id appears at most once across the three lists.
+    """
+
+    target_status: str
+    succeeded: list[uuid.UUID] = field(default_factory=list)
+    moved: list[uuid.UUID] = field(default_factory=list)
+    skipped: list[BulkStatusSkip] = field(default_factory=list)
+
+
+async def change_workspace_score_status_bulk(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_ids: Sequence[uuid.UUID],
+    target_status: str,
+) -> BulkStatusResult:
+    """Bulk-transition many ``signals_workspace_score`` rows in one request (G3).
+
+    The multi-select triage seam (mass dismiss / mass pin, doc 14 §5.3). Reuses the
+    G4 transition graph (:data:`STATUS_TRANSITIONS`) per item but is **resilient**: a
+    signal that has no score row in the calling workspace, or whose current status does
+    not permit the move, is recorded in :attr:`BulkStatusResult.skipped` rather than
+    failing the whole batch. An idempotent no-op (the row already holds the target)
+    counts as a success.
+
+    Workspace-scoped: rows are read by ``(workspace_id, signal_id IN …)`` from the
+    resolved context, so workspace A can never mutate workspace B's rows (doc 14 §5.3,
+    doc 08 §1.4). All candidate rows are loaded in **one** query and persisted with a
+    **single** flush — N transitions cost one round-trip + one transaction.
+
+    Raises:
+    - :class:`ValueError` — ``target_status`` is not a known status (the route should
+      have rejected it at the schema layer; defensive backstop).
+    - :class:`BulkStatusBatchTooLargeError` — more than :data:`MAX_BULK_STATUS_BATCH`
+      ids (route → 422). Checked before any row is read, so an over-large request
+      mutates nothing.
+
+    The caller owns the transaction (this flushes, not commits). Cross-module callers
+    reach this through ``signals.services`` (never the model directly — doc 06 §3).
+    """
+    if target_status not in SCORE_STATUSES:
+        raise ValueError(f"unknown status {target_status!r}")
+
+    # De-duplicate, preserving first-seen order, so a repeated id is one outcome.
+    unique_ids = _ordered_unique(list(signal_ids))
+    if len(unique_ids) > MAX_BULK_STATUS_BATCH:
+        raise BulkStatusBatchTooLargeError(len(unique_ids), MAX_BULK_STATUS_BATCH)
+
+    result = BulkStatusResult(target_status=target_status)
+    if not unique_ids:
+        return result
+
+    # One indexed read for the whole batch (the (workspace_id, signal_id) set).
+    rows = list(
+        (
+            await session.execute(
+                select(WorkspaceScore)
+                .where(WorkspaceScore.workspace_id == workspace_id)
+                .where(WorkspaceScore.signal_id.in_(unique_ids))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_signal: dict[uuid.UUID, WorkspaceScore] = {row.signal_id: row for row in rows}
+
+    mutated = False
+    for signal_id in unique_ids:
+        row = by_signal.get(signal_id)
+        if row is None:
+            # No score row for this signal in the workspace — nothing to transition.
+            result.skipped.append(
+                BulkStatusSkip(signal_id=signal_id, reason=BULK_SKIP_NOT_IN_WORKSPACE)
+            )
+            continue
+
+        current = row.status
+        if target_status == current:
+            # Idempotent no-op: the row already holds the target.
+            result.succeeded.append(signal_id)
+            continue
+
+        allowed = STATUS_TRANSITIONS.get(current, frozenset())
+        if target_status not in allowed:
+            result.skipped.append(
+                BulkStatusSkip(
+                    signal_id=signal_id,
+                    reason=BULK_SKIP_ILLEGAL_TRANSITION,
+                    current=current,
+                )
+            )
+            continue
+
+        row.status = target_status
+        result.succeeded.append(signal_id)
+        result.moved.append(signal_id)
+        mutated = True
+
+    if mutated:
+        await session.flush()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Per-(workspace, signal) feedback loop (F5, doc 14 §12 "negative training")
+# ---------------------------------------------------------------------------
+#
+# A user marks a scored signal ``relevant`` / ``not_relevant`` / ``wrong_extraction``.
+# The first two aggregate (per signal type) into a bounded per-workspace nudge to the
+# signal-type weight via ``workspace_scoring.derive_signal_type_overrides``, applied
+# when the ``ScoringConfig`` is built for scoring/backfill (see
+# :func:`scoring_config_for_workspace`). ``wrong_extraction`` is an *extraction
+# quality* signal, not a relevance one, so it is recorded + surfaced but never alters
+# scoring weights — see :func:`workspace_wrong_extraction_count` and the QA-7 / E-epic
+# hand-off below.
+
+# The settable feedback kinds (the F5 verdicts). Re-exported through the service seam
+# so routes / cross-module callers reference these, not the model module directly.
+SETTABLE_FEEDBACK_KINDS: tuple[str, ...] = FEEDBACK_KINDS
+
+
+class FeedbackKindError(ValueError):
+    """An unknown feedback kind was supplied (route → 422 / defensive backstop)."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        super().__init__(
+            f"unknown feedback kind {kind!r}; expected one of {sorted(FEEDBACK_KINDS)}"
+        )
+
+
+async def set_signal_feedback(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    user_id: uuid.UUID,
+    kind: str,
+) -> SignalFeedback:
+    """Record (or change) one user's feedback verdict on a signal (F5, doc 14 §12).
+
+    Upserts the ``(workspace_id, signal_id, user_id)`` row: a first verdict inserts, a
+    changed verdict flips ``kind`` (ON CONFLICT DO UPDATE) — at most one live verdict
+    per user per (workspace, signal). Workspace-scoped: the workspace id comes from the
+    resolved context (B5), never a body param, so one workspace can never write
+    another's feedback (doc 14 §12). Raises :class:`FeedbackKindError` on an unknown
+    kind (the route should reject it at the schema layer; this is the backstop). The
+    caller owns the transaction (this flushes, not commits).
+
+    Note: this does **not** synchronously re-score the workspace's feed. The nudge is
+    applied to *subsequent* scores (the F3 fan-out + the F6 backfill build their
+    ``ScoringConfig`` through :func:`scoring_config_for_workspace`), matching doc 14
+    §12 ("re-weights subsequent scores") — an immediate full re-score is the F6
+    backfill's job, which a future trigger can invoke.
+    """
+    if kind not in FEEDBACK_KINDS:
+        raise FeedbackKindError(kind)
+
+    values = {
+        "id": uuid7(),
+        "workspace_id": workspace_id,
+        "signal_id": signal_id,
+        "user_id": user_id,
+        "kind": kind,
+    }
+    stmt = pg_insert(SignalFeedback).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_signal_feedback_ws_signal_user",
+        set_={"kind": stmt.excluded.kind, "updated_at": datetime.now(UTC)},
+    )
+    await session.execute(stmt)
+    # ``populate_existing`` so a *changed* verdict refreshes the identity-map instance
+    # that an earlier call in the same session may have loaded — the raw ON CONFLICT
+    # UPDATE bypasses the ORM, so without this the cached ``kind`` would be stale.
+    row = (
+        await session.execute(
+            select(SignalFeedback)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.signal_id == signal_id)
+            .where(SignalFeedback.user_id == user_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    return row
+
+
+async def clear_signal_feedback(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> bool:
+    """Retract one user's feedback verdict on a signal (F5, doc 14 §12).
+
+    Deletes the ``(workspace_id, signal_id, user_id)`` row. Returns ``True`` when a row
+    was removed, ``False`` when there was nothing to retract (idempotent). Workspace-
+    scoped; the caller owns the transaction (this flushes, not commits).
+    """
+    result = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            delete(SignalFeedback)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.signal_id == signal_id)
+            .where(SignalFeedback.user_id == user_id)
+        ),
+    )
+    return bool(result.rowcount)
+
+
+async def get_user_signal_feedback(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> str | None:
+    """The calling user's current verdict kind on a signal, or ``None`` (F5).
+
+    Surfaced on the detail/feed read so the feedback controls can reflect the user's
+    own current verdict. Workspace + user scoped (never another tenant's / user's).
+    """
+    return (
+        await session.execute(
+            select(SignalFeedback.kind)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.signal_id == signal_id)
+            .where(SignalFeedback.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+
+
+async def feedback_counts_by_signal_type(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+) -> dict[str, tuple[int, int]]:
+    """Aggregate a workspace's *relevance* feedback per signal type (F5, doc 14 §12).
+
+    Joins ``signals_signal_feedback`` to ``signals_signal`` (for the signal type) and
+    counts ``relevant`` vs ``not_relevant`` verdicts per type. ``wrong_extraction`` is
+    excluded — it is an extraction-quality signal, not a relevance one (doc 14 §12), so
+    it never reaches the re-weighting math. Returns ``{signal_type: (relevant_count,
+    not_relevant_count)}`` ready for :func:`~.workspace_scoring.derive_signal_type_overrides`.
+
+    Workspace-scoped: only this workspace's feedback is aggregated, so one workspace's
+    verdicts can never re-weight another's (doc 14 §12).
+    """
+    rows = (
+        await session.execute(
+            select(
+                Signal.signal_type,
+                SignalFeedback.kind,
+                func.count().label("n"),
+            )
+            .join(Signal, Signal.id == SignalFeedback.signal_id)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.kind.in_(tuple(FEEDBACK_SCORING_KINDS)))
+            .group_by(Signal.signal_type, SignalFeedback.kind)
+        )
+    ).all()
+
+    counts: dict[str, tuple[int, int]] = {}
+    for signal_type, kind, n in rows:
+        relevant, not_relevant = counts.get(signal_type, (0, 0))
+        if kind == FEEDBACK_RELEVANT:
+            relevant += int(n)
+        elif kind == FEEDBACK_NOT_RELEVANT:
+            not_relevant += int(n)
+        counts[signal_type] = (relevant, not_relevant)
+    return counts
+
+
+async def workspace_wrong_extraction_count(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+) -> int:
+    """Count a workspace's ``wrong_extraction`` flags (F5 → extraction-quality seam).
+
+    ``wrong_extraction`` deliberately does NOT alter scoring weights — it flags a bad
+    *extraction*, not an irrelevant signal (doc 14 §12). It is surfaced here as a count
+    so the UI / an operator can see how often extraction is being flagged.
+
+    # TODO QA-7 / E-epic: route these flags into the extraction-quality sampling /
+    # dead-letter review (doc 19 §6, QA-7 extraction-quality sampling) rather than only
+    # counting them — a flagged signal is a candidate for re-extraction / a recipe-
+    # selector review, which the extraction module owns (doc 06 §3, cross-module via
+    # its services seam).
+    """
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(SignalFeedback)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.kind == FEEDBACK_WRONG_EXTRACTION)
+        )
+    ).scalar_one()
+
+
+async def scoring_config_for_workspace(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    base_config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+) -> ScoringConfig:
+    """Build a workspace's :class:`ScoringConfig` with the F5 feedback nudge applied.
+
+    Aggregates the workspace's relevance feedback (:func:`feedback_counts_by_signal_type`)
+    and derives bounded per-signal-type weight overrides
+    (:func:`~.workspace_scoring.derive_signal_type_overrides`), returning a copy of
+    ``base_config`` carrying them. **No-op by default**: a workspace with no (or
+    perfectly balanced / below-volume) feedback yields an empty override map, so the
+    returned config is the unchanged baseline and scoring is identical to F3.
+
+    This is the seam the scoring/backfill paths build their config through so the
+    re-weighting applies to *subsequent* scores (doc 14 §12). The caller passes the
+    result as ``config=`` to the scorer.
+    """
+    counts = await feedback_counts_by_signal_type(session, workspace_id=workspace_id)
+    overrides = derive_signal_type_overrides(counts)
+    if not overrides:
+        # No nudge → return the base config untouched (a strict no-op, doc 14 §12).
+        return base_config
+    return replace(base_config, signal_type_weight_overrides=overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -1093,6 +1638,305 @@ class WorkspaceFeedPage:
 
     items: list[WorkspaceFeedItem]
     next_cursor: str | None
+
+
+# ---------------------------------------------------------------------------
+# The G2 signal-detail read seam (doc 07 §2, doc 14 §5.3)
+# ---------------------------------------------------------------------------
+#
+# The detail page (G2) shows one signal in full: the global signal core, the
+# *calling workspace's* score / breakdown / status (when the signal scored into
+# this workspace's feed — the row is workspace-scoped, never another tenant's),
+# the source documents that corroborate it, the suggested contacts at the
+# signal's entity, and related signals about the same entity. The cross-module
+# data (source docs, contacts, entity name) is fetched through the owning
+# module's ``services.py`` only — no module reaches into another's models
+# (doc 06 §3) — so this aggregator imports ``ingestion.services`` /
+# ``contacts.services`` / ``entities.services`` lazily at call time (the same
+# one-directional, explicit-at-call-site pattern as the F3 scorer above).
+
+# How many related signals + suggested contacts the detail view surfaces. Bounded
+# so the detail read stays a fixed handful of cheap queries (the full lists live on
+# the entity profile / contacts pages).
+RELATED_SIGNALS_LIMIT: int = 10
+SUGGESTED_CONTACTS_LIMIT: int = 10
+
+# Contact statuses we never suggest as actionable on the detail page: a bounced or
+# invalid contact is known-bad (C6 correction lifecycle, doc 07 §4), so surfacing it
+# would just send the user to a dead address. We over-fetch from the contacts module
+# (its list is status-agnostic — shared with the entity profile) and drop these here.
+# (Mirrors the exact ``bounced``/``invalid`` values in ``contacts.models.CONTACT_STATUSES``.)
+UNUSABLE_CONTACT_STATUSES: frozenset[str] = frozenset({"bounced", "invalid"})
+
+
+@dataclass(slots=True)
+class SignalSourceDocument:
+    """One corroborating source document for a signal (G2; doc 19 §7.3).
+
+    A lightweight provenance projection of an ``ingestion_raw_document`` row
+    (resolved via ``ingestion.services.get_raw_document``) — the originating URL,
+    recipe, fetch time, and content type so the detail page can list "where this
+    came from" and deep-link to the source. ``missing`` flags a referenced id that
+    no longer resolves (a doc pruned after the signal was stored) so the UI can
+    show a tombstone rather than silently dropping it.
+    """
+
+    raw_document_id: uuid.UUID
+    recipe_id: str | None
+    source_url: str | None
+    fetched_at: datetime | None
+    content_type: str | None
+    missing: bool = False
+
+
+@dataclass(slots=True)
+class SuggestedContact:
+    """One suggested contact at the signal's entity (G2; doc 07 §2 contacts).
+
+    A projection of a global ``contacts_contact`` row (via
+    ``contacts.services.list_contacts_for_entity``). Contacts are global per entity
+    (doc 07 §3), so this is the same directory the entity profile shows — surfaced
+    here so a user acting on a signal can reach the right person without leaving the
+    detail page. ``None`` entity → no suggestions (an unresolved signal, doc 19 §4.3).
+    """
+
+    contact_id: uuid.UUID
+    name: str
+    title: str | None
+    department: str | None
+    canonical_email: str | None
+    status: str
+    verified: bool
+
+
+@dataclass(slots=True)
+class RelatedSignal:
+    """One related signal about the same entity (G2; doc 14 §5.3).
+
+    Other (non-merged) signals for the signal's resolved entity, newest-first,
+    excluding the signal itself. Carries the global signal core only — the related
+    signal's per-workspace score is not joined here (the user can open it to see
+    that). ``None`` entity → no related signals (cannot relate by entity).
+    """
+
+    signal: SignalRead
+
+
+@dataclass(slots=True)
+class WorkspaceSignalDetail:
+    """The full G2 signal-detail view for one (workspace, signal) pair.
+
+    Aggregates the global signal, the calling workspace's score row (when present —
+    a signal can be opened by id even if it did not score into this workspace's
+    feed, in which case ``score``/``status``/``score_breakdown`` are ``None``), the
+    resolved entity name, the corroborating source documents, the suggested contacts
+    at the entity, and the related signals about the same entity. The
+    ``extracted_fields`` is the validated per-type payload (``details_jsonb``) lifted
+    out for the "Extracted fields" + inspect panel; it is the same map as
+    ``signal.details`` (surfaced explicitly so the UI need not reach into ``signal``).
+    """
+
+    signal: SignalRead
+    entity_id: uuid.UUID | None
+    entity_name: str | None
+    score: float | None
+    status: str | None
+    score_breakdown: dict[str, Any] | None
+    matched_keywords: list[str]
+    extracted_fields: dict[str, Any]
+    source_documents: list[SignalSourceDocument]
+    suggested_contacts: list[SuggestedContact]
+    related_signals: list[RelatedSignal]
+    # The calling user's current feedback verdict on this signal (F5, doc 14 §12), or
+    # ``None`` if they have not given one — lets the detail page's feedback controls
+    # reflect the user's own current selection.
+    feedback: str | None = None
+
+
+async def _related_signals_for_entity(
+    session: AsyncSession,
+    *,
+    entity_id: uuid.UUID,
+    exclude_signal_id: uuid.UUID,
+    limit: int,
+) -> list[RelatedSignal]:
+    """Load up to ``limit`` non-merged signals for an entity, newest-first (G2).
+
+    Excludes the signal being viewed and any soft-deleted (``merged``) rows so the
+    detail page's "Related signals" section mirrors what ``list_signals`` would show
+    for the same entity (doc 19 §7.4 merged rows stay hidden).
+    """
+    stmt = (
+        select(Signal)
+        .where(Signal.entity_id == entity_id)
+        .where(Signal.id != exclude_signal_id)
+        .where(Signal.status != SIGNAL_STATUS_MERGED)
+        .order_by(Signal.observed_at.desc(), Signal.id.desc())
+        .limit(limit)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    return [RelatedSignal(signal=SignalRead.model_validate(r)) for r in rows]
+
+
+async def _source_documents_for_signal(
+    session: AsyncSession,
+    raw_document_ids: Sequence[uuid.UUID],
+) -> list[SignalSourceDocument]:
+    """Resolve a signal's ``raw_document_ids`` to source-document projections (G2).
+
+    Reads each referenced ``ingestion_raw_document`` through
+    ``ingestion.services.get_raw_document`` (the owning module's seam, doc 06 §3); a
+    referenced id that no longer resolves is kept as a ``missing`` tombstone so the
+    provenance list stays complete and explainable.
+    """
+    from civicsignals_api.modules.ingestion import services as ingestion_services
+
+    docs: list[SignalSourceDocument] = []
+    for doc_id in raw_document_ids:
+        stored = await ingestion_services.get_raw_document(session, doc_id)
+        if stored is None:
+            docs.append(
+                SignalSourceDocument(
+                    raw_document_id=doc_id,
+                    recipe_id=None,
+                    source_url=None,
+                    fetched_at=None,
+                    content_type=None,
+                    missing=True,
+                )
+            )
+            continue
+        docs.append(
+            SignalSourceDocument(
+                raw_document_id=stored.id,
+                recipe_id=stored.recipe_id,
+                source_url=stored.source_url,
+                fetched_at=stored.fetched_at,
+                content_type=stored.content_type,
+            )
+        )
+    return docs
+
+
+async def get_signal_detail(
+    session: AsyncSession,
+    *,
+    signal_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID | None = None,
+) -> WorkspaceSignalDetail | None:
+    """The full G2 detail view for one signal in one workspace's context.
+
+    Returns ``None`` only when the global signal does not exist (or is a soft-deleted
+    ``merged`` row — those are not directly viewable). A signal that exists but did
+    **not** score into the calling workspace's feed is still returned, with the
+    per-workspace fields (``score``/``status``/``score_breakdown``) left ``None`` —
+    the signal corpus is global (doc 07 §3), so the detail page can be reached by id
+    (e.g. a shared link) even from a workspace whose ICP did not match it.
+
+    The per-workspace score row is read **scoped to the calling workspace** via the
+    ``(workspace_id, signal_id)`` unique key — workspace A can never read workspace
+    B's score for the same global signal (doc 14 §5.3). Source documents, suggested
+    contacts, and the resolved entity name come through the owning modules'
+    ``services.py`` (doc 06 §3). Related signals are other non-merged signals for the
+    same entity. The caller does not commit (this only reads).
+
+    When ``user_id`` is supplied, the calling user's current F5 feedback verdict on the
+    signal is read (scoped to the workspace + user) and surfaced as ``feedback`` so the
+    detail page's feedback controls reflect the user's own selection (doc 14 §12).
+
+    F4: the "Why this signal?" panel renders human-readable bullets from
+    ``score_breakdown`` — the structured breakdown is already returned here.
+    G4: status transitions (dismiss/pin/push) PATCH the score row this view reads
+    ``status`` from.
+    """
+    signal = await session.get(Signal, signal_id)
+    if signal is None or signal.status == SIGNAL_STATUS_MERGED:
+        return None
+
+    # The calling user's current feedback verdict on this signal (F5, doc 14 §12),
+    # scoped to the workspace + user so it reflects only their own selection.
+    user_feedback: str | None = None
+    if user_id is not None:
+        user_feedback = await get_user_signal_feedback(
+            session, workspace_id=workspace_id, signal_id=signal_id, user_id=user_id
+        )
+
+    # The calling workspace's score row for this signal, if any (scoped to the
+    # workspace — never another tenant's). A signal can be viewed without a score
+    # row (it simply did not match this workspace's ICP); the per-workspace fields
+    # stay None in that case.
+    score_row = (
+        await session.execute(
+            select(WorkspaceScore)
+            .where(WorkspaceScore.workspace_id == workspace_id)
+            .where(WorkspaceScore.signal_id == signal_id)
+        )
+    ).scalar_one_or_none()
+
+    entity_id = signal.entity_id
+    entity_name: str | None = signal.entity_name_raw
+    suggested_contacts: list[SuggestedContact] = []
+    related_signals: list[RelatedSignal] = []
+    if entity_id is not None:
+        from civicsignals_api.modules.contacts import services as contact_services
+        from civicsignals_api.modules.entities import services as entity_services
+
+        entity = await entity_services.get_entity(session, entity_id)
+        if entity is not None:
+            entity_name = entity.name
+        # Over-fetch so dropping known-bad rows (bounced/invalid) does not starve the
+        # list below the cap when an entity carries a few dead contacts. The contacts
+        # module's list is status-agnostic (shared with the entity profile), so we do
+        # the usability filter + verified-first ordering here, in the consuming view.
+        contact_page = await contact_services.list_contacts_for_entity(
+            session, entity_id, limit=SUGGESTED_CONTACTS_LIMIT * 2
+        )
+        usable_contacts = [
+            c for c in contact_page.items if c.status not in UNUSABLE_CONTACT_STATUSES
+        ]
+        # Surface verified/active contacts first so the most-actionable person leads;
+        # stable within each tier (the contacts module already orders by id).
+        usable_contacts.sort(
+            key=lambda c: (not c.verified, c.status != "active"),
+        )
+        suggested_contacts = [
+            SuggestedContact(
+                contact_id=c.id,
+                name=c.name,
+                title=c.title,
+                department=c.department,
+                canonical_email=c.canonical_email,
+                status=c.status,
+                verified=c.verified,
+            )
+            for c in usable_contacts[:SUGGESTED_CONTACTS_LIMIT]
+        ]
+        related_signals = await _related_signals_for_entity(
+            session,
+            entity_id=entity_id,
+            exclude_signal_id=signal_id,
+            limit=RELATED_SIGNALS_LIMIT,
+        )
+
+    source_documents = await _source_documents_for_signal(
+        session, [uuid.UUID(d) for d in signal.raw_document_ids]
+    )
+
+    return WorkspaceSignalDetail(
+        signal=SignalRead.model_validate(signal),
+        entity_id=entity_id,
+        entity_name=entity_name,
+        score=float(score_row.score) if score_row is not None else None,
+        status=score_row.status if score_row is not None else None,
+        score_breakdown=score_row.score_breakdown if score_row is not None else None,
+        matched_keywords=list(score_row.matched_keywords) if score_row is not None else [],
+        extracted_fields=dict(signal.details),
+        source_documents=source_documents,
+        suggested_contacts=suggested_contacts,
+        related_signals=related_signals,
+        feedback=user_feedback,
+    )
 
 
 async def list_workspace_signals(
@@ -1210,62 +2054,87 @@ __all__ = [
     "DEFAULT_FUZZY_CONFIG",
     "DEFAULT_LIMIT",
     "DEFAULT_SCORING_CONFIG",
+    "FEEDBACK_KINDS",
+    "FEEDBACK_NOT_RELEVANT",
+    "FEEDBACK_RELEVANT",
+    "FEEDBACK_SCORING_KINDS",
+    "FEEDBACK_WRONG_EXTRACTION",
     "FUZZY_COSINE_THRESHOLD",
     "GRADUATION_COUNT",
     "HIGH_STAKES_TYPES",
     "MAX_LIMIT",
     "PAYLOAD_BY_TYPE",
     "PUBLIC_SIGNAL_TYPES",
+    "RELATED_SIGNALS_LIMIT",
     "REVIEW_STATUS_APPROVED",
     "REVIEW_STATUS_PENDING",
     "REVIEW_STATUS_REJECTED",
+    "SETTABLE_FEEDBACK_KINDS",
     "SIGNAL_STATUS_MERGED",
+    "STATUS_TRANSITIONS",
+    "SUGGESTED_CONTACTS_LIMIT",
+    "UNUSABLE_CONTACT_STATUSES",
+    "USER_SETTABLE_STATUSES",
     "BandThresholds",
     "CandidateInput",
     "ConfidenceBand",
     "ConfidenceConfig",
     "ConfidenceWeights",
     "EmbeddingDimMismatchError",
+    "FeedbackKindError",
     "FuzzyDedupeConfig",
     "FuzzyDedupeResult",
     "FuzzyReviewAlreadyDecidedError",
     "FuzzyReviewNotFoundError",
     "FuzzyReviewSignalMissingError",
     "IcpCriteria",
+    "IllegalStatusTransitionError",
     "PublicSignalRead",
+    "RelatedSignal",
     "ScoreResult",
     "ScoringConfig",
     "SignalDimensions",
+    "SignalFeedback",
     "SignalFuzzyReview",
     "SignalPage",
     "SignalPayload",
     "SignalRead",
     "SignalSource",
+    "SignalSourceDocument",
     "SignalSourcesRead",
     "SignalType",
     "SignalValidationError",
+    "SuggestedContact",
     "WorkspaceFeedItem",
     "WorkspaceFeedPage",
     "WorkspaceScore",
+    "WorkspaceScoreNotFoundError",
     "WorkspaceScoreResult",
+    "WorkspaceSignalDetail",
     "backfill_embeddings",
     "build_embedding_text",
     "candidate_icp_filter",
     "candidate_signal_ids_for_icp",
+    "change_workspace_score_status",
+    "clear_signal_feedback",
     "compute_dedupe_hash",
     "compute_dedupe_hash_for_payload",
     "config_from_recipe",
     "decide_fuzzy_review",
     "decode_cursor",
     "dedupe_key_for_candidate",
+    "derive_signal_type_overrides",
     "embed_signals",
     "embedding_text_for_signal",
     "encode_cursor",
+    "feedback_counts_by_signal_type",
     "find_duplicate",
     "get_fuzzy_review",
     "get_public_signal",
     "get_signal",
+    "get_signal_detail",
     "get_signal_sources",
+    "get_user_signal_feedback",
     "is_high_stakes_type",
     "is_public_signal_type",
     "list_fuzzy_reviews",
@@ -1280,7 +2149,10 @@ __all__ = [
     "score_signal_for_all_workspaces",
     "score_signal_for_workspace",
     "score_workspace_candidates",
+    "scoring_config_for_workspace",
+    "set_signal_feedback",
     "signal_matches_icp",
     "store_signal",
     "window_for",
+    "workspace_wrong_extraction_count",
 ]

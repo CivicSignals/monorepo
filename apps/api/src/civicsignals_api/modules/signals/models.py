@@ -34,6 +34,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from civicsignals_api.db import Base
 from civicsignals_api.ids import uuid7
 
+# F5's per-(workspace, signal) user feedback table (doc 14 §12) likewise lives in its
+# own file; re-exported here for the same Alembic-autoload + single-import reasons.
+from .models_feedback import SignalFeedback  # noqa: F401
+
 # F3's sparse per-workspace score table (doc 14 §5) lives in its own module file to
 # keep the two concerns readable. Re-export it here so Alembic's ``env.py`` (which
 # imports ``modules/*/models.py``) autoloads it onto the shared metadata, and so
