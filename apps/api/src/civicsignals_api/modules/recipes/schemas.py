@@ -530,3 +530,78 @@ class ScorecardPageOut(BaseModel):
 
     items: list[RecipeScorecardOut]
     next_cursor: str | None = None
+
+
+# ----------------------------------------------------------------------------
+# QA-7: Extraction quality sampling schemas
+# ----------------------------------------------------------------------------
+
+
+class QualitySampleOut(BaseModel):
+    """API representation of one quality sample row (QA-7).
+
+    ``field_judgements`` is ``None`` until the sample has been reviewed.
+    ``overall_accuracy`` is the fraction correct/(correct+incorrect) over all
+    non-unknown fields; ``None`` when unreviewed or all fields are unknown.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str  # UUID as string
+    signal_id: str  # UUID as string
+    recipe_id: str
+    signal_type: str
+    field_snapshot: dict[str, object]
+    sample_window: str
+    sampled_at: datetime
+    field_judgements: dict[str, str] | None = None
+    overall_accuracy: float | None = None
+    reviewer: str | None = None
+    reviewed_at: datetime | None = None
+
+
+class QualitySampleListOut(BaseModel):
+    """Paginated list of quality samples."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[QualitySampleOut]
+    total: int
+
+
+class RecordFieldAccuracyIn(BaseModel):
+    """Request body for recording per-field accuracy on a quality sample (QA-7).
+
+    ``field_judgements`` maps field name → ``"correct" | "incorrect" | "unknown"``.
+    ``reviewer`` identifies who performed the review (email, user id, etc.).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    field_judgements: dict[str, str] = Field(min_length=1)
+    reviewer: str = Field(min_length=1, max_length=255)
+
+
+class RecipeAccuracyOut(BaseModel):
+    """Per-recipe accuracy rollup (QA-7).
+
+    Aggregates reviewed quality sample accuracy for one recipe, optionally
+    scoped to a single ISO-week window.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str
+    sample_count: int
+    reviewed_count: int
+    overall_accuracy: float | None = None
+    field_accuracy: dict[str, float]
+    window: str | None = None
+
+
+class RecipeAccuracyListOut(BaseModel):
+    """List of per-recipe accuracy rollups (QA-7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[RecipeAccuracyOut]

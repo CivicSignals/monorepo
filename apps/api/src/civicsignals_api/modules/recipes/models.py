@@ -27,6 +27,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from civicsignals_api.db import Base
 
+# ---------------------------------------------------------------------------
+# QA-7: Extraction quality sampling
+# ---------------------------------------------------------------------------
+
 
 def _new_uuid() -> uuid.UUID:
     """Application-side UUID v4 default.
@@ -196,3 +200,82 @@ class DriftState(Base):
     )
 
     __table_args__ = (UniqueConstraint("recipe_id", name="recipes_drift_state_recipe_uq"),)
+
+
+class QualitySample(Base):
+    """One sampled signal in the weekly extraction quality review queue (QA-7).
+
+    The weekly beat task (``recipes.sample_extraction_quality``) draws ~N random
+    recent signals from ``signals_signal`` and creates one row here per signal for
+    human review. The row captures:
+
+    - Which signal was sampled (``signal_id`` — loose UUID ref, no cross-module FK;
+      doc 06 §3 forbids FK across module boundaries. ``signal_id`` points to
+      ``signals_signal.id`` by convention).
+    - The producing recipe + signal type (provenance, denormalised from the signal
+      at sample time so the sample is self-contained even if the signal changes).
+    - The extracted field-value **snapshot** at sample time (``field_snapshot``),
+      i.e. ``signals_signal.details`` captured when the row was created. This is
+      what the reviewer is assessing — the exact values the extractor produced.
+    - Per-field accuracy judgements (``field_judgements``): a JSONB map
+      ``{field_name: "correct" | "incorrect" | "unknown"}``. Populated by the
+      review endpoint; ``unknown`` means the reviewer could not assess that field.
+    - ``overall_accuracy``: fraction of ``correct`` / (``correct`` + ``incorrect``)
+      fields. Recomputed by the service each time field judgements are recorded.
+    - ``reviewer``: free-form string identifying who reviewed (user email / id).
+    - ``reviewed_at``: when the review was recorded; ``None`` = pending review.
+    - ``sample_window``: the ISO-week label (e.g. ``'2026-W21'``) used for the
+      idempotency guard — the beat task will not re-sample the same week.
+
+    Owned solely by the ``recipes`` module (table prefix ``recipes_``).
+    """
+
+    __tablename__ = "recipes_quality_sample"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=_new_uuid,
+    )
+
+    # Loose ref to signals_signal.id — no FK across module boundary (doc 06 §3).
+    signal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+
+    # Provenance — denormalised from the signal at sample time.
+    recipe_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    signal_type: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # Snapshot of the extracted fields at the time of sampling (signals_signal.details).
+    field_snapshot: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+
+    # ISO-week label for the idempotency guard (e.g. "2026-W21").
+    sample_window: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    sampled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # Review fields — all nullable until reviewed.
+    # Per-field judgements: {field_name: "correct" | "incorrect" | "unknown"}.
+    field_judgements: Mapped[dict[str, str] | None] = mapped_column(JSONB, nullable=True)
+    # Fraction of correct / (correct + incorrect) judged fields; recomputed on record.
+    overall_accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Free-form reviewer identifier (e.g. email, user id, "system").
+    reviewer: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # Primary lookup: pending samples for a recipe in a given week.
+        Index(
+            "ix_recipes_quality_sample_recipe_window",
+            "recipe_id",
+            "sample_window",
+        ),
+        # Secondary lookup: all samples for a given week (operator dashboard).
+        Index("ix_recipes_quality_sample_window_sampled", "sample_window", "sampled_at"),
+    )

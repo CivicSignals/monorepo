@@ -37,6 +37,8 @@ celery_app.conf.task_routes = {
     "integrations.*": {"queue": "notify"},
     # M5: FOIA reminder emails are notification-flavoured work — notify worker.
     "foia.*": {"queue": "notify"},
+    # QA-7: quality sampling reads signals_signal — score worker has that access.
+    "recipes.sample_extraction_quality": {"queue": "score"},
 }
 
 # Beat schedule (doc 06 §8). Tasks are defined in each module's tasks.py.
@@ -100,6 +102,13 @@ celery_app.conf.beat_schedule = {
     "foia.send_foia_reminders": {
         "task": "foia.send_foia_reminders",
         "schedule": crontab(minute=0, hour="*/6"),
+    },
+    # QA-7: weekly extraction quality sampling. Runs every Monday at 06:00 UTC
+    # (after the week's runs have accumulated enough signals). Idempotent per
+    # ISO-week: a retry or accidental double-fire does not re-sample the same week.
+    "recipes.sample_extraction_quality": {
+        "task": "recipes.sample_extraction_quality",
+        "schedule": crontab(hour=6, minute=0, day_of_week=1),
     },
 }
 
