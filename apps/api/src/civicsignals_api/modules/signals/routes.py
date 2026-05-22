@@ -15,6 +15,7 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
   GET  /signals/{id}/detail                  — workspace-scoped signal detail (G2)
   PATCH /signals/{id}/status                 — transition the per-workspace status (G4)
+  POST /signals/bulk-status                  — bulk-transition many signals' status (G3)
   POST /signals/{id}/feedback                — record / change / retract user feedback (F5)
   GET  /signals/{id}                         — get one signal
 
@@ -41,7 +42,7 @@ from typing import Annotated, Literal
 import structlog
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api import events
@@ -195,7 +196,8 @@ async def get_workspace_feed(
     the workspace id comes from the resolved :class:`WorkspaceContext`, never from
     a query param, so one workspace cannot read another's feed (doc 08 §1.4).
 
-    TODO G3: bulk actions (dismiss/pin batch) build on this feed.
+    G3: bulk actions (mass dismiss / pin) are the ``POST /signals/bulk-status`` endpoint
+    below (``change_status_bulk``), built on the same per-workspace score rows.
     G4: single-row status transitions are the ``PATCH /signals/{id}/status`` endpoint
     below (``change_status``).
     TODO G5: polished loading/empty/error states (the UI leaves seams for these).
@@ -603,6 +605,130 @@ async def change_status(
         log.warning("signal_status_changed_event_failed", signal_id=str(signal_id))
 
     return StatusChangeRead(score_id=row.id, signal_id=signal_id, status=row.status)
+
+
+# ---------------------------------------------------------------------------
+# G3 bulk status-transition endpoint — workspace-scoped mass dismiss / pin.
+#
+# IMPORTANT: registered before the bare ``/{signal_id}`` (below) so FastAPI matches
+# the static ``/bulk-status`` prefix first (it would otherwise be captured as a
+# ``signal_id`` path param).
+# ---------------------------------------------------------------------------
+
+
+class BulkStatusChangeIn(BaseModel):
+    """Request body for the G3 bulk status transition (doc 14 §5.3).
+
+    ``signal_ids`` is the multi-selected set; ``status`` is the single target applied to
+    each. The list is length-bounded at the schema layer (≥ 1, ≤
+    :data:`~signals.services.MAX_BULK_STATUS_BATCH`) so an empty or over-large request is
+    a 422 (request validation) before the service runs. ``pushed`` is excluded from the
+    settable Literal — it is owned by the K-epic CRM-push flow, never this human PATCH.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal_ids: Annotated[
+        list[uuid.UUID],
+        Field(min_length=1, max_length=services.MAX_BULK_STATUS_BATCH),
+    ]
+    status: SettableStatus
+
+
+class BulkStatusSkipRead(BaseModel):
+    """One signal that could not be transitioned in a bulk request (G3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal_id: uuid.UUID
+    # Stable reason code: ``not_in_workspace`` | ``illegal_transition``.
+    reason: str
+    # Current status when known (None when the signal has no score row here).
+    current: str | None = None
+
+
+class BulkStatusChangeRead(BaseModel):
+    """The per-item outcome of a G3 bulk status transition (doc 14 §5.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    succeeded: list[uuid.UUID]
+    skipped: list[BulkStatusSkipRead]
+
+
+@router.post(
+    "/bulk-status",
+    response_model=BulkStatusChangeRead,
+    summary="Bulk-transition signals' per-workspace status (G3)",
+)
+async def change_status_bulk(
+    ctx: RequireMember,
+    session: SessionDep,
+    body: Annotated[BulkStatusChangeIn, Body()],
+) -> BulkStatusChangeRead | JSONResponse:
+    """Bulk-transition many signals' ``signals_workspace_score.status`` (G3, mass actions).
+
+    The multi-select triage action (mass dismiss / mass pin, doc 14 §5.3). Applies one
+    target ``status`` to every selected signal's score row, reusing the same transition
+    graph as the G4 single PATCH. **Resilient**: a signal with no score row in this
+    workspace, or whose current status forbids the move, is reported in ``skipped`` (with
+    a reason) rather than failing the whole batch — the legal moves still apply.
+
+    Member-gated (``RequireMember``: viewers cannot mutate workspace data, B7) and
+    workspace-scoped — rows are read by ``(workspace_id, signal_id IN …)`` from the
+    resolved :class:`WorkspaceContext` (never a body/query param), so one workspace can
+    never transition another's rows (doc 08 §1.4). The batch is bounded
+    (``services.MAX_BULK_STATUS_BATCH``); the request schema rejects an over-large or
+    empty selection as a 422 before the service runs.
+
+    The ``pushed`` state is not settable here (K-epic-owned, doc 14 §5.3); the schema's
+    ``Literal`` rejects it as a 422.
+
+    Emits one :data:`~civicsignals_api.events.SIGNAL_STATUS_CHANGED` per successfully
+    transitioned signal so B9's audit listener records each change (best-effort; a failed
+    audit never fails the action). Idempotent no-ops (a row already at the target) count
+    as succeeded but emit no audit event.
+    """
+    try:
+        result = await services.change_workspace_score_status_bulk(
+            session,
+            workspace_id=ctx.workspace.id,
+            signal_ids=body.signal_ids,
+            target_status=body.status,
+        )
+    except services.BulkStatusBatchTooLargeError as exc:  # pragma: no cover - schema caps first
+        return _problem(
+            422,
+            "Bulk status batch too large",
+            f"Requested {exc.count} signals; the per-request limit is {exc.limit}.",
+        )
+    await session.commit()
+
+    # Best-effort audit (B9 persists), one event per actually-transitioned signal. A
+    # broken audit sink must not fail the action.
+    for signal_id in result.succeeded:
+        try:
+            await events.publish(
+                events.SIGNAL_STATUS_CHANGED,
+                {
+                    "signal_id": str(signal_id),
+                    "workspace_id": str(ctx.workspace.id),
+                    "user_id": str(ctx.user.id),
+                    "status": result.target_status,
+                },
+            )
+        except Exception:  # pragma: no cover - defensive; audit is fire-and-forget
+            log.warning("signal_status_changed_event_failed", signal_id=str(signal_id))
+
+    return BulkStatusChangeRead(
+        status=result.target_status,
+        succeeded=result.succeeded,
+        skipped=[
+            BulkStatusSkipRead(signal_id=s.signal_id, reason=s.reason, current=s.current)
+            for s in result.skipped
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------

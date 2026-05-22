@@ -29,6 +29,14 @@ vi.mock("@/hooks/use-signals", () => ({
     isError: false,
     error: null,
   }),
+  // FeedList renders BulkActionBar (G3), which calls useBulkChangeSignalStatus —
+  // stub it as an idle mutation too.
+  useBulkChangeSignalStatus: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
   feedKeys: {
     all: ["signals-feed"],
     workspace: (id: string | null) => ["signals-feed", id ?? "none"],
@@ -307,6 +315,67 @@ describe("FeedList — filter interaction", () => {
     mockUseWorkspaceFeed.mockReturnValue(stubLoaded([makePage([])]) as MockReturn);
     render(<FeedList />, { wrapper });
     expect(screen.queryByTestId("filter-signal-type")).toBeNull();
+  });
+});
+
+describe("FeedList — multi-select (G3)", () => {
+  it("hides the bulk-action bar until a row is selected", () => {
+    mockUseWorkspaceFeed.mockReturnValue(
+      stubLoaded([makePage([makeItem({ title: "RFP A" })])]) as MockReturn,
+    );
+    render(<FeedList />, { wrapper });
+    expect(screen.queryByTestId("bulk-action-bar")).toBeNull();
+  });
+
+  it("selecting a row reveals the bulk-action bar with the count", () => {
+    mockUseWorkspaceFeed.mockReturnValue(
+      stubLoaded([
+        makePage([makeItem({ title: "RFP A" }), makeItem({ title: "RFP B" })]),
+      ]) as MockReturn,
+    );
+    render(<FeedList />, { wrapper });
+    const checkboxes = screen.getAllByTestId("feed-item-select");
+    fireEvent.click(checkboxes[0]);
+    expect(screen.getByTestId("bulk-action-bar")).toBeTruthy();
+    expect(screen.getByTestId("bulk-selected-count").textContent).toBe(
+      "1 selected",
+    );
+  });
+
+  it("select-all-visible selects every row, and toggles off", () => {
+    mockUseWorkspaceFeed.mockReturnValue(
+      stubLoaded([
+        makePage([makeItem({ title: "RFP A" }), makeItem({ title: "RFP B" })]),
+      ]) as MockReturn,
+    );
+    render(<FeedList />, { wrapper });
+    const selectAll = screen.getByTestId("feed-select-all");
+    fireEvent.click(selectAll);
+    expect(screen.getByTestId("bulk-selected-count").textContent).toBe(
+      "2 selected",
+    );
+    // Toggling again clears the selection (bar disappears).
+    fireEvent.click(selectAll);
+    expect(screen.queryByTestId("bulk-action-bar")).toBeNull();
+  });
+
+  it("toggling a selected row off updates the count", () => {
+    mockUseWorkspaceFeed.mockReturnValue(
+      stubLoaded([
+        makePage([makeItem({ title: "RFP A" }), makeItem({ title: "RFP B" })]),
+      ]) as MockReturn,
+    );
+    render(<FeedList />, { wrapper });
+    const checkboxes = screen.getAllByTestId("feed-item-select");
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+    expect(screen.getByTestId("bulk-selected-count").textContent).toBe(
+      "2 selected",
+    );
+    fireEvent.click(checkboxes[0]);
+    expect(screen.getByTestId("bulk-selected-count").textContent).toBe(
+      "1 selected",
+    );
   });
 });
 

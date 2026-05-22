@@ -11,8 +11,9 @@
 //
 // Seams:
 // - G2 (done): feed rows link through to the signal detail page at /signals/[id].
-// - TODO G3: bulk actions (dismiss/pin batch).
-// - TODO G4: per-signal status transitions.
+// - G3 (done): bulk actions (mass dismiss / pin) — multi-select + BulkActionBar live
+//   inside FeedList.
+// - G4 (done): per-signal status transitions (StatusControls on each feed row).
 // - TODO G5: polished loading/empty/error states (leave the FeedList seams).
 
 "use client";
@@ -57,7 +58,7 @@ function FeedPageInner() {
 
   return (
     <>
-      {/* TODO G3: bulk action bar */}
+      {/* G3: the bulk-action bar lives inside FeedList (it owns the multi-select state). */}
       {/* TODO G5: polished empty / error states */}
       <FeedList filters={filters} onFiltersChange={handleFiltersChange} />
     </>

@@ -335,6 +335,56 @@ export function changeSignalStatus(
   );
 }
 
+// ---- Bulk status transitions (G3) -------------------------------------------
+
+/**
+ * The largest bulk-status batch the API accepts in one request (mirrors
+ * ``services.MAX_BULK_STATUS_BATCH``). The UI caps a multi-select at this so the
+ * request is never rejected for size.
+ */
+export const MAX_BULK_STATUS_BATCH = 200;
+
+/** One signal that could not be transitioned in a bulk request (G3). */
+export interface BulkStatusSkip {
+  signal_id: string;
+  /** Stable reason code: ``not_in_workspace`` | ``illegal_transition``. */
+  reason: string;
+  /** Current status when known (null when the signal had no score row here). */
+  current: string | null;
+}
+
+/** Response of the G3 bulk PATCH: the per-item outcome (succeeded + skipped). */
+export interface BulkStatusChangeRead {
+  status: FeedStatus;
+  succeeded: string[];
+  skipped: BulkStatusSkip[];
+}
+
+/**
+ * Bulk-transition many signals' per-workspace status in one request (G3, mass actions).
+ *
+ * POSTs ``{ signal_ids, status }`` to apply one target status to every selected signal's
+ * score row, reusing the G4 transition graph per item. Resilient: a signal with no score
+ * row in this workspace, or an illegal transition, is reported in ``skipped`` (with a
+ * reason) rather than failing the whole batch. The batch is bounded
+ * ({@link MAX_BULK_STATUS_BATCH}); an over-large / empty selection is a 422. Workspace-
+ * scoped via X-Workspace-Id (doc 08 §1.4); member-gated server-side (B7).
+ */
+export function changeSignalStatusBulk(
+  token: string,
+  workspaceId: string,
+  signalIds: string[],
+  status: SettableStatus,
+): Promise<BulkStatusChangeRead> {
+  return request<BulkStatusChangeRead>("/signals/bulk-status", {
+    method: "POST",
+    token,
+    workspaceId,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ signal_ids: signalIds, status }),
+  });
+}
+
 // ---- Feedback (F5; doc 14 §12) ----------------------------------------------
 
 /** Response of the F5 feedback POST/DELETE: the signal + its recorded kind. */

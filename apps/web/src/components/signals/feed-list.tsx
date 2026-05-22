@@ -16,6 +16,7 @@
 
 "use client";
 
+import { useCallback, useMemo, useState } from "react";
 import Link from "next/link";
 import type {
   FeedItemRead,
@@ -27,6 +28,7 @@ import type {
 import { SIGNAL_TYPE_LABELS } from "@/lib/signals-api";
 import { useWorkspaceFeed } from "@/hooks/use-signals";
 import { StatusControls } from "@/components/signals/status-controls";
+import { BulkActionBar } from "@/components/signals/bulk-action-bar";
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -65,7 +67,15 @@ function topWhyBullet(breakdown: Record<string, unknown>): string | null {
 
 // ---- Sub-components ---------------------------------------------------------
 
-function FeedItemCard({ item }: { item: FeedItemRead }) {
+function FeedItemCard({
+  item,
+  selected,
+  onToggleSelect,
+}: {
+  item: FeedItemRead;
+  selected: boolean;
+  onToggleSelect: (signalId: string) => void;
+}) {
   const { label: bandLabel, className: bandClass } = scoreBand(item.score);
   const sig = item.signal;
   const why = topWhyBullet(item.score_breakdown);
@@ -73,10 +83,23 @@ function FeedItemCard({ item }: { item: FeedItemRead }) {
   return (
     <article
       data-testid="feed-item"
-      className="border border-gray-200 rounded-lg p-4 hover:border-gray-300 hover:shadow-sm transition-all bg-white"
+      data-selected={selected ? "true" : "false"}
+      className={`border rounded-lg p-4 hover:border-gray-300 hover:shadow-sm transition-all bg-white ${
+        selected ? "border-indigo-300 ring-1 ring-indigo-200" : "border-gray-200"
+      }`}
       aria-label={sig.title}
     >
-      <div className="flex items-start justify-between gap-4">
+      <div className="flex items-start gap-3">
+        {/* Multi-select checkbox (G3) */}
+        <input
+          type="checkbox"
+          data-testid="feed-item-select"
+          aria-label={`Select ${sig.title}`}
+          checked={selected}
+          onChange={() => onToggleSelect(sig.id)}
+          className="mt-1 h-4 w-4 flex-shrink-0 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+        />
+        <div className="flex flex-1 items-start justify-between gap-4 min-w-0">
         <div className="flex-1 min-w-0">
           {/* Title + type */}
           <div className="flex items-center gap-2 flex-wrap mb-1">
@@ -146,6 +169,7 @@ function FeedItemCard({ item }: { item: FeedItemRead }) {
           <div className="text-[11px] text-gray-400 mt-0.5 tabular-nums">
             {item.score.toFixed(0)}/100
           </div>
+        </div>
         </div>
       </div>
     </article>
@@ -281,7 +305,49 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
   const { data, isLoading, isError, error, fetchNextPage, hasNextPage, isFetchingNextPage } =
     useWorkspaceFeed(queryFilters);
 
-  const allItems = data?.pages.flatMap((p) => p.data) ?? [];
+  const allItems = useMemo(
+    () => data?.pages.flatMap((p) => p.data) ?? [],
+    [data],
+  );
+
+  // ---- Multi-select state (G3) ----------------------------------------------
+  // Ephemeral, view-local client state (not workspace-level), so it lives in React
+  // state here rather than Zustand (doc 06 §2). Keyed by signal id (stable across the
+  // feed refetch the bulk mutation triggers on settle).
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const visibleIds = useMemo(
+    () => allItems.map((item) => item.signal.id),
+    [allItems],
+  );
+  const selectedList = useMemo(
+    // Only count ids that are still visible — a refetch may have dropped some rows
+    // (e.g. dismissed signals leave the default visible set) out from under us.
+    () => visibleIds.filter((id) => selectedIds.has(id)),
+    [visibleIds, selectedIds],
+  );
+  const allVisibleSelected =
+    visibleIds.length > 0 && selectedList.length === visibleIds.length;
+
+  const toggleSelect = useCallback((signalId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(signalId)) next.delete(signalId);
+      else next.add(signalId);
+      return next;
+    });
+  }, []);
+
+  const toggleSelectAll = useCallback(() => {
+    setSelectedIds((prev) => {
+      // If every visible row is already selected, clear; otherwise select all visible.
+      const everySelected =
+        visibleIds.length > 0 && visibleIds.every((id) => prev.has(id));
+      return everySelected ? new Set() : new Set(visibleIds);
+    });
+  }, [visibleIds]);
+
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
 
   return (
     <div className="space-y-4">
@@ -289,6 +355,9 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
       {onFiltersChange && (
         <FilterBar filters={filters} onChange={onFiltersChange} />
       )}
+
+      {/* Bulk-action bar (G3) — appears when ≥ 1 row is selected. */}
+      <BulkActionBar selectedIds={selectedList} onClear={clearSelection} />
 
       {/* Loading state — TODO G5: replace with skeleton */}
       {isLoading && (
@@ -329,13 +398,36 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
 
       {/* Feed items */}
       {allItems.length > 0 && (
-        <ul className="space-y-3" data-testid="feed-list" aria-label="Signal feed">
-          {allItems.map((item) => (
-            <li key={item.score_id}>
-              <FeedItemCard item={item} />
-            </li>
-          ))}
-        </ul>
+        <>
+          {/* Select-all-visible header (G3) */}
+          <div className="flex items-center gap-2 px-1">
+            <input
+              type="checkbox"
+              data-testid="feed-select-all"
+              aria-label="Select all visible signals"
+              checked={allVisibleSelected}
+              onChange={toggleSelectAll}
+              className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+            />
+            <label className="text-xs text-gray-500">
+              {selectedList.length > 0
+                ? `${selectedList.length} selected`
+                : "Select all"}
+            </label>
+          </div>
+
+          <ul className="space-y-3" data-testid="feed-list" aria-label="Signal feed">
+            {allItems.map((item) => (
+              <li key={item.score_id}>
+                <FeedItemCard
+                  item={item}
+                  selected={selectedIds.has(item.signal.id)}
+                  onToggleSelect={toggleSelect}
+                />
+              </li>
+            ))}
+          </ul>
+        </>
       )}
 
       {/* Load more */}

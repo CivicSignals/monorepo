@@ -1045,6 +1045,167 @@ async def change_workspace_score_status(
 
 
 # ---------------------------------------------------------------------------
+# Bulk per-workspace status transitions (G3, doc 14 §5.3 — "mass dismiss / pin")
+# ---------------------------------------------------------------------------
+#
+# G3 is multi-select triage: the user selects N feed rows and mass-applies one status
+# (dismiss / pin / …). It reuses the G4 transition rules per item but is **resilient** —
+# a single bad id (not in the workspace, or an illegal transition from its current
+# state) is reported in the result rather than aborting the whole batch. The batch is
+# bounded (:data:`MAX_BULK_STATUS_BATCH`) so one request can't fan out unboundedly.
+#
+# Efficiency: all candidate rows are read in **one** indexed query (the
+# ``(workspace_id, signal_id)`` set), the legal transitions are applied in memory, and
+# a single ``flush`` persists them — N transitions, one round-trip + one transaction.
+
+# The largest bulk status batch we accept in one request (G3). A request over this is
+# rejected before any row is touched (the route maps it to a 422). Keeps the single
+# read query + the in-memory transition pass bounded.
+MAX_BULK_STATUS_BATCH: int = 200
+
+# Per-item skip reasons surfaced in the bulk result (stable string codes the UI/SDK can
+# branch on without parsing prose).
+BULK_SKIP_NOT_IN_WORKSPACE = "not_in_workspace"
+BULK_SKIP_ILLEGAL_TRANSITION = "illegal_transition"
+
+
+class BulkStatusBatchTooLargeError(Exception):
+    """A bulk status request exceeded :data:`MAX_BULK_STATUS_BATCH` (G3 → 422).
+
+    Carries the offending ``count`` + the ``limit`` so the route can surface an explicit
+    RFC 7807 422 the UI can act on (trim the selection) before any row is mutated.
+    """
+
+    def __init__(self, count: int, limit: int) -> None:
+        self.count = count
+        self.limit = limit
+        super().__init__(f"bulk status batch of {count} exceeds the limit of {limit}")
+
+
+@dataclass(slots=True)
+class BulkStatusSkip:
+    """One signal that could not be transitioned in a bulk request (G3).
+
+    ``reason`` is a stable code (:data:`BULK_SKIP_NOT_IN_WORKSPACE` /
+    :data:`BULK_SKIP_ILLEGAL_TRANSITION`); ``current`` is the row's current status when
+    known (``None`` when the signal has no score row in the workspace).
+    """
+
+    signal_id: uuid.UUID
+    reason: str
+    current: str | None = None
+
+
+@dataclass(slots=True)
+class BulkStatusResult:
+    """The per-item outcome of a bulk status transition (G3, doc 14 §5.3).
+
+    ``succeeded`` lists the signal ids whose score row now holds ``target_status``
+    (including idempotent no-ops — the row already held it). ``skipped`` carries the
+    ids that could not be transitioned, each with a reason. A duplicate id in the
+    request is collapsed (de-duplicated) before processing, so each id appears at most
+    once across the two lists.
+    """
+
+    target_status: str
+    succeeded: list[uuid.UUID] = field(default_factory=list)
+    skipped: list[BulkStatusSkip] = field(default_factory=list)
+
+
+async def change_workspace_score_status_bulk(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_ids: Sequence[uuid.UUID],
+    target_status: str,
+) -> BulkStatusResult:
+    """Bulk-transition many ``signals_workspace_score`` rows in one request (G3).
+
+    The multi-select triage seam (mass dismiss / mass pin, doc 14 §5.3). Reuses the
+    G4 transition graph (:data:`STATUS_TRANSITIONS`) per item but is **resilient**: a
+    signal that has no score row in the calling workspace, or whose current status does
+    not permit the move, is recorded in :attr:`BulkStatusResult.skipped` rather than
+    failing the whole batch. An idempotent no-op (the row already holds the target)
+    counts as a success.
+
+    Workspace-scoped: rows are read by ``(workspace_id, signal_id IN …)`` from the
+    resolved context, so workspace A can never mutate workspace B's rows (doc 14 §5.3,
+    doc 08 §1.4). All candidate rows are loaded in **one** query and persisted with a
+    **single** flush — N transitions cost one round-trip + one transaction.
+
+    Raises:
+    - :class:`ValueError` — ``target_status`` is not a known status (the route should
+      have rejected it at the schema layer; defensive backstop).
+    - :class:`BulkStatusBatchTooLargeError` — more than :data:`MAX_BULK_STATUS_BATCH`
+      ids (route → 422). Checked before any row is read, so an over-large request
+      mutates nothing.
+
+    The caller owns the transaction (this flushes, not commits). Cross-module callers
+    reach this through ``signals.services`` (never the model directly — doc 06 §3).
+    """
+    if target_status not in SCORE_STATUSES:
+        raise ValueError(f"unknown status {target_status!r}")
+
+    # De-duplicate, preserving first-seen order, so a repeated id is one outcome.
+    unique_ids = _ordered_unique(list(signal_ids))
+    if len(unique_ids) > MAX_BULK_STATUS_BATCH:
+        raise BulkStatusBatchTooLargeError(len(unique_ids), MAX_BULK_STATUS_BATCH)
+
+    result = BulkStatusResult(target_status=target_status)
+    if not unique_ids:
+        return result
+
+    # One indexed read for the whole batch (the (workspace_id, signal_id) set).
+    rows = list(
+        (
+            await session.execute(
+                select(WorkspaceScore)
+                .where(WorkspaceScore.workspace_id == workspace_id)
+                .where(WorkspaceScore.signal_id.in_(unique_ids))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_signal: dict[uuid.UUID, WorkspaceScore] = {row.signal_id: row for row in rows}
+
+    mutated = False
+    for signal_id in unique_ids:
+        row = by_signal.get(signal_id)
+        if row is None:
+            # No score row for this signal in the workspace — nothing to transition.
+            result.skipped.append(
+                BulkStatusSkip(signal_id=signal_id, reason=BULK_SKIP_NOT_IN_WORKSPACE)
+            )
+            continue
+
+        current = row.status
+        if target_status == current:
+            # Idempotent no-op: the row already holds the target.
+            result.succeeded.append(signal_id)
+            continue
+
+        allowed = STATUS_TRANSITIONS.get(current, frozenset())
+        if target_status not in allowed:
+            result.skipped.append(
+                BulkStatusSkip(
+                    signal_id=signal_id,
+                    reason=BULK_SKIP_ILLEGAL_TRANSITION,
+                    current=current,
+                )
+            )
+            continue
+
+        row.status = target_status
+        result.succeeded.append(signal_id)
+        mutated = True
+
+    if mutated:
+        await session.flush()
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Per-(workspace, signal) feedback loop (F5, doc 14 §12 "negative training")
 # ---------------------------------------------------------------------------
 #

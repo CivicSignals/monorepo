@@ -17,6 +17,7 @@ import {
   type InfiniteData,
 } from "@tanstack/react-query";
 import {
+  type BulkStatusChangeRead,
   type FeedbackKind,
   type FeedbackRead,
   type FeedFilters,
@@ -27,6 +28,7 @@ import {
   type StatusChangeRead,
   FEED_PAGE_LIMIT,
   changeSignalStatus,
+  changeSignalStatusBulk,
   getSignalDetail,
   listFeedSignals,
   retractSignalFeedback,
@@ -222,6 +224,96 @@ export function useChangeSignalStatus() {
       });
       void queryClient.invalidateQueries({
         queryKey: feedKeys.detail(workspaceId, signalId),
+      });
+    },
+  });
+}
+
+// ---- useBulkChangeSignalStatus (G3) -----------------------------------------
+
+/** Variables for the G3 bulk status mutation: which signals, and the target status. */
+export interface BulkChangeStatusVars {
+  signalIds: string[];
+  status: SettableStatus;
+}
+
+/** Snapshot of the feed caches we touched, kept so onError can roll the UI back. */
+interface BulkStatusRollback {
+  feed: Array<[readonly unknown[], InfiniteData<FeedPage> | undefined]>;
+}
+
+/** Apply ``status`` to every feed item whose signal id is in ``ids`` across all pages. */
+function patchFeedStatusMany(
+  data: InfiniteData<FeedPage> | undefined,
+  ids: Set<string>,
+  status: SettableStatus,
+): InfiniteData<FeedPage> | undefined {
+  if (!data) return data;
+  return {
+    ...data,
+    pages: data.pages.map((page) => ({
+      ...page,
+      data: page.data.map((item: FeedItemRead) =>
+        ids.has(item.signal.id) ? { ...item, status } : item,
+      ),
+    })),
+  };
+}
+
+/**
+ * Mutation hook for the G3 bulk status transition (mass dismiss / mass pin).
+ *
+ * Optimistically applies ``status`` to every selected signal across the cached feed
+ * lists, rolls back on error, and invalidates the workspace's feed queries on settle so
+ * the server (the source of truth for which rows actually transitioned, and the
+ * resulting feed ordering / visibility) wins. The clearing of the selection itself is
+ * the caller's responsibility (the bulk-action bar clears on success).
+ *
+ * Server state only — the optimistic write lives in the TanStack Query cache, never
+ * Zustand. The POST is workspace-scoped + member-gated server-side (B7).
+ */
+export function useBulkChangeSignalStatus() {
+  const { token, workspaceId } = useAuth();
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    BulkStatusChangeRead,
+    Error,
+    BulkChangeStatusVars,
+    BulkStatusRollback
+  >({
+    mutationFn: ({ signalIds, status }) => {
+      if (!token || !workspaceId)
+        return Promise.reject(new Error("not authenticated"));
+      return changeSignalStatusBulk(token, workspaceId, signalIds, status);
+    },
+    onMutate: async ({ signalIds, status }) => {
+      await queryClient.cancelQueries({
+        queryKey: feedKeys.workspace(workspaceId),
+      });
+      const feed = queryClient.getQueriesData<InfiniteData<FeedPage>>({
+        queryKey: [...feedKeys.workspace(workspaceId), "list"],
+      });
+      const ids = new Set(signalIds);
+      for (const [key] of feed) {
+        queryClient.setQueryData<InfiniteData<FeedPage>>(key, (old) =>
+          patchFeedStatusMany(old, ids, status),
+        );
+      }
+      return { feed };
+    },
+    onError: (_err, _vars, context) => {
+      if (!context) return;
+      for (const [key, snapshot] of context.feed) {
+        queryClient.setQueryData(key, snapshot);
+      }
+    },
+    onSettled: () => {
+      // Re-sync from the server: only some rows may have transitioned (partial
+      // failure), and the feed ordering / visibility can shift (dismissed rows drop
+      // out of the default visible set).
+      void queryClient.invalidateQueries({
+        queryKey: feedKeys.workspace(workspaceId),
       });
     },
   });
