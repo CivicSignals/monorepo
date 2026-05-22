@@ -1,0 +1,49 @@
+# Example recipe — higher-ed entity directory via IPEDS (doc 18 §5 wave 3 #17).
+# Instantiates the `ipeds` bulk-import connector (TODO D8). An ENTITY DIRECTORY,
+# not a signal stream (doc 16 §6): each row resolves to a higher-ed Entity by its
+# stable IPEDS UNITID (doc 18 §2.4 step 5), so `signal_types` is empty. The fixture
+# is one directory row projected to the `dd[data-key=...]` form the runner
+# extracts. Public domain; checkpointed download.
+recipe_id: ipeds-highered-directory
+connector: ipeds
+version: 1
+
+entity:
+  entity_id: ipeds:228778
+  name: The University of Texas at Austin
+  state: TX
+  kind: university
+
+schedule:
+  cron: "0 4 1 * *" # monthly (IPEDS updates per survey year; checkpointing no-ops between)
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  ipeds:
+    # Defaults to the current IPEDS HD directory file; override to pin a survey year.
+    checkpoint_strategy: etag
+
+fields:
+  name:
+    selectors:
+      - "dd[data-key='INSTNM']"
+    required: true
+  ipeds_unit_id:
+    selectors:
+      - "dd[data-key='UNITID']"
+    required: true
+  state:
+    selectors:
+      - "dd[data-key='STABBR']"
+    required: false
+  website:
+    selectors:
+      - "dd[data-key='WEBADDR']"
+    required: false
+
+signal_types: []

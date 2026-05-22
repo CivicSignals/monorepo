@@ -1,0 +1,49 @@
+# Example recipe — SLED news mentions via the GDELT 2.0 DOC API
+# (doc 18 §5 wave 3 #15). Instantiates the `gdelt` connector (TODO D8) over the
+# free, keyless news-search API. Synthetic example: demonstrates the GDELT boolean
+# query + the `dd[data-key=...]` selectors over the connector's JSON->HTML
+# projection. Open data; no auth.
+recipe_id: gdelt-sled-news
+connector: gdelt
+version: 1
+
+entity:
+  name: Austin Independent School District
+  state: TX
+  kind: school_district
+
+schedule:
+  cron: "0 */6 * * *" # every 6 hours
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  gdelt:
+    query: '"Austin ISD" OR "Austin Independent School District" sourcecountry:US'
+    timespan: "1d"
+    max_records: 75
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='title']"
+    required: true
+  source_url:
+    selectors:
+      - "dd[data-key='url']"
+    required: true
+  source_domain:
+    selectors:
+      - "dd[data-key='domain']"
+    required: false
+  seen_date:
+    selectors:
+      - "dd[data-key='seendate']"
+    required: false
+
+signal_types:
+  - news_mention

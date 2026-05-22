@@ -27,6 +27,23 @@ entities via per-tenant recipes — TODO D7):
   shared base (:mod:`._meeting_platform`) crawls the tenant's meeting index and
   emits one pointer per detail page for the runner to fetch + extract.
 
+**Wave 3 — federal + niche** (doc 18 §5 wave 3; TODO D8):
+
+* :mod:`.usaspending` / :mod:`.gdelt` — public, keyless federal/open-data JSON
+  APIs (USAspending awards; GDELT 2.0 DOC news). They reuse
+  :class:`.rest_api_pager.RestApiPagerFetcher` for rate-limit + retry and project
+  each record to the stable HTML ``<dl>`` (:mod:`._platform`) the runner extracts.
+* :mod:`.bonfire_euna` / :mod:`.ionwave` — multi-tenant e-procurement platforms,
+  ingested via their public listing data APIs (same JSON→HTML projection path).
+* :mod:`.nces_ccd` / :mod:`.ipeds` / :mod:`.census_gov` — federal **entity
+  directory** bulk imports (K-12 / higher-ed / all-government). Thin subclasses of
+  the bulk-download machinery (:mod:`._bulk_entity_directory`) with source-specific
+  defaults; normalize() resolves rows by stable external id (NCES/IPEDS/FIPS).
+* :mod:`.samgov` / :mod:`.grantsgov` — **deferred to v2** (federal coverage is out
+  of MVP scope — TODO.md "Out of scope"). Registered but not wired for live
+  fetching (:mod:`._deferred_federal`): ``discover`` emits no pointers and the
+  fetcher refuses any fetch.
+
 Importing this package registers every connector (its module's ``@register``
 runs), so :func:`~.base.get_connector` / :func:`~.base.connector_for` resolve a
 recipe's ``connector`` field to its class. The recipe runner dispatches through
@@ -38,6 +55,15 @@ from __future__ import annotations
 # Importing the connector modules runs their ``@register`` decorators, populating
 # the registry. Listed explicitly (not glob-imported) so the set of registered
 # connectors is auditable and import order is deterministic.
+from ._bulk_entity_directory import (
+    BulkEntityDirectoryConfig,
+    BulkEntityDirectoryConnector,
+)
+from ._deferred_federal import (
+    DeferredConnectorError,
+    DeferredFederalConfig,
+    DeferredFederalConnector,
+)
 from .arcgis_rest import (
     ArcgisRestConfig,
     ArcgisRestConnector,
@@ -55,11 +81,19 @@ from .boarddocs import (
     BoarddocsConfig,
     BoarddocsConnector,
 )
+from .bonfire_euna import (
+    BonfireEunaConfig,
+    BonfireEunaConnector,
+)
 from .bulk_download import (
     BulkDownloadConfig,
     BulkDownloadConnector,
     Checkpoint,
     CheckpointStore,
+)
+from .census_gov import (
+    CensusGovConfig,
+    CensusGovConnector,
 )
 from .civicplus import (
     CivicplusConfig,
@@ -69,14 +103,34 @@ from .ckan import (
     CkanConfig,
     CkanConnector,
 )
+from .gdelt import (
+    GdeltConfig,
+    GdeltConnector,
+)
 from .granicus_peak import (
     GranicusPeakConfig,
     GranicusPeakConnector,
+)
+from .grantsgov import (
+    GrantsgovConfig,
+    GrantsgovConnector,
 )
 from .http_static import (
     HttpStaticConfig,
     HttpStaticConnector,
     HttpxFetcher,
+)
+from .ionwave import (
+    IonwaveConfig,
+    IonwaveConnector,
+)
+from .ipeds import (
+    IpedsConfig,
+    IpedsConnector,
+)
+from .nces_ccd import (
+    NcesCcdConfig,
+    NcesCcdConnector,
 )
 from .pdf_extractor import (
     PdfConfig,
@@ -96,9 +150,17 @@ from .rss import (
     RssConfig,
     RssConnector,
 )
+from .samgov import (
+    SamgovConfig,
+    SamgovConnector,
+)
 from .socrata import (
     SocrataConfig,
     SocrataConnector,
+)
+from .usaspending import (
+    UsaspendingConfig,
+    UsaspendingConnector,
 )
 
 __all__ = [
@@ -107,8 +169,14 @@ __all__ = [
     "AuthConfig",
     "BoarddocsConfig",
     "BoarddocsConnector",
+    "BonfireEunaConfig",
+    "BonfireEunaConnector",
     "BulkDownloadConfig",
     "BulkDownloadConnector",
+    "BulkEntityDirectoryConfig",
+    "BulkEntityDirectoryConnector",
+    "CensusGovConfig",
+    "CensusGovConnector",
     "Checkpoint",
     "CheckpointStore",
     "CivicplusConfig",
@@ -117,11 +185,24 @@ __all__ = [
     "CkanConnector",
     "Connector",
     "ConnectorError",
+    "DeferredConnectorError",
+    "DeferredFederalConfig",
+    "DeferredFederalConnector",
+    "GdeltConfig",
+    "GdeltConnector",
     "GranicusPeakConfig",
     "GranicusPeakConnector",
+    "GrantsgovConfig",
+    "GrantsgovConnector",
     "HttpStaticConfig",
     "HttpStaticConnector",
     "HttpxFetcher",
+    "IonwaveConfig",
+    "IonwaveConnector",
+    "IpedsConfig",
+    "IpedsConnector",
+    "NcesCcdConfig",
+    "NcesCcdConnector",
     "PaginationConfig",
     "PdfConfig",
     "PdfExtractionError",
@@ -133,9 +214,13 @@ __all__ = [
     "RestApiPagerFetcher",
     "RssConfig",
     "RssConnector",
+    "SamgovConfig",
+    "SamgovConnector",
     "SocrataConfig",
     "SocrataConnector",
     "UnknownConnectorError",
+    "UsaspendingConfig",
+    "UsaspendingConnector",
     "connector_for",
     "get_connector",
     "register",

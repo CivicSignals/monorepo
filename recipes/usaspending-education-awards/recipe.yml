@@ -1,0 +1,56 @@
+# Example recipe — federal education contract awards via USAspending.gov
+# (doc 18 §5 wave 3 #14). Instantiates the `usaspending` connector (TODO D8) over
+# the free, keyless award-search API. Synthetic example: demonstrates per-recipe
+# query scoping + the `dd[data-key=...]` selectors over the connector's
+# JSON->HTML projection. Public domain; no auth.
+recipe_id: usaspending-education-awards
+connector: usaspending
+version: 1
+
+entity:
+  name: Department of Education
+  state: DC
+  kind: federal_agency
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+# Keyless public-domain API; politeness still applies between the runner's
+# per-record fetches (which are local, post-discover).
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+# Pre-vetted open-data feed: skip the Stage-2 relevance classifier (doc 19 §3).
+prefilter: assume_relevant
+
+connector_config:
+  usaspending:
+    base_url: https://api.usaspending.gov
+    endpoint: /api/v2/search/spending_by_award/
+    page_size: 100
+    max_pages: 10
+
+# The connector projects each award into an HTML <dl>; fields select the column by
+# data-key (doc 18 §3.4 ordered selectors: primary -> fallbacks).
+fields:
+  title:
+    selectors:
+      - "dd[data-key='description']"
+      - "dd[data-key='award_id']"
+    required: true
+  vendor:
+    selectors:
+      - "dd[data-key='recipient_name']"
+    required: false
+  award_amount:
+    selectors:
+      - "dd[data-key='award_amount']"
+    required: false
+  award_date:
+    selectors:
+      - "dd[data-key='action_date']"
+    required: false
+
+signal_types:
+  - contract_award

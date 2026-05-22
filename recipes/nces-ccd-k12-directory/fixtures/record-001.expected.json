@@ -1,0 +1,11 @@
+{
+  "signal_types": [],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "name": "Austin Independent School District",
+    "nces_id": "4823640",
+    "state": "TX",
+    "city": "Austin"
+  }
+}

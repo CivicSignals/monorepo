@@ -1,0 +1,11 @@
+{
+  "signal_types": ["contract_award"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "School facility modernization",
+    "vendor": "Acme Construction LLC",
+    "award_amount": "4250000",
+    "award_date": "2025-03-14"
+  }
+}
