@@ -47,7 +47,9 @@ _SEED_TABLES = (
 
 
 @pytest.mark.asyncio
-async def test_seed_is_idempotent() -> None:
+async def test_seed_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
     """Running the seed twice yields the same row counts (no duplicates)."""
     dsn = os.environ.get("SEED_DEMO_TEST_DSN")
     if not dsn:
@@ -56,10 +58,14 @@ async def test_seed_is_idempotent() -> None:
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    # Point the seed at the test DSN. The seed resolves
-    # ``database_direct_url`` first, so set it on the cached Settings instance.
-    settings = seed_demo.get_settings()
-    object.__setattr__(settings, "database_direct_url", dsn)
+    # Point the seed at the test DSN. The seed resolves ``database_direct_url``
+    # first, so override the env var and drop the lru_cache so a fresh Settings
+    # is built. `monkeypatch` reverts the env var; the finalizer clears the cache
+    # again afterwards so the test-scoped DSN never leaks into another test's
+    # cached Settings.
+    monkeypatch.setenv("DATABASE_DIRECT_URL", dsn)
+    seed_demo.get_settings.cache_clear()
+    request.addfinalizer(seed_demo.get_settings.cache_clear)
 
     engine = create_async_engine(dsn)
 

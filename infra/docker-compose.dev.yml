@@ -107,7 +107,10 @@ services:
     volumes:
       - miniodata:/data
     healthcheck:
-      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      # The server image ships curl; hit MinIO's built-in liveness endpoint.
+      # (Don't use `mc ready local` here — no `local` alias is configured in the
+      # server container, so it would hang and never report healthy.)
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10

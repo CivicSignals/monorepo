@@ -1,7 +1,9 @@
 """Seed a demo workspace with synthetic signals (TODO A2).
 
-Invoked by ``make seed`` (``python -m civicsignals_api.scripts.seed_demo``). Gives
-a fresh developer real rows to look at the moment the stack is up.
+Invoked by ``make seed`` (``docker compose run --rm api seed``), which dispatches
+to this module's ``seed`` process type via ``docker-entrypoint.sh``. Outside the
+stack, run it directly with ``python -m civicsignals_api.scripts.seed_demo``.
+Gives a fresh developer real rows to look at the moment the stack is up.
 
 Idempotent: safe to re-run. Every insert is guarded by a stable ``slug``/``key``
 so re-running updates-or-skips rather than duplicating.
