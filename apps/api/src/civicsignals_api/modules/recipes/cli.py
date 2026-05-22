@@ -116,8 +116,9 @@ def _cmd_preview(args: argparse.Namespace) -> int:
 
     try:
         if args.html is not None:
-            html = Path(args.html).read_text(encoding="utf-8")
-            result = services.preview_html(recipe, html, source_url=f"file://{args.html}")
+            html_path = Path(args.html).resolve()
+            html = html_path.read_text(encoding="utf-8")
+            result = services.preview_html(recipe, html, source_url=html_path.as_uri())
         else:
             with services.HttpxFetcher() as fetcher:
                 result = services.preview_url(recipe, args.url, fetcher)

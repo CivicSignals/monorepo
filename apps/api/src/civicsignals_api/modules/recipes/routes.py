@@ -59,7 +59,7 @@ def staff_problem(x_staff_token: str | None) -> JSONResponse | None:
             "Forbidden",
             "recipe preview is disabled (set RECIPE_PREVIEW_STAFF_TOKEN to enable)",
         )
-    # Constant-time compare to avoid timing side-channels leaking the token length.
+    # Constant-time compare to reduce timing side-channels about token content.
     if not secrets.compare_digest(x_staff_token or "", expected):
         return _problem(403, "Forbidden", "a valid X-Staff-Token header is required")
     return None

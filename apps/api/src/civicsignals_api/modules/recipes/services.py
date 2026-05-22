@@ -146,17 +146,19 @@ async def persist_dead_letters(
 
 
 def _validate_preview_url(url: str) -> None:
-    """Guard against SSRF: only allow http/https to globally-routable IP literals.
+    """Partial SSRF guard: require http/https and reject non-global IP literals.
 
-    Hostname targets (non-IP strings) are allowed through; network-level egress
-    controls or a dedicated egress proxy are the second line of defense for those.
-    For IP literals we require the address to be globally routable — this rejects
-    loopback (127.x / ::1), link-local (169.254.x, fe80::), RFC-1918 / ULA private,
-    unspecified (0.0.0.0 / ::), multicast, and reserved ranges, covering cloud
-    metadata endpoints, internal services, and other SSRF targets.
+    **Scope**: This function blocks the most obvious SSRF vectors — non-http(s)
+    schemes, empty hostnames (``http:///path``), and IP literals that are not
+    globally routable (loopback, link-local, RFC-1918 / ULA private, unspecified
+    0.0.0.0/::, multicast, reserved). It does *not* resolve hostnames, so names
+    like ``localhost`` or internal DNS entries can still reach private addresses.
+    Network-level egress controls (firewall, egress proxy) or a hostname-resolving
+    validator are the second line of defense for hostname-based targets.
 
-    Also requires the URL to have a non-empty hostname so malformed URLs such as
-    ``http:///path`` (empty authority) are rejected before reaching the fetcher.
+    Redirect chains are handled by the caller's fetcher; ``HttpxFetcher`` follows
+    redirects automatically. A full SSRF fix would disable automatic redirects and
+    re-validate each hop, which is deferred to the production connector (D6).
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):

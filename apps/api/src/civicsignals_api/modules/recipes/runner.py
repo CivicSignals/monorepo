@@ -819,16 +819,22 @@ class RecipeRunner:
     def field_values(self, html: str) -> dict[str, str | None]:
         """Per-field extracted values for ``html`` — public, never raises.
 
-        A *non-raising*, **selector-only** sibling of :meth:`extract`: it runs
-        only the CSS-selector chain (primary → fallback selectors, via
+        A **selector-only** sibling of :meth:`extract`: it runs only the
+        CSS-selector chain (primary → fallback selectors, via
         :func:`_extract_field`) for each field and returns every declared
-        field's value (``None`` for a miss). It does *not* invoke the
-        LLM-assisted rung (``llm_extractor``) or the dead-letter path that
-        :meth:`preview_extract` / :meth:`extract` use via :meth:`_resolve_field`.
-        Use :meth:`preview_extract` when the full extraction picture — including
-        LLM-assisted fallback and per-field diagnostics — is required (D5 authoring
-        preview). This method is still useful for fast, network-free selector
-        smoke-tests where LLM assistance is not needed.
+        field's value (``None`` for a miss, including a missing required field).
+        It does *not* invoke the LLM-assisted rung (``llm_extractor``) or the
+        dead-letter path that :meth:`preview_extract` / :meth:`extract` use via
+        :meth:`_resolve_field`.
+
+        **Does not raise on missing required fields** — that is its key difference
+        from :meth:`extract`. However it can still raise :class:`RecipeError` for
+        unexpected extraction failures (e.g. a field using an unsupported selector
+        type). Use :meth:`preview_extract` when the full extraction picture —
+        including LLM-assisted fallback, per-field diagnostics, and structured
+        error capture — is required (D5 authoring preview). This method is useful
+        for fast, network-free selector smoke-tests where LLM assistance is not
+        needed.
         """
         doc = ParsedDocument(_parse_html(html), html)
         return {
