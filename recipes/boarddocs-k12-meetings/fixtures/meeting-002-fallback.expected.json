@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "fallback",
+  "degraded": true,
+  "fields": {
+    "title": "Special Board Meeting — July 2025",
+    "meeting_date": "2025-07-14",
+    "agenda_summary": "Board approved an emergency facilities repair contract following storm damage."
+  }
+}

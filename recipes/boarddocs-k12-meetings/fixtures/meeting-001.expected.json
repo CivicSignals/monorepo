@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Regular Board Meeting — June 2025",
+    "meeting_date": "2025-06-09",
+    "agenda_summary": "Board adopted the FY2026 general fund budget and authorized an RFP for student transportation services."
+  }
+}

@@ -1,0 +1,45 @@
+# State portal — California Cal eProcure (Caltrans/DGS) solicitations
+# (doc 16 §14 recipe #11; doc 18 §5 wave 1). Instantiates the generic
+# `http_static` connector (TODO D6) for the Cal eProcure event detail page.
+# Public listings only; static HTML (doc 16 §17.1, §18).
+recipe_id: ca-cal-eprocure
+connector: http_static
+version: 1
+
+entity:
+  name: California Department of General Services — Procurement Division
+  state: CA
+  kind: state_agency
+
+schedule:
+  cron: "0 */2 * * *" # every 2 hours
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: assume_relevant
+
+fields:
+  title:
+    selectors:
+      - "h1.event-title"
+      - ".solicitation-header h2"
+      - "main h1:first-of-type"
+    required: true
+  due_date:
+    attr: datetime
+    selectors:
+      - ".bid-due time"
+      - "td.due-date time"
+    required: false
+  agency:
+    selectors:
+      - ".department"
+      - "td.agency"
+    required: false
+
+signal_types:
+  - rfp_posted
+  - contract_award

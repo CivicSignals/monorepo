@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "contract_award",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Contract Award — Districtwide Network Modernization",
+    "vendor": "Northwest Network Solutions Inc",
+    "award_amount": "875000",
+    "award_date": "2025-05-20T00:00:00.000"
+  }
+}

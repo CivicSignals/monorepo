@@ -1,0 +1,53 @@
+# News — StateScoop SLED news via RSS (doc 16 §14 recipes #116-125 news RSS
+# aggregation; doc 18 §1 cat. B). Instantiates the generic `rss` connector
+# (TODO D6): discover() parses the feed and emits one pointer per item, then the
+# runner fetches each linked article and extracts the fields below. Public news;
+# static HTML (doc 16 §16, Tier 1).
+recipe_id: statescoop-news-rss
+connector: rss
+version: 1
+
+entity:
+  name: StateScoop (Scoop News Group) — state government IT news
+  state: DC
+  kind: news_source
+
+schedule:
+  cron: "0 */4 * * *" # every 4 hours
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: classifier
+
+connector_config:
+  rss:
+    feed_url: https://statescoop.com/feed/
+    max_items: 50
+    fetch_item_body: true
+
+fields:
+  title:
+    selectors:
+      - "h1.entry-title"
+      - "article h1"
+      - "main h1:first-of-type"
+    required: true
+  published_date:
+    attr: datetime
+    selectors:
+      - "time.entry-date"
+      - "article time[datetime]"
+      - "time[datetime]"
+    required: false
+  source_url:
+    attr: href
+    selectors:
+      - "link[rel='canonical']"
+      - "a.entry-permalink"
+    required: false
+
+signal_types:
+  - news_mention

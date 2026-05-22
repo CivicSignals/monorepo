@@ -1,0 +1,56 @@
+# Platform mega-recipe — CKAN datastore grants/funding catalog (template)
+# (doc 16 §14 recipes #11-22 state portals; doc 18 §5 wave 2 #10). ONE recipe
+# pattern covers Data.gov + many state/city CKAN catalogs that publish a
+# grants/funding datastore resource: clone per catalog, swap `entity` +
+# `connector_config.ckan` (domain + resource_id), and adapt the field
+# data-keys. Public open-data; api_key optional (private datasets only).
+recipe_id: ckan-grants-template
+connector: ckan
+version: 1
+
+entity:
+  name: TEMPLATE — clone per catalog (set name/state/kind + connector_config)
+  state: OR
+  kind: state_agency
+
+schedule:
+  cron: "0 7 * * *" # daily
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  ckan:
+    domain: catalog.example.gov
+    resource_id: 11112222-3333-4444-5555-666677778888
+    page_size: 100
+    max_pages: 20
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='program_title']"
+      - "dd[data-key='title']"
+    required: true
+  agency:
+    selectors:
+      - "dd[data-key='agency']"
+      - "dd[data-key='administering_agency']"
+    required: false
+  funding_amount:
+    selectors:
+      - "dd[data-key='funding_amount']"
+      - "dd[data-key='award_amount']"
+    required: false
+  posted_date:
+    selectors:
+      - "dd[data-key='posted_date']"
+      - "dd[data-key='open_date']"
+    required: false
+
+signal_types:
+  - budget
+  - rfp_posted

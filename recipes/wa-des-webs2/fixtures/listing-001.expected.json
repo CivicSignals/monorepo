@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "rfp_posted",
+    "contract_award"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "RFP 2025-088 — Statewide Learning Management System",
+    "due_date": "2025-08-22",
+    "agency": "Office of the Superintendent of Public Instruction"
+  }
+}

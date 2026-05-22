@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "rfp_posted",
+    "budget"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Ordinance O2025-2041 — Award of Smart Streetlight Modernization Contract",
+    "meeting_date": "2025-06-25",
+    "agenda_summary": "City Council approved award of the citywide smart streetlight modernization contract."
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Governing Board Regular Meeting — June 2025",
+    "meeting_date": "2025-06-24",
+    "agenda_summary": "Board adopted the FY2026 operating budget and authorized an RFP for districtwide enterprise resource planning software."
+  }
+}

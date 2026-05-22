@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "rfp_posted",
+    "budget"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Resolution R-2025-688 — Award of Transit Fleet Procurement",
+    "meeting_date": "2025-06-20",
+    "agenda_summary": "Board of County Commissioners approved award of the electric transit bus procurement contract."
+  }
+}

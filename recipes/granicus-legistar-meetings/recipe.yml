@@ -1,0 +1,57 @@
+# Platform mega-recipe — Granicus Legistar legislative-management meetings
+# (doc 16 §14 recipe #2 "Granicus PEAK / Legistar"; doc 18 §5 wave 2 #7).
+# Legistar is the Granicus legislative-calendar product used by large cities,
+# counties, and universities. It is served by the same `granicus_peak`
+# multi-tenant connector (Granicus host family); this recipe pattern covers the
+# Legistar `LegislationDetail`/`MeetingDetail` page shape. Clone per org: swap
+# `entity` + `connector_config.granicus_peak` (full Legistar base_url) and reuse
+# the selector chain. Public legislative records; static HTML (doc 16 §16,
+# Tier 1).
+recipe_id: granicus-legistar-meetings
+connector: granicus_peak
+version: 1
+
+entity:
+  name: TEMPLATE — clone per org (set name/state/kind + connector_config)
+  state: CA
+  kind: county
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  granicus_peak:
+    # Legistar tenants expose a dedicated host, e.g.
+    # https://<org>.legistar.com — set it as the full base_url.
+    base_url: https://template-county.legistar.com
+    meeting_path: Calendar.aspx
+
+fields:
+  title:
+    selectors:
+      - "h1.legislation-title"
+      - "#ctl00_ContentPlaceHolder1_lblTitle"
+      - "main h1:first-of-type"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-date time"
+      - "span.date time"
+      - "time[datetime]"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".legislation-summary"
+      - "div.summary"
+    required: false
+
+signal_types:
+  - board_decision
+  - budget
+  - rfp_posted

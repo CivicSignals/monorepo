@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Resolution 2025-204 — Award of Broadband Expansion Contract",
+    "meeting_date": "2025-06-24",
+    "agenda_summary": "Board of Supervisors approved award of the county broadband expansion contract to the lowest responsive bidder."
+  }
+}

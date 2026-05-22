@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "rfp_posted",
+    "budget"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Town Council Regular Session — June 2025",
+    "meeting_date": "2025-06-10",
+    "agenda_summary": "Council issued an RFP for a new municipal water-meter system and reviewed the quarterly budget report."
+  }
+}

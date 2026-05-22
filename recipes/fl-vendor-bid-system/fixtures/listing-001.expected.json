@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "rfp_posted",
+    "contract_award"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "ITN 06-2025 — Statewide K-12 Assessment Platform",
+    "due_date": "2025-09-12",
+    "agency": "Florida Department of Education"
+  }
+}

@@ -1,0 +1,50 @@
+# K-12 wedge — Seattle Public Schools board meetings via BoardDocs
+# (doc 16 §14 recipes #23-40 top WA/OR/CA K-12 districts; doc 15 §3 wedge 1).
+# Instantiates the multi-tenant `boarddocs` connector (TODO D7) for one WA
+# district by state+subdomain. Public agendas/minutes; static HTML (doc 16 §16,
+# Tier 1). Per-tenant clone of the `boarddocs-k12-meetings` mega-recipe.
+recipe_id: seattle-ps-boarddocs
+connector: boarddocs
+version: 1
+
+entity:
+  entity_id: nces:5307710
+  name: Seattle Public Schools
+  state: WA
+  kind: k12_district
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  boarddocs:
+    state: wa
+    subdomain: spsk12
+
+fields:
+  title:
+    selectors:
+      - "h1.meeting-title"
+      - ".agenda-header h2"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-date time"
+      - "span.date time"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".agenda-summary"
+      - "div.summary"
+    required: false
+
+signal_types:
+  - board_decision
+  - budget
+  - rfp_posted

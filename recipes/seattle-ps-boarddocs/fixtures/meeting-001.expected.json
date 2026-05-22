@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Regular Board Meeting — June 2025",
+    "meeting_date": "2025-06-04",
+    "agenda_summary": "Board approved the 2025-26 operating budget and authorized an RFP for districtwide HVAC modernization."
+  }
+}

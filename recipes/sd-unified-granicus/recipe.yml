@@ -1,0 +1,51 @@
+# K-12 wedge — San Diego Unified School District board meetings via Granicus PEAK
+# (doc 16 §14 recipes #23-40 top WA/OR/CA K-12 districts; doc 15 §3 wedge 1).
+# Some large districts run their board video/agenda archive on Granicus rather
+# than BoardDocs; this instantiates the multi-tenant `granicus_peak` connector
+# (TODO D7) for one CA district. Public agendas/minutes; static HTML (doc 16
+# §16, Tier 1).
+recipe_id: sd-unified-granicus
+connector: granicus_peak
+version: 1
+
+entity:
+  entity_id: nces:0634320
+  name: San Diego Unified School District
+  state: CA
+  kind: k12_district
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  granicus_peak:
+    subdomain: sandiegounified
+    view_id: 2
+
+fields:
+  title:
+    selectors:
+      - "h1.meeting-name"
+      - ".meeting-header h1"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-when time"
+      - "span.when time"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".agenda-abstract"
+      - "div.abstract"
+    required: false
+
+signal_types:
+  - board_decision
+  - budget
+  - rfp_posted

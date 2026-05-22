@@ -1,0 +1,12 @@
+{
+  "signal_types": [
+    "news_mention"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Counties turn to shared services for cybersecurity",
+    "published_date": "2025-06-13",
+    "source_url": "https://www.route-fifty.com/cybersecurity/2025/06/counties-shared-services/"
+  }
+}

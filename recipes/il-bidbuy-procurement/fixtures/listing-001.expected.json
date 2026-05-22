@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "rfp_posted",
+    "contract_award"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "RFP 25-416CMS — Statewide Broadband Equity Program",
+    "due_date": "2025-09-25",
+    "agency": "Illinois Department of Innovation & Technology"
+  }
+}

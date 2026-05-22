@@ -1,0 +1,45 @@
+# State portal — Florida Vendor Bid System (VBS / MyFloridaMarketPlace)
+# (doc 16 §14 recipe #15-17 "FL"; doc 18 §5 wave 1). Instantiates the generic
+# `http_static` connector (TODO D6) for the Florida VBS advertisement detail
+# page. Public listings only; static HTML (doc 16 §17.1, §18).
+recipe_id: fl-vendor-bid-system
+connector: http_static
+version: 1
+
+entity:
+  name: Florida Department of Management Services — State Purchasing
+  state: FL
+  kind: state_agency
+
+schedule:
+  cron: "0 */2 * * *" # every 2 hours
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: assume_relevant
+
+fields:
+  title:
+    selectors:
+      - "h1.ad-title"
+      - ".vbs-header h2"
+      - "main h1:first-of-type"
+    required: true
+  due_date:
+    attr: datetime
+    selectors:
+      - ".closing-date time"
+      - "td.due-date time"
+    required: false
+  agency:
+    selectors:
+      - ".advertising-agency"
+      - "td.agency"
+    required: false
+
+signal_types:
+  - rfp_posted
+  - contract_award

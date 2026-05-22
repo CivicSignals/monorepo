@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "budget",
+    "board_decision"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Main Street Bridge Replacement",
+    "budget": "15400000",
+    "status": "In Design",
+    "department": "Public Works"
+  }
+}

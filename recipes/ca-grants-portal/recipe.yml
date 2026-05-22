@@ -1,0 +1,57 @@
+# State portal — California Grants Portal (grants.ca.gov open-data feed)
+# (doc 16 §14 recipes #18-22 grant/accountability portals; doc 18 §5 wave 2 #9).
+# The California Grants Portal publishes its open grant opportunities as a
+# Socrata dataset, so this instantiates the multi-tenant `socrata` connector
+# (TODO D7). Public open-data; app_token optional. Fields read the connector's
+# JSON->HTML <dl> projection by data-key.
+recipe_id: ca-grants-portal
+connector: socrata
+version: 1
+
+entity:
+  name: California Grants Portal
+  state: CA
+  kind: state_agency
+
+schedule:
+  cron: "0 6 * * *" # daily
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  socrata:
+    domain: data.ca.gov
+    dataset_id: 35rd-tg9m
+    order: ":id"
+    page_size: 100
+    max_pages: 20
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='title']"
+      - "dd[data-key='grant_title']"
+    required: true
+  agency:
+    selectors:
+      - "dd[data-key='agencydept']"
+      - "dd[data-key='agency']"
+    required: false
+  funding_amount:
+    selectors:
+      - "dd[data-key='estamounts']"
+      - "dd[data-key='total_estimated_available_funding']"
+    required: false
+  due_date:
+    selectors:
+      - "dd[data-key='applicationdeadline']"
+      - "dd[data-key='close_date']"
+    required: false
+
+signal_types:
+  - budget
+  - rfp_posted

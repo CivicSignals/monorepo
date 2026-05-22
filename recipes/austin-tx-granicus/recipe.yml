@@ -1,0 +1,49 @@
+# City wedge — City of Austin, TX council meetings via Granicus PEAK
+# (doc 16 §14 recipes #61-100 top TX/FL/IL cities >100k; doc 15 §3 wedge 3).
+# Instantiates the multi-tenant `granicus_peak` connector (TODO D7) for one TX
+# city. Public agendas/minutes; static HTML (doc 16 §16, Tier 1).
+recipe_id: austin-tx-granicus
+connector: granicus_peak
+version: 1
+
+entity:
+  entity_id: fips:4805000
+  name: City of Austin
+  state: TX
+  kind: city
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  granicus_peak:
+    subdomain: austintx
+    view_id: 6
+
+fields:
+  title:
+    selectors:
+      - "h1.meeting-name"
+      - ".meeting-header h1"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-when time"
+      - "span.when time"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".agenda-abstract"
+      - "div.abstract"
+    required: false
+
+signal_types:
+  - board_decision
+  - rfp_posted
+  - budget

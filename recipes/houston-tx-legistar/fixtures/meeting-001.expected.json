@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "rfp_posted",
+    "budget"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Ordinance 2025-512 — Award of Wastewater Treatment Upgrade Contract",
+    "meeting_date": "2025-06-18",
+    "agenda_summary": "City Council approved award of the wastewater treatment plant upgrade contract to the recommended bidder."
+  }
+}

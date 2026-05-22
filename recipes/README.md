@@ -107,4 +107,58 @@ make check-recipes
 > them (no test node generated) so the CI stays green during early authoring,
 > but the warning is visible in the CI log.
 
-The 200-recipe Tier-1 sprint (TODO D12) populates this directory.
+## The 200-recipe Tier-1 sprint (TODO D12)
+
+The Tier-1 wedge target is **200 recipes** (doc 16 §14, doc 15 §3 cold-start),
+broken down as:
+
+| Category (doc 16 §14) | Target | Examples in this repo |
+|---|---|---|
+| Platform mega-recipes (#1–10) | ~10 | `boarddocs-k12-meetings`, `granicus-peak-muni-meetings`, `granicus-legistar-meetings`, `civicplus-muni-meetings`, `civicclerk-muni-meetings`, `socrata-contracts-template`, `ckan-grants-template`, `arcgis-capital-projects-template`, `usaspending-sled-awards`, `gdelt-sled-news-template` |
+| State portals (#11–22) | ~50 | `wa-des-webs2`, `or-orpin-solicitations`, `ca-cal-eprocure`, `tx-smartbuy-esbd`, `fl-vendor-bid-system`, `il-bidbuy-procurement`, `ca-grants-portal` |
+| K-12 / community college (#23–60, #101–115) | ~70 | `seattle-ps-boarddocs`, `portland-ps-boarddocs`, `lausd-boarddocs`, `sd-unified-granicus`, `tacoma-ps-boarddocs`, `maricopa-ccd-boarddocs`, `foothill-deanza-ccd-bids` |
+| Cities / counties / news / staff directories (#61–100, #116–170) | ~70 | `austin-tx-granicus`, `houston-tx-legistar`, `miamidade-fl-legistar`, `chicago-il-legistar`, `govtech-news-rss`, `statescoop-news-rss`, `route-fifty-news-rss`, `wa-k12-staff-directory` |
+
+### What is shipped vs. what remains
+
+This directory currently holds a **representative batch spanning all four
+categories** (the 15 wave-1/2/3 connector examples plus the D12 batch above) —
+**not** all 200. The full 200 is a content sprint requiring live-source access
+to author + verify selectors against each tenant's real HTML/JSON (doc 15 §4:
+"~1–2 hours per recipe with AI assist"). Every recipe here uses **realistic but
+synthetic** fixtures so the QA-4 harness exercises extraction **without hitting
+live services**.
+
+The remaining recipes toward 200 are added as **community/operator YAML PRs**
+(the recipe model, doc 16 §17.4): no code change, just a new `recipes/<id>/`
+directory that the path-filtered `recipe-fixtures` CI job validates + replays
+automatically. Each new recipe should reference its row in doc 16 §14/§20.
+
+### The "platform mega-recipe" pattern (highest leverage)
+
+Most of the 200 are **clones of a platform mega-recipe**, not net-new authoring.
+A mega-recipe (e.g. `boarddocs-k12-meetings`) carries the platform-wide selector
+chain (primary → fallbacks, doc 18 §3.4); a per-tenant recipe is the same file
+with `entity` + `connector_config` swapped and the selectors reused verbatim.
+The fallbacks absorb per-tenant theming, so one pattern covers thousands of
+tenants. To add a tenant:
+
+1. **Scaffold or clone.** Either start from the mega-recipe directory:
+   ```bash
+   cp -r recipes/boarddocs-k12-meetings recipes/<new-tenant-id>
+   # then edit entity + connector_config; reuse the selectors
+   ```
+   …or scaffold a fresh skeleton for a non-platform source:
+   ```bash
+   cd apps/api
+   uv run python -m civicsignals_api.modules.recipes.cli scaffold <new-id> --connector <connector>
+   ```
+2. **Capture one synthetic (or live-snapshot) fixture** under `fixtures/`.
+3. **Generate the expected JSON** with the runner (see the snippet in "Adding a
+   new recipe", or just run `cli test <new-id>` after writing it by hand).
+4. **Validate + replay** locally, then open the PR.
+
+> The synthetic fixtures here intentionally exercise the *primary* selector
+> chain; `boarddocs-k12-meetings/meeting-002-fallback` additionally exercises
+> the **fallback** rung (`extraction_method: fallback`, `degraded: true`) so the
+> harness proves the ordered-fallback path stays wired (doc 18 §3.4).

@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Community Broadband Infrastructure Grant Program",
+    "agency": "State Department of Commerce",
+    "funding_amount": "2400000",
+    "posted_date": "2025-04-15"
+  }
+}

@@ -1,0 +1,57 @@
+# Platform mega-recipe — CivicPlus / CivicWeb municipal meetings
+# (doc 16 §14 recipe #3; doc 18 §5 wave 2 #8). ONE recipe pattern covers the
+# 2,500+ local governments on CivicPlus/CivicWeb: clone per municipality, swap
+# `entity` + `connector_config.civicplus` (subdomain + platform, or full
+# base_url), reuse the selector chain. Public meeting materials; static HTML
+# (doc 16 §16, Tier 1).
+#
+# NOTE (D9 seam): a CivicClerk tenant whose meeting list renders only
+# client-side is the wave-2 case most likely to need the headless browser.
+# Switch *that* recipe to `connector: http_browser` once D9 lands; do not render
+# JS in this connector. The `civicclerk-muni-meetings` sibling documents that.
+recipe_id: civicplus-muni-meetings
+connector: civicplus
+version: 1
+
+entity:
+  name: TEMPLATE — clone per municipality (set name/state/kind + connector_config)
+  state: TX
+  kind: city
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  civicplus:
+    subdomain: template-town
+    platform: civicweb
+
+fields:
+  title:
+    selectors:
+      - "h1.MeetingTitle"
+      - ".meeting-detail h1"
+      - "main h1:first-of-type"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".MeetingDate time"
+      - "span.date time"
+      - "time[datetime]"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".MeetingSummary"
+      - "div.summary"
+    required: false
+
+signal_types:
+  - board_decision
+  - rfp_posted
+  - budget

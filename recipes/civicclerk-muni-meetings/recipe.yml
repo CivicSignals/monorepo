@@ -1,0 +1,58 @@
+# Platform mega-recipe — CivicPlus CivicClerk municipal meetings
+# (doc 16 §14 recipe #3 "CivicPlus / CivicClerk"; doc 18 §5 wave 2 #8).
+# CivicClerk is the CivicPlus agenda/minutes product; it shares the `civicplus`
+# multi-tenant connector but uses the `civicclerk` host family. Clone per
+# municipality: swap `entity` + `connector_config.civicplus` (subdomain +
+# platform=civicclerk, or full base_url).
+#
+# LEGAL/D9 NOTE (doc 16 §18): some CivicClerk tenants render the meeting list
+# only client-side (JS). Those tenants are NOT handled by this static recipe —
+# do not disable robots or render JS here. Once D9 (http_browser) lands, a
+# JS-only tenant gets its own recipe with `connector: http_browser`; this static
+# pattern stays for the server-rendered majority.
+recipe_id: civicclerk-muni-meetings
+connector: civicplus
+version: 1
+
+entity:
+  name: TEMPLATE — clone per municipality (set name/state/kind + connector_config)
+  state: FL
+  kind: city
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  civicplus:
+    subdomain: template-city
+    platform: civicclerk
+
+fields:
+  title:
+    selectors:
+      - "h1.event-title"
+      - ".MeetingTitle"
+      - "main h1:first-of-type"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".event-date time"
+      - ".MeetingDate time"
+      - "time[datetime]"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".event-summary"
+      - ".MeetingSummary"
+    required: false
+
+signal_types:
+  - board_decision
+  - rfp_posted
+  - budget

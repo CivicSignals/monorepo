@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "rfp_posted",
+    "contract_award"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "ITB 2025-O-0142 — Highway Maintenance Equipment",
+    "due_date": "2025-09-05",
+    "agency": "Oregon Department of Transportation"
+  }
+}

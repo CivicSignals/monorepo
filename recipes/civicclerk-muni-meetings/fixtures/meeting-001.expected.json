@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "rfp_posted",
+    "budget"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "City Commission Meeting — June 2025",
+    "meeting_date": "2025-06-18",
+    "agenda_summary": "Commission approved a contract award for citywide LED streetlight conversion and adopted the FY2026 capital improvement plan."
+  }
+}
