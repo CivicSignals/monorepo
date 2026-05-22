@@ -46,9 +46,10 @@ class SignalFuzzyReview(Base):
     - ``reviewed_at``: when the human acted (NULL while pending).
     - ``reviewer_note``: optional free-text from the reviewer (for the audit trail).
 
-    Loose refs (UUIDs stored as strings, no FK across the module boundary — doc 06
-    §3). Both signal ids reference ``signals_signal.id`` but the FK is intentionally
-    absent so the review table does not create a cross-module hard dependency.
+    Loose refs (UUIDs stored as native Postgres UUIDs, no FK across the module
+    boundary — doc 06 §3). Both signal ids reference ``signals_signal.id`` but the FK
+    is intentionally absent so the review table does not create a cross-module hard
+    dependency.
     """
 
     __tablename__ = "signals_fuzzy_review"

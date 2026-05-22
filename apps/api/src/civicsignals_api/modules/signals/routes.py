@@ -34,7 +34,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.db import get_session
 
 from . import services
-from .fuzzy_dedupe import FuzzyReviewAlreadyDecidedError, FuzzyReviewNotFoundError
 from .schemas import SignalPage, SignalRead
 
 router = APIRouter(prefix="/signals", tags=["signals"])
@@ -220,9 +219,9 @@ async def approve_fuzzy_review(
             approved=True,
             reviewer_note=body.reviewer_note,
         )
-    except FuzzyReviewNotFoundError:
+    except services.FuzzyReviewNotFoundError:
         return _problem(404, "Fuzzy review not found", f"No fuzzy review with id {review_id}.")
-    except FuzzyReviewAlreadyDecidedError as exc:
+    except services.FuzzyReviewAlreadyDecidedError as exc:
         return _problem(
             409,
             "Fuzzy review already decided",
@@ -254,9 +253,9 @@ async def reject_fuzzy_review(
             approved=False,
             reviewer_note=body.reviewer_note,
         )
-    except FuzzyReviewNotFoundError:
+    except services.FuzzyReviewNotFoundError:
         return _problem(404, "Fuzzy review not found", f"No fuzzy review with id {review_id}.")
-    except FuzzyReviewAlreadyDecidedError as exc:
+    except services.FuzzyReviewAlreadyDecidedError as exc:
         return _problem(
             409,
             "Fuzzy review already decided",

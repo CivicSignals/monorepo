@@ -50,7 +50,12 @@ from civicsignals_api.llm_gateway import LLMGateway, get_gateway
 from .dedupe import merge_signal, window_for
 from .embedding import build_embedding_text
 from .models import EMBEDDING_DIM, Signal
-from .models_fuzzy_review import REVIEW_STATUS_PENDING, SignalFuzzyReview
+from .models_fuzzy_review import (
+    REVIEW_STATUS_APPROVED,
+    REVIEW_STATUS_PENDING,
+    REVIEW_STATUS_REJECTED,
+    SignalFuzzyReview,
+)
 from .schemas import SignalType
 
 log = structlog.get_logger(__name__)
@@ -119,6 +124,7 @@ async def find_fuzzy_duplicate(
     embedding: list[float],
     signal_type: SignalType,
     entity_id: uuid.UUID | None,
+    exclude_signal_id: uuid.UUID | None = None,
     now: datetime | None = None,
     config: FuzzyDedupeConfig = DEFAULT_FUZZY_CONFIG,
 ) -> Signal | None:
@@ -134,6 +140,11 @@ async def find_fuzzy_duplicate(
     The ANN query uses the ivfflat index (built by I1) via pgvector's
     ``<=>`` cosine-distance operator. ``1 - cosine_distance ≥ threshold`` is
     equivalent to ``cosine_distance ≤ 1 - threshold``.
+
+    ``exclude_signal_id`` — when provided, the row with that id is excluded from the
+    results. Pass the candidate signal's id so the ANN query cannot return the
+    candidate row itself (distance 0), which would make the match non-deterministic
+    and mask real nearest neighbours.
 
     Requires the candidate's embedding to be pre-computed (non-empty list of floats);
     returns ``None`` immediately if the embedding is empty (best-effort: a failed
@@ -152,17 +163,19 @@ async def find_fuzzy_duplicate(
 
     # pgvector cosine_distance accepts a Python list[float] directly — the same
     # pattern used by the smart-search ANN query (I3). No explicit cast needed.
+    filters = [
+        Signal.signal_type == signal_type.value,
+        Signal.entity_id == entity_id,  # IS NULL when entity_id is None
+        effective_date > cutoff,
+        Signal.vector_embedding.isnot(None),
+        Signal.vector_embedding.cosine_distance(embedding) <= max_distance,
+    ]
+    if exclude_signal_id is not None:
+        filters.append(Signal.id != exclude_signal_id)
+
     stmt = (
         select(Signal)
-        .where(
-            and_(
-                Signal.signal_type == signal_type.value,
-                Signal.entity_id == entity_id,  # IS NULL when entity_id is None
-                effective_date > cutoff,
-                Signal.vector_embedding.isnot(None),
-                Signal.vector_embedding.cosine_distance(embedding) <= max_distance,
-            )
-        )
+        .where(and_(*filters))
         .order_by(Signal.vector_embedding.cosine_distance(embedding))
         .limit(1)
     )
@@ -284,7 +297,7 @@ async def apply_fuzzy_review(
                 now=now,
             )
             await session.flush()
-        review.status = "approved"
+        review.status = REVIEW_STATUS_APPROVED
         log.info(
             "signals.fuzzy_dedupe.review_approved",
             review_id=str(review_id),
@@ -292,7 +305,7 @@ async def apply_fuzzy_review(
             candidate_signal_id=str(review.candidate_signal_id),
         )
     else:
-        review.status = "rejected"
+        review.status = REVIEW_STATUS_REJECTED
         log.info(
             "signals.fuzzy_dedupe.review_rejected",
             review_id=str(review_id),
@@ -351,15 +364,18 @@ async def run_fuzzy_dedupe(
         return FuzzyDedupeResult(matched=False)
 
     # 2. ANN query for a near-duplicate within the type window.
+    # Exclude the candidate's own row so it cannot appear as its own nearest
+    # neighbour (distance 0), which would mask the real nearest match.
     matched_signal = await find_fuzzy_duplicate(
         session,
         embedding=embedding,
         signal_type=signal_type,
         entity_id=candidate_signal.entity_id,
+        exclude_signal_id=candidate_signal.id,
         now=now,
         config=config,
     )
-    if matched_signal is None or matched_signal.id == candidate_signal.id:
+    if matched_signal is None:
         return FuzzyDedupeResult(matched=False)
 
     # Compute the actual similarity for the review row.
