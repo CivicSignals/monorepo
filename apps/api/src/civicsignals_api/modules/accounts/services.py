@@ -107,13 +107,21 @@ class WorkspacePage:
     next_cursor: str | None
 
 
-def encode_cursor(workspace_id: uuid.UUID) -> str:
-    """Encode a keyset cursor (the last row's id) as an opaque base64 token."""
-    return base64.urlsafe_b64encode(workspace_id.bytes).decode("ascii")
+def encode_cursor(row_id: uuid.UUID) -> str:
+    """Encode a keyset cursor (the last row's UUID v7 id) as an opaque base64 token.
+
+    Id-agnostic: used for both the workspace list (workspace id) and the member
+    list (membership id) — any keyset paginated on a UUID v7 primary key.
+    """
+    return base64.urlsafe_b64encode(row_id.bytes).decode("ascii")
 
 
 def decode_cursor(cursor: str) -> uuid.UUID:
-    """Decode a cursor token back to the workspace id, or raise ``ValueError``."""
+    """Decode a cursor token back to the row id, or raise ``ValueError``.
+
+    Counterpart to :func:`encode_cursor`; returns the opaque token's UUID v7 id
+    regardless of which table it paginates.
+    """
     try:
         return uuid.UUID(bytes=base64.urlsafe_b64decode(cursor.encode("ascii")))
     except (binascii.Error, ValueError) as exc:  # malformed token

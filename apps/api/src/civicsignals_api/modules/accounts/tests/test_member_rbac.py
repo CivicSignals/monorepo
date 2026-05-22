@@ -18,7 +18,7 @@ from sqlalchemy.pool import NullPool
 from civicsignals_api.modules.accounts import services as accounts_services
 from civicsignals_api.modules.accounts.models import MembershipRole as Role
 
-from .conftest import _DSN
+from .conftest import _require_db
 
 SIGNUP = "/api/v1/auth/signup"
 WORKSPACES = "/api/v1/workspaces"
@@ -42,7 +42,7 @@ def _hdr(token: str, ws_id: str) -> dict[str, str]:
 
 def _add_member_at_role(user_id: str, workspace_id: str, role: Role) -> None:
     async def _do() -> None:
-        engine = create_async_engine(_DSN, poolclass=NullPool)  # type: ignore[arg-type]
+        engine = create_async_engine(_require_db(), poolclass=NullPool)
         factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         async with factory() as session:
             await accounts_services.add_member(
