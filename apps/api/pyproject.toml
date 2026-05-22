@@ -11,7 +11,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.35",
     "asyncpg>=0.30",
     "alembic>=1.13",
-    "pydantic>=2.9",
+    "pydantic[email]>=2.9",
     "pydantic-settings>=2.5",
     "celery[redis]>=5.4",
     "redis>=5.1",
@@ -19,6 +19,11 @@ dependencies = [
     "boto3>=1.35",
     "pgvector>=0.3",
     "passlib[bcrypt]>=1.7",
+    # Pin bcrypt to the 4.0.x line: passlib 1.7.4 reads ``bcrypt.__about__`` for
+    # the backend version, which bcrypt removed in 4.1+, and bcrypt 4.1+ also
+    # raises on >72-byte secrets instead of truncating. Both break passlib's
+    # bcrypt handler. (B1; revisit when passlib ships a 1.7.4+ fix.)
+    "bcrypt>=4.0.1,<4.1",
     "pyjwt>=2.9",
     "python-multipart>=0.0.12",
     "structlog>=24.4",
@@ -61,6 +66,8 @@ dev = [
     "types-jsonschema>=4.23",
     "types-beautifulsoup4>=4.12",
     "types-pyyaml>=6.0",
+    # Typing stubs for passlib (auth password hashing, B1).
+    "types-passlib>=1.7",
 ]
 
 [build-system]

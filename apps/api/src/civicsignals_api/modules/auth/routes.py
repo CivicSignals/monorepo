@@ -1,6 +1,174 @@
-"""HTTP endpoints for the auth module, mounted under `/api/v1/auth`."""
+"""HTTP endpoints for the auth module, mounted under ``/api/v1/auth`` (doc 08 §3.1).
+
+Email/password identity (B1): signup, login, logout, email verification, and the
+current-user lookup. Errors are RFC 7807 ``application/problem+json`` (doc 08
+§1.7) raised as :class:`ProblemException`. Bearer JWTs are issued by
+``auth.services``; the reusable ``get_current_user`` dependency guards ``/me``.
+
+# TODO B1: per-IP / per-account rate limiting attaches to /signup, /login, and
+#   /verify-email (5/15min/IP, 20/15min/account — threat-model §4.2). The
+#   service layer (``authenticate``) is the single credential-check choke point.
+"""
+
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Response, status
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from civicsignals_api.config import Settings, get_settings
+from civicsignals_api.db import get_session
+from civicsignals_api.modules.accounts.schemas import UserOut
+from civicsignals_api.modules.notifications import services as notifications_services
+from civicsignals_api.problems import ProblemException
+
+from . import services as auth_services
+from .dependencies import CurrentUser
+from .schemas import (
+    AuthResponse,
+    LoginRequest,
+    MessageResponse,
+    SignupRequest,
+    SignupResponse,
+    TokenPair,
+    VerifyEmailRequest,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+
+def _token_pair(user_id: UUID, settings: Settings) -> TokenPair:
+    return TokenPair(
+        access_token=auth_services.issue_access_token(user_id, settings=settings),
+        refresh_token=auth_services.issue_refresh_token(user_id, settings=settings),
+        expires_in=settings.access_token_ttl_seconds,
+    )
+
+
+def _send_verification_email(email: str, raw_token: str, settings: Settings) -> None:
+    link = f"{settings.web_base_url}/verify-email?token={raw_token}"
+    message = notifications_services.OutboundEmail(
+        to=email,
+        subject="Verify your CivicSignals email",
+        text_body=(
+            "Welcome to CivicSignals.\n\n"
+            f"Confirm your email address by visiting:\n{link}\n\n"
+            "If you did not create this account, you can ignore this message."
+        ),
+        html_body=(
+            "<p>Welcome to CivicSignals.</p>"
+            f'<p>Confirm your email address: <a href="{link}">verify my email</a></p>'
+            "<p>If you did not create this account, you can ignore this message.</p>"
+        ),
+    )
+    notifications_services.send_email(message)
+
+
+@router.post("/signup", response_model=SignupResponse, status_code=status.HTTP_201_CREATED)
+async def signup(body: SignupRequest, session: SessionDep, settings: SettingsDep) -> SignupResponse:
+    try:
+        result = await auth_services.signup(
+            session,
+            email=str(body.email),
+            password=body.password,
+            name=body.name,
+            settings=settings,
+        )
+        await session.commit()
+    except auth_services.InvalidCredentialsError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="email_taken",
+            title="Email already registered",
+            detail="An account with this email already exists.",
+        ) from exc
+    except IntegrityError as exc:  # unique-violation race
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="email_taken",
+            title="Email already registered",
+            detail="An account with this email already exists.",
+        ) from exc
+
+    _send_verification_email(result.user.email, result.verification_token, settings)
+    return SignupResponse(
+        user=UserOut.model_validate(result.user),
+        tokens=_token_pair(result.user.id, settings),
+        email_verification_required=settings.require_email_verification,
+    )
+
+
+@router.post("/login", response_model=AuthResponse)
+async def login(body: LoginRequest, session: SessionDep, settings: SettingsDep) -> AuthResponse:
+    try:
+        user = await auth_services.authenticate(
+            session,
+            email=str(body.email),
+            password=body.password,
+            settings=settings,
+        )
+        await session.commit()
+    except auth_services.InvalidCredentialsError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_credentials",
+            title="Invalid credentials",
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    except auth_services.EmailNotVerifiedError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_403_FORBIDDEN,
+            code="email_not_verified",
+            title="Email not verified",
+            detail="Verify your email address before signing in.",
+        ) from exc
+
+    return AuthResponse(
+        user=UserOut.model_validate(user),
+        tokens=_token_pair(user.id, settings),
+    )
+
+
+@router.post("/logout", response_model=MessageResponse)
+async def logout(response: Response) -> MessageResponse:
+    """Log out the current session.
+
+    Bearer JWTs are stateless, so logout is client-side (drop the token). The
+    web app also clears its cookie. A server-side token denylist / opaque-session
+    revocation is a B-series follow-up (threat-model §4.2: session invalidation
+    on password change / MFA enable). We clear the session cookie defensively.
+    """
+    response.delete_cookie("cs_session", path="/")
+    return MessageResponse(message="logged out")
+
+
+@router.post("/verify-email", response_model=MessageResponse)
+async def verify_email(body: VerifyEmailRequest, session: SessionDep) -> MessageResponse:
+    try:
+        await auth_services.consume_email_verification_token(session, body.token)
+        await session.commit()
+    except auth_services.VerificationTokenError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="invalid_verification_token",
+            title="Invalid verification token",
+            detail="This verification link is invalid, expired, or already used.",
+        ) from exc
+    return MessageResponse(message="email verified")
+
+
+@router.get("/me", response_model=UserOut)
+async def me(current_user: CurrentUser) -> UserOut:
+    return UserOut.model_validate(current_user)

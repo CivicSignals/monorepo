@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from civicsignals_api.api.v1 import api_router
 from civicsignals_api.config import get_settings
 from civicsignals_api.logging import configure_logging
+from civicsignals_api.problems import install_problem_handlers
 
 
 def create_app() -> FastAPI:
@@ -24,6 +25,9 @@ def create_app() -> FastAPI:
         openapi_url=f"{settings.api_v1_prefix}/openapi.json",
         docs_url="/docs",
     )
+
+    # RFC 7807 problem+json error responses across the whole API (doc 08 §1.7).
+    install_problem_handlers(app)
 
     app.include_router(api_router, prefix=settings.api_v1_prefix)
 

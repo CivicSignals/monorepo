@@ -66,9 +66,7 @@ async def _async_main() -> None:
         sys.exit(1)
 
     # -------------------------------------------------------------------------
-    # Step 2: Create the initial admin user + workspace.
-    # TODO B1 — auth module (user model + password hashing) must be DONE before
-    # this block can be fully implemented. Stub that gracefully no-ops for now.
+    # Step 2: Create the initial admin user (B1 — DONE).
     # TODO B5 — workspace model must be DONE before workspace creation works.
     # -------------------------------------------------------------------------
     admin_email = _require_env("CIVICSIGNALS_ADMIN_EMAIL")
@@ -78,21 +76,38 @@ async def _async_main() -> None:
         print(
             "seed_admin: Skipping admin user creation (env vars not set). "
             "Set CIVICSIGNALS_ADMIN_EMAIL and CIVICSIGNALS_ADMIN_PASSWORD and re-run "
-            "`docker compose run --rm init` after completing task B1.",
+            "`docker compose run --rm init`.",
             flush=True,
         )
         return
 
-    # TODO B1: Replace this stub with the real auth.services.create_user() call once
-    #          the User model and password-hashing service are implemented.
-    # TODO B5: Replace stub with accounts.services.create_workspace() once
-    #          the Workspace model is implemented.
-    print(
-        f"seed_admin: TODO B1/B5 — admin user creation for '{admin_email}' is stubbed. "
-        "Implement this block once auth (B1) and workspace (B5) models exist. "
-        "The DB connection is healthy and migrations have already run.",
-        flush=True,
-    )
+    # Create the admin via the accounts/auth services (never their internals,
+    # doc 06 §3). The operator's own account is created already-verified.
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from civicsignals_api.modules.accounts import services as accounts_services
+    from civicsignals_api.modules.auth import services as auth_services
+
+    engine = create_async_engine(direct_url, echo=False)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        existing = await accounts_services.get_user_by_email(session, admin_email)
+        if existing is not None:
+            print(f"seed_admin: admin user '{admin_email}' already exists — skipping.", flush=True)
+        else:
+            await accounts_services.create_user(
+                session,
+                email=admin_email,
+                password_hash=auth_services.hash_password(admin_password),
+                name="Administrator",
+                email_verified=True,
+            )
+            await session.commit()
+            print(f"seed_admin: created admin user '{admin_email}'.", flush=True)
+    await engine.dispose()
+
+    # TODO B5: create the admin's organization + workspace + owner membership via
+    #          accounts.services once the Workspace model exists.
     print("seed_admin: init complete.", flush=True)
 
 

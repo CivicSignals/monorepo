@@ -165,13 +165,19 @@ any SMTP server.
 | Variable | Description | Default | Required | Scope |
 |---|---|---|---|---|
 | `SECRET_KEY` | Master secret used for JWT signing and session-cookie signing. **Must be a long random value in production — never use the default.** Generate with `python -c "import secrets; print(secrets.token_hex(64))"`. | `dev-only-change-me` | **Yes** (change for production) | `api` |
+| `JWT_SECRET` | Optional dedicated secret for signing bearer JWTs. Falls back to `SECRET_KEY` when unset. | `None` (uses `SECRET_KEY`) | No | `api` |
+| `JWT_ALGORITHM` | JWT signing algorithm. Verification is pinned to this value, so `alg: none` / algorithm-confusion tokens are rejected. | `HS256` | No | `api` |
+| `JWT_ISSUER` | `iss` claim set on issued tokens and verified on decode. | `civicsignals` | No | `api` |
 | `ACCESS_TOKEN_TTL_SECONDS` | Lifetime of short-lived access tokens (JWTs), in seconds. | `3600` (1 hour) | No | `api` |
+| `REFRESH_TOKEN_TTL_SECONDS` | Lifetime of refresh tokens, in seconds. | `2592000` (30 days) | No | `api` |
+| `EMAIL_VERIFICATION_TTL_SECONDS` | Lifetime of single-use email-verification tokens, in seconds. | `86400` (24 hours) | No | `api` |
+| `REQUIRE_EMAIL_VERIFICATION` | When `true`, users must verify their email before they can log in. Off by default for a frictionless first run. | `false` | No | `api` |
+| `WEB_BASE_URL` | Base URL of the web app, used to build the link in the verification email (`<WEB_BASE_URL>/verify-email?token=…`). | `http://localhost:3000` | **Yes** (set to your domain in production) | `api` |
 
-> **Note — `REFRESH_TOKEN_TTL_SECONDS`, `GOOGLE_OAUTH_CLIENT_ID`, and
-> `GOOGLE_OAUTH_CLIENT_SECRET`** are present in `infra/.env.example` but are not
-> yet declared in `config.py`. They will be wired in when the auth module (task B1
-> / B2) is implemented. Set them in `.env` now so they are available when auth
-> lands.
+> **Note — `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET`** are
+> present in `infra/.env.example` but are not yet declared in `config.py`. They
+> will be wired in when Google OAuth (task B2) is implemented. Set them in `.env`
+> now so they are available when OAuth lands.
 
 ---
 
