@@ -166,11 +166,14 @@ async def update_icp(
     session: SessionDep,
 ) -> IcpOut:
     """Patch an ICP's fields (partial). Activation is changed via ``/activate``."""
-    changes = body.model_dump(exclude_unset=True)
+    # ``exclude_none`` so an explicit ``null`` is treated as "leave unchanged"
+    # (every IcpUpdate field is optional and ``None`` means unchanged) — without
+    # it a ``{"countries": null}`` body would null a NOT NULL column → 500.
+    changes = body.model_dump(exclude_unset=True, exclude_none=True)
     # Normalize enum lists to their string values for the DB array columns.
-    if "entity_kinds" in changes and changes["entity_kinds"] is not None:
+    if "entity_kinds" in changes:
         changes["entity_kinds"] = [k.value for k in body.entity_kinds or []]
-    if "signal_types" in changes and changes["signal_types"] is not None:
+    if "signal_types" in changes:
         changes["signal_types"] = [t.value for t in body.signal_types or []]
     try:
         icp = await services.update_icp(

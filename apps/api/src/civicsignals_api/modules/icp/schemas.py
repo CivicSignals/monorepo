@@ -144,8 +144,10 @@ def _check_ranges(
 class IcpCreate(_IcpDimensionsMixin, BaseModel):
     """Request body for ``POST /icp`` (doc 14 §3.1).
 
-    Dimension arrays default to empty (= "all values", doc 14 §6.1). ``signal_types``
-    and ``entity_kinds`` are typed enums so unknown values are rejected with ``422``.
+    Most dimension arrays default to empty (= "all values", doc 14 §6.1); the
+    one exception is ``countries``, which defaults to ``["US"]`` (the MVP is
+    US-only, doc 14 §3.1). ``signal_types`` and ``entity_kinds`` are typed enums
+    so unknown values are rejected with ``422``.
     """
 
     name: str = _NAME

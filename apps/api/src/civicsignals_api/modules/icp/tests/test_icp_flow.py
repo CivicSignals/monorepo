@@ -233,6 +233,23 @@ def test_patch_updates_fields(client: TestClient) -> None:
     assert body["signal_types"] == ["rfp_posted", "grant_awarded"]
 
 
+def test_patch_explicit_null_leaves_field_unchanged(client: TestClient) -> None:
+    token = _signup(client, "patchnull@example.com")
+    ws = _make_workspace(client, token)
+    created = client.post(ICP, json=_valid_body(), headers=_scoped(token, ws)).json()
+    # An explicit null on a NOT NULL array column means "leave unchanged" — it
+    # must not 500 by writing NULL, and the stored value is preserved.
+    resp = client.patch(
+        f"{ICP}/{created['id']}",
+        json={"countries": None, "name": "Kept Arrays"},
+        headers=_scoped(token, ws),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["name"] == "Kept Arrays"
+    assert body["countries"] == ["US"]  # unchanged
+
+
 def test_patch_inverted_band_against_stored_row_is_422(client: TestClient) -> None:
     token = _signup(client, "patchband@example.com")
     ws = _make_workspace(client, token)
