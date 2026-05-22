@@ -54,7 +54,9 @@ make seed                    # seed a demo workspace
 **Python (`apps/api`, `packages/sdk-py`)**
 
 - `from __future__ import annotations` at the top of every module.
-- `ruff` for lint + format (line length 100): `uv run ruff check .`
+- `ruff` for lint **and** format (line length 100). Lint with
+  `uv run ruff check .` (add `--fix` to auto-fix) and format with
+  `uv run ruff format .` (use `--check` in CI to verify formatting).
 - `mypy --strict`: `uv run mypy src`
 - Tests with `pytest` (asyncio auto-mode): `uv run pytest`
 
@@ -109,8 +111,9 @@ commits) and force-push.
 ## Licensing
 
 By contributing, you agree that your contributions are licensed under the
-project's **AGPL-3.0-only** license. See [LICENSE](LICENSE) and
-`docs/legal/license-faq.md` for what that means in practice.
+project's **AGPL-3.0-only** license. See [LICENSE](LICENSE) for the full text;
+a plain-language License FAQ is published under `docs/legal/` (`license-faq.md`)
+explaining what AGPL-3.0 means in practice for self-hosters and SaaS use.
 
 ## Reporting security issues
 

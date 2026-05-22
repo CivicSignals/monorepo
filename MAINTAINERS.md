@@ -19,7 +19,11 @@ security reports, use **security@civicsignals.io** (see [SECURITY.md](SECURITY.m
 ## Areas of ownership
 
 Ownership maps to the delivery-plan epics and the API modules. The list below is
-a guide for routing reviews, not a hard gate.
+a guide for routing reviews, not a hard gate. Module paths are relative to
+`apps/api/src/civicsignals_api/` (e.g. `modules/auth` →
+`apps/api/src/civicsignals_api/modules/auth`, `llm_gateway.py` →
+`apps/api/src/civicsignals_api/llm_gateway.py`); `prompts/` is `apps/api/prompts/`,
+the web app is `apps/web`, and the docs site is `docs-site/`.
 
 | Area | Modules / paths | Primary owner |
 |------|-----------------|---------------|

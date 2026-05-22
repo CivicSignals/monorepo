@@ -16,7 +16,7 @@
 ## Checklist
 
 - [ ] My commits are **signed off** (`git commit -s`) per the [DCO](CONTRIBUTING.md#developer-certificate-of-origin-dco).
-- [ ] Lint, type-check, and tests pass locally (`pnpm lint`, `pnpm typecheck`, `pnpm test`; `uv run ruff check . && uv run mypy src && uv run pytest` in `apps/api`).
+- [ ] Lint, format, type-check, and tests pass locally (`pnpm lint`, `pnpm typecheck`, `pnpm test`; in `apps/api`: `uv run ruff format --check . && uv run ruff check . && uv run mypy src && uv run pytest`).
 - [ ] I followed the module/coding conventions in [CONTRIBUTING.md](CONTRIBUTING.md) and `CLAUDE.md`.
 - [ ] I added or updated tests where it makes sense.
 - [ ] I updated documentation where it makes sense.

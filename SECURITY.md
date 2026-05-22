@@ -69,9 +69,10 @@ Out of scope:
 
 ## Hardening & operational guidance
 
-Self-hosters should follow the production and hardening guides under
-`docs/` (see also the public security page in `docs/legal/security.md`) and the
-project threat model at `security/threat-model.md`.
+Self-hosters should follow the production and hardening guides in the project
+documentation. The project also publishes a public security page (under
+`docs/legal/`) and an end-to-end threat model at `security/threat-model.md`,
+which describe our security practices and trust boundaries in more detail.
 
 ## Safe harbor
 
