@@ -24,7 +24,6 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects import postgresql
 
 revision: str = "5d3748bed3c5"
 down_revision: str | None = "467a515ea5a6"
