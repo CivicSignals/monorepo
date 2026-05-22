@@ -96,6 +96,19 @@ def test_declared_superset_is_allowed(tmp_path: Path) -> None:
     assert reg.get("ok").variables == frozenset({"a", "b"})
 
 
+def test_empty_declared_variables_forbids_placeholders(tmp_path: Path) -> None:
+    # `variables: []` means "no placeholders allowed" — gate on key presence.
+    _write(tmp_path, "bad/v1.md", _prompt(body="uses {x}", meta="variables: []"))
+    with pytest.raises(PromptLoadError, match="undeclared variables"):
+        PromptRegistry(tmp_path)
+
+
+def test_empty_declared_variables_with_static_body_ok(tmp_path: Path) -> None:
+    _write(tmp_path, "ok/v1.md", _prompt(body="no placeholders here", meta="variables: []"))
+    reg = PromptRegistry(tmp_path)
+    assert reg.get("ok").render() == "no placeholders here"
+
+
 def test_malformed_template_brace_fails(tmp_path: Path) -> None:
     _write(tmp_path, "bad/v1.md", _prompt(body="unmatched {"))
     with pytest.raises(PromptLoadError, match="malformed template"):

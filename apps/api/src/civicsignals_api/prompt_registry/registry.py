@@ -251,9 +251,12 @@ def _load_prompt_file(name: str, version: str, path: Path) -> Prompt:
         raise PromptLoadError(f"prompt {path}: 'model_hint' must be a string")
 
     used = _extract_placeholders(body) | _extract_placeholders(system or "")
-    # If the author declared variables, the template must not reference any that
-    # were not declared — catches drift between the declared contract and body.
-    if declared_set and not used <= declared_set:
+    # If the author declared variables at all (even ``variables: []``), the
+    # template must not reference any that were not declared — catches drift
+    # between the declared contract and the body. Gate on key *presence*
+    # (``declared is not None``), not truthiness, so an empty list still enforces
+    # "no placeholders allowed".
+    if declared is not None and not used <= declared_set:
         raise PromptLoadError(
             f"prompt {path}: template uses undeclared variables "
             f"{sorted(used - declared_set)} (declared: {sorted(declared_set)})"
