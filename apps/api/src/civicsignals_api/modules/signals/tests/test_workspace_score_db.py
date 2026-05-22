@@ -460,6 +460,13 @@ async def test_feed_hides_dismissed_by_default(session: AsyncSession) -> None:
     )
     assert len(page_all.items) == 1
 
+    # An explicit filter naming only invalid statuses returns an empty feed — not
+    # "all statuses" (Copilot review fix).
+    page_invalid = await services.list_workspace_signals(
+        session, workspace_id=ws, statuses=["bogus_status"]
+    )
+    assert page_invalid.items == []
+
 
 async def test_feed_is_workspace_scoped(session: AsyncSession) -> None:
     ws_a = await _workspace(session, email="scope-a@example.com")

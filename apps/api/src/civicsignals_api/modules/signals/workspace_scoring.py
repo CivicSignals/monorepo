@@ -367,11 +367,15 @@ def recency_score(observed_at: datetime | None, *, now: datetime, half_life_days
     A brand-new signal scores ~1.0; one ``half_life_days`` old scores 0.5; older
     signals decay smoothly toward 0. A future or missing timestamp is treated as
     "now" (1.0) — clock skew / a missing observed_at should not penalise a signal.
+
+    Both ``observed_at`` and ``now`` are normalised to UTC when naive so a mixed
+    naive/aware pair cannot raise ``TypeError`` on subtraction.
     """
     if observed_at is None:
         return 1.0
     obs = observed_at if observed_at.tzinfo is not None else observed_at.replace(tzinfo=UTC)
-    age_days = (now - obs).total_seconds() / 86_400.0
+    ref = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    age_days = (ref - obs).total_seconds() / 86_400.0
     if age_days <= 0:
         return 1.0
     return _clamp_unit(math.pow(0.5, age_days / half_life_days))

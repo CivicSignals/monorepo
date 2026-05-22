@@ -155,6 +155,13 @@ def test_recency_missing_or_future_is_one() -> None:
     assert recency_score(NOW + timedelta(days=5), now=NOW, half_life_days=30.0) == 1.0
 
 
+def test_recency_handles_naive_now() -> None:
+    # A naive ``now`` against an aware ``observed_at`` must not raise TypeError —
+    # both are normalised to UTC (Copilot review fix).
+    naive_now = datetime(2026, 5, 22, 12, 0, 0)
+    assert recency_score(NOW, now=naive_now, half_life_days=30.0) == 1.0
+
+
 # --- Semantic similarity (doc 14 §6.2) --------------------------------------
 
 

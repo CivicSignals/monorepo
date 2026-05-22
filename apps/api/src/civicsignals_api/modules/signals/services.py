@@ -43,6 +43,7 @@ from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from civicsignals_api.ids import uuid7
 from civicsignals_api.modules.entities.models import Entity
 from civicsignals_api.modules.icp.models import IcpDefinition
 
@@ -665,7 +666,10 @@ async def _upsert_score(
     """
     dims = result.matched
     values = {
-        "id": uuid.uuid4(),
+        # UUID v7 (time-ordered) so the feed cursor's id tiebreaker stays stable
+        # and index locality holds (matches the model's ``default=uuid7``); a fresh
+        # id is only used on INSERT — the ON CONFLICT path keeps the existing row.
+        "id": uuid7(),
         "workspace_id": workspace_id,
         "signal_id": signal_id,
         "score": result.score,
@@ -942,17 +946,22 @@ async def list_workspace_signals(
     """
     limit = max(1, min(limit, MAX_LIMIT))
     if statuses is None:
+        # No filter requested → the default feed-visible statuses (doc 14 §5.3).
         status_filter: Sequence[str] = FEED_VISIBLE_STATUSES
     else:
+        # An explicit filter — drop unknown values. If the caller asked only for
+        # invalid statuses, the result is an *empty* feed (not "all statuses"): the
+        # request named no valid bucket, so nothing matches.
         status_filter = [s for s in statuses if s in SCORE_STATUSES]
+        if not status_filter:
+            return WorkspaceFeedPage(items=[], next_cursor=None)
 
     stmt = (
         select(WorkspaceScore, Signal)
         .join(Signal, Signal.id == WorkspaceScore.signal_id)
         .where(WorkspaceScore.workspace_id == workspace_id)
+        .where(WorkspaceScore.status.in_(status_filter))
     )
-    if status_filter:
-        stmt = stmt.where(WorkspaceScore.status.in_(status_filter))
     if signal_type is not None:
         stmt = stmt.where(Signal.signal_type == signal_type)
 
