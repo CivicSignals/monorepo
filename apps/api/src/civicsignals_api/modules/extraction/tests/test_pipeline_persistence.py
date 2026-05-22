@@ -34,6 +34,7 @@ from civicsignals_api.llm_gateway import (
     TASK_CLASSIFY,
     TASK_EXTRACTION,
     FakeBackend,
+    FakeEmbeddingBackend,
     LLMGateway,
     ModelChoice,
     TaskModelPolicy,
@@ -54,7 +55,7 @@ from civicsignals_api.modules.extraction.models import (
 )
 from civicsignals_api.modules.extraction.relevance import RelevanceClassifier
 from civicsignals_api.modules.ingestion.services import StoredRawDocument
-from civicsignals_api.modules.signals.models import Signal
+from civicsignals_api.modules.signals.models import EMBEDDING_DIM, Signal
 
 _DSN = os.environ.get("EXTRACTION_TEST_DSN")
 pytestmark = pytest.mark.skipif(
@@ -144,6 +145,13 @@ def _gateway(*, relevance: str, extract: str) -> LLMGateway:
             "extract_be": FakeBackend(provider="extract_be", responses=[extract]),
         },
         policy=policy,
+        # The store stage embeds each promoted signal (I1); the deterministic fake
+        # embedding backend keeps the end-to-end run network-free, and its dim must
+        # match the signals_signal.vector_embedding column (EMBEDDING_DIM = 1536).
+        embedding_backends={
+            "fake_embed": FakeEmbeddingBackend(provider="fake_embed", dim=EMBEDDING_DIM)
+        },
+        embedding_choice=ModelChoice("fake_embed", "fake-embed-model"),
     )
 
 
@@ -288,6 +296,10 @@ async def test_pipeline_end_to_end_persists_candidate(
         assert signals[0].title == "ERP RFP"
         assert signals[0].source_candidate_id == candidates[0].id
         assert str(doc_id) in signals[0].raw_document_ids
+        # The embed step (I1) populated the pgvector column at extraction time.
+        embedding = signals[0].vector_embedding
+        assert embedding is not None
+        assert len(embedding) == EMBEDDING_DIM
 
         refreshed = await session.get(ExtractionJob, job.id)
         assert refreshed is not None

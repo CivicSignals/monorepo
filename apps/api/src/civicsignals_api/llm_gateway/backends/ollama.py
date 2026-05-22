@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from ..types import LLMResult, PermanentLLMError, TransientLLMError
+from ..types import EmbeddingResult, LLMResult, PermanentLLMError, TransientLLMError
 
 
 class OllamaBackend:
@@ -93,4 +93,43 @@ class OllamaBackend:
             provider=self.provider,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+        )
+
+    async def embed(self, *, texts: list[str], model: str) -> EmbeddingResult:
+        """Embed a batch via Ollama's ``/api/embed`` endpoint (I1, doc 19 §7.4).
+
+        Uses the batch ``input`` form (Ollama >= 0.1.39) so the whole batch is one
+        round-trip; ``embeddings`` comes back in input order. Errors are wrapped in
+        the gateway's transient/permanent taxonomy (the raw httpx error never
+        crosses the boundary). Model is reported ``ollama/<name>`` so the accountant
+        prices it at $0 (a local model, doc 06 §7).
+        """
+        payload: dict[str, Any] = {"model": model, "input": texts}
+        try:
+            response = await self._get_client().post(f"{self._base_url}/api/embed", json=payload)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status >= 500 or status == 429:
+                raise TransientLLMError(f"ollama transient error: HTTP {status}") from exc
+            raise PermanentLLMError(f"ollama error: HTTP {status}") from exc
+        except httpx.TransportError as exc:
+            raise TransientLLMError(f"ollama transport error: {exc}") from exc
+
+        try:
+            data = response.json()
+            raw_vectors = data.get("embeddings")
+            if not isinstance(raw_vectors, list):
+                raise TypeError("missing 'embeddings' array")
+            vectors = [[float(x) for x in vec] for vec in raw_vectors]
+            input_tokens = int(data.get("prompt_eval_count", 0) or 0)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise TransientLLMError(f"ollama returned an unexpected body: {exc}") from exc
+
+        return EmbeddingResult(
+            vectors=vectors,
+            model=f"ollama/{model}" if not model.startswith("ollama") else model,
+            provider=self.provider,
+            dim=len(vectors[0]) if vectors else 0,
+            input_tokens=input_tokens,
         )

@@ -12,10 +12,12 @@ import pytest
 from civicsignals_api.config import Settings
 from civicsignals_api.llm_gateway import (
     TASK_CLASSIFY,
+    TASK_EMBED,
     TASK_EXTRACTION,
     AnthropicBackend,
     BackendNotAvailableError,
     FakeBackend,
+    FakeEmbeddingBackend,
     InMemoryTokenAccountant,
     LLMError,
     LLMGateway,
@@ -306,6 +308,121 @@ def test_normalize_error_taxonomy(module_name: str) -> None:
     assert isinstance(normalize(ValueError("boom")), PermanentLLMError)
 
 
+# --- embeddings (I1) -----------------------------------------------------
+
+
+def _embed_gateway(backend: FakeEmbeddingBackend, **kwargs: object) -> LLMGateway:
+    return LLMGateway(
+        {"fake": FakeBackend()},
+        embedding_backends={"embed_be": backend},
+        embedding_choice=ModelChoice("embed_be", "fake-embed-model"),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+async def test_embed_returns_one_vector_per_text_in_order() -> None:
+    backend = FakeEmbeddingBackend(provider="embed_be", dim=8)
+    gw = _embed_gateway(backend)
+    result = await gw.embed(["alpha", "beta", "gamma"])
+    assert result.task == TASK_EMBED
+    assert result.model == "fake-embed-model"
+    assert result.dim == 8
+    assert len(result.vectors) == 3
+    assert all(len(v) == 8 for v in result.vectors)
+    # Order is preserved (the backend recorded the texts in input order).
+    assert backend.calls[0]["texts"] == ["alpha", "beta", "gamma"]
+
+
+async def test_embed_is_deterministic_and_distinguishes_text() -> None:
+    backend = FakeEmbeddingBackend(provider="embed_be", dim=16)
+    gw = _embed_gateway(backend)
+    a1 = (await gw.embed(["same text"])).vectors[0]
+    a2 = (await gw.embed(["same text"])).vectors[0]
+    b = (await gw.embed(["different text"])).vectors[0]
+    # Identical text → identical vector (deterministic across calls/processes).
+    assert a1 == a2
+    # Different text → a different vector.
+    assert a1 != b
+    # Vectors are unit-norm (cosine-friendly, like a real embedding).
+    assert abs(sum(x * x for x in a1) - 1.0) < 1e-9
+
+
+async def test_embed_empty_batch_short_circuits() -> None:
+    backend = FakeEmbeddingBackend(provider="embed_be", dim=8)
+    gw = _embed_gateway(backend)
+    result = await gw.embed([])
+    assert result.vectors == []
+    assert result.dim == 0
+    # No backend call for an empty batch.
+    assert backend.calls == []
+
+
+async def test_embed_accounts_usage_per_workspace() -> None:
+    backend = FakeEmbeddingBackend(provider="embed_be", dim=8)
+    gw = _embed_gateway(backend)
+    await gw.embed(["x" * 40, "y" * 40], workspace_id="ws-embed")
+    usage = gw.usage("ws-embed")
+    assert usage.calls == 1
+    assert usage.input_tokens > 0
+    # Embeddings have no output tokens.
+    assert usage.by_task[TASK_EMBED].output_tokens == 0
+    assert usage.by_task[TASK_EMBED].calls == 1
+
+
+async def test_embed_retries_then_succeeds() -> None:
+    backend = FakeEmbeddingBackend(provider="embed_be", dim=4, fail_times=2)
+    gw = _embed_gateway(backend, max_attempts=3)
+    result = await gw.embed(["recoverable"])
+    assert len(result.vectors) == 1
+    # 2 failures + 1 success = 3 recorded calls.
+    assert len(backend.calls) == 3
+
+
+async def test_embed_exhausts_retries_and_reraises() -> None:
+    backend = FakeEmbeddingBackend(provider="embed_be", dim=4, fail_times=5)
+    gw = _embed_gateway(backend, max_attempts=2)
+    with pytest.raises(TransientLLMError):
+        await gw.embed(["never"])
+
+
+async def test_embed_explicit_provider_and_model_override() -> None:
+    backend = FakeEmbeddingBackend(provider="other_be", dim=4)
+    gw = LLMGateway(
+        {"fake": FakeBackend()},
+        embedding_backends={"other_be": backend},
+        embedding_choice=ModelChoice("embed_be", "default-model"),
+    )
+    result = await gw.embed(["q"], provider="other_be", model="forced-model")
+    assert result.model == "forced-model"
+    assert result.provider == "other_be"
+
+
+async def test_embed_provider_only_override_rejected() -> None:
+    gw = _embed_gateway(FakeEmbeddingBackend(provider="embed_be"))
+    with pytest.raises(ValueError, match="provider and model overrides"):
+        await gw.embed(["q"], provider="embed_be")
+
+
+async def test_embed_without_configured_model_raises() -> None:
+    # No embedding_choice and no explicit provider/model -> a clear error.
+    gw = LLMGateway(
+        {"fake": FakeBackend()},
+        embedding_backends={"embed_be": FakeEmbeddingBackend(provider="embed_be")},
+    )
+    with pytest.raises(LLMError, match="No embedding model configured"):
+        await gw.embed(["q"])
+
+
+async def test_embed_unregistered_provider_raises() -> None:
+    gw = LLMGateway(
+        {"fake": FakeBackend()},
+        embedding_backends={"embed_be": FakeEmbeddingBackend(provider="embed_be")},
+        embedding_choice=ModelChoice("nope", "m"),
+    )
+    with pytest.raises(LLMError, match="No embedding backend registered"):
+        await gw.embed(["q"])
+
+
 # --- settings-driven factory --------------------------------------------
 
 
@@ -313,6 +430,34 @@ def test_build_gateway_registers_all_providers() -> None:
     gw = build_gateway(Settings())
     # All three real providers are registered (lazily importing their SDKs).
     assert set(gw._backends) == {"anthropic", "openai", "ollama"}  # type: ignore[attr-defined]
+    # Embeddings are served by OpenAI + Ollama (Anthropic has no embeddings API).
+    assert set(gw._embedding_backends) == {"openai", "ollama"}  # type: ignore[attr-defined]
+    # The default embedding choice matches the documented OpenAI default.
+    assert gw._embedding_choice == ModelChoice("openai", "text-embedding-3-small")  # type: ignore[attr-defined]
+
+
+def test_build_gateway_shares_backend_instances_for_embeddings() -> None:
+    # The OpenAI/Ollama instances are shared between the completion and embedding
+    # registries so their vendor clients (and aclose) are reused, not duplicated.
+    gw = build_gateway(Settings())
+    assert gw._backends["openai"] is gw._embedding_backends["openai"]  # type: ignore[attr-defined]
+    assert gw._backends["ollama"] is gw._embedding_backends["ollama"]  # type: ignore[attr-defined]
+
+
+def test_build_gateway_embedding_model_provider_split() -> None:
+    settings = Settings(embedding_model="ollama:nomic-embed-text", embedding_provider="openai")
+    gw = build_gateway(settings)
+    # A known-provider prefix splits "provider:model"; the prefix wins over
+    # embedding_provider.
+    assert gw._embedding_choice == ModelChoice("ollama", "nomic-embed-text")  # type: ignore[attr-defined]
+
+
+def test_build_gateway_embedding_ollama_tag_keeps_colon() -> None:
+    settings = Settings(embedding_model="nomic-embed-text:latest", embedding_provider="ollama")
+    gw = build_gateway(settings)
+    # "nomic-embed-text:latest" is an Ollama tag, not provider:model — the whole
+    # string stays the model id under the configured embedding_provider.
+    assert gw._embedding_choice == ModelChoice("ollama", "nomic-embed-text:latest")  # type: ignore[attr-defined]
 
 
 def test_build_gateway_applies_task_model_overrides() -> None:

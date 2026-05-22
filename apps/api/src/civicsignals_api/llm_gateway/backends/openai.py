@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..types import (
     BackendNotAvailableError,
+    EmbeddingResult,
     LLMError,
     LLMResult,
     PermanentLLMError,
@@ -85,6 +86,33 @@ class OpenAIBackend:
             provider=self.provider,
             input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
             output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+        )
+
+    async def embed(self, *, texts: list[str], model: str) -> EmbeddingResult:
+        """Embed a batch via the OpenAI embeddings endpoint (I1, doc 19 §7.4).
+
+        One vector per input text, in input order (the SDK returns each item with an
+        ``index`` we sort on, so order is guaranteed even if the API reorders).
+        Errors are normalised to the gateway's transient/permanent taxonomy so a
+        raw ``openai.*`` exception never crosses the boundary.
+        """
+        client = self._get_client()
+        try:
+            response = await client.embeddings.create(model=model, input=texts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise _normalize_error(exc) from exc
+
+        items = sorted(response.data, key=lambda d: d.index)
+        vectors = [list(item.embedding) for item in items]
+        usage = response.usage
+        return EmbeddingResult(
+            vectors=vectors,
+            model=model,
+            provider=self.provider,
+            dim=len(vectors[0]) if vectors else 0,
+            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
         )
 
 

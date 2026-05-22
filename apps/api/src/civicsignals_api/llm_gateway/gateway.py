@@ -33,10 +33,13 @@ from .accounting import (
     UsageCounters,
     estimate_cost_usd,
 )
-from .policy import TaskModelPolicy
+from .policy import ModelChoice, TaskModelPolicy
 from .types import (
     TASK_CLASSIFY,
+    TASK_EMBED,
+    EmbeddingResult,
     LLMBackend,
+    LLMEmbeddingBackend,
     LLMError,
     LLMResult,
     TransientLLMError,
@@ -58,6 +61,8 @@ class LLMGateway:
         accountant: TokenAccountant | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         prompt_registry: PromptRegistry | None = None,
+        embedding_backends: dict[str, LLMEmbeddingBackend] | None = None,
+        embedding_choice: ModelChoice | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
@@ -69,6 +74,12 @@ class LLMGateway:
         # process-wide singleton on first prompt-registry use (avoids loading the
         # prompts dir for raw ``prompt=`` callers).
         self._prompt_registry = prompt_registry
+        # Embeddings route through a separate backend registry + a single default
+        # model choice (there is one embedding model per deployment, unlike the
+        # per-task completion models). Empty/None until I1 wires them in
+        # ``build_gateway``; ``embed`` raises a clear error if called without one.
+        self._embedding_backends = embedding_backends or {}
+        self._embedding_choice = embedding_choice
 
     def _registry(self) -> PromptRegistry:
         if self._prompt_registry is None:
@@ -213,6 +224,104 @@ class LLMGateway:
 
         return rendered, rendered_system, task, provider, model, resolved.version
 
+    # -- embeddings -------------------------------------------------------
+
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        workspace_id: str | None = None,
+    ) -> EmbeddingResult:
+        """Embed a batch of texts via the configured embeddings backend (I1).
+
+        No module reaches a vendor embeddings SDK directly — like completions, all
+        embedding traffic routes here for backend selection + per-workspace token
+        accounting (doc 06 §7, doc 19 §7.4). Returns one vector per input text in
+        input order. ``provider``/``model`` override the deployment default (must be
+        supplied together, mirroring :meth:`complete`'s escalation override).
+        Transient errors are retried with backoff; usage is recorded against
+        ``workspace_id`` under the :data:`TASK_EMBED` task.
+
+        An empty ``texts`` short-circuits to an empty result (no backend call, no
+        accounting) so callers can pass through trivially-empty batches.
+        """
+        if (provider is None) != (model is None):
+            raise ValueError(
+                "provider and model overrides must be supplied together "
+                f"(got provider={provider!r}, model={model!r})"
+            )
+        if not texts:
+            chosen = self._resolve_embedding_choice(provider, model)
+            return EmbeddingResult(
+                vectors=[], model=chosen.model, provider=chosen.provider, dim=0, input_tokens=0
+            )
+
+        chosen = self._resolve_embedding_choice(provider, model)
+        backend = self._embedding_backends.get(chosen.provider)
+        if backend is None:
+            raise LLMError(
+                f"No embedding backend registered for provider {chosen.provider!r}. "
+                f"Registered: {sorted(self._embedding_backends)}."
+            )
+
+        result = await self._embed_with_retry(backend=backend, texts=texts, model=chosen.model)
+        result = EmbeddingResult(
+            vectors=result.vectors,
+            model=result.model,
+            provider=result.provider,
+            dim=result.dim,
+            input_tokens=result.input_tokens,
+            task=TASK_EMBED,
+        )
+
+        if workspace_id is not None:
+            cost = estimate_cost_usd(result.model, result.input_tokens, 0)
+            self._accountant.record(
+                workspace_id=workspace_id,
+                task=TASK_EMBED,
+                input_tokens=result.input_tokens,
+                output_tokens=0,
+                cost_usd=cost,
+            )
+        return result
+
+    def _resolve_embedding_choice(self, provider: str | None, model: str | None) -> ModelChoice:
+        if provider is not None and model is not None:
+            return ModelChoice(provider=provider, model=model)
+        if self._embedding_choice is None:
+            raise LLMError(
+                "No embedding model configured. Set settings.embedding_model / "
+                "embedding_provider, or pass provider+model to embed()."
+            )
+        return self._embedding_choice
+
+    async def _embed_with_retry(
+        self,
+        *,
+        backend: LLMEmbeddingBackend,
+        texts: list[str],
+        model: str,
+    ) -> EmbeddingResult:
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(self._max_attempts),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+            retry=retry_if_exception_type(TransientLLMError),
+            reraise=True,
+        )
+        async for attempt in retrying:
+            with attempt:
+                if attempt.retry_state.attempt_number > 1:
+                    log.warning(
+                        "llm_gateway.embed_retry",
+                        provider=backend.provider,
+                        model=model,
+                        attempt=attempt.retry_state.attempt_number,
+                    )
+                return await backend.embed(texts=texts, model=model)
+        raise AssertionError("unreachable")  # pragma: no cover
+
     async def _complete_with_retry(
         self,
         *,
@@ -264,8 +373,14 @@ class LLMGateway:
         """Close any backends holding resources (e.g. the Ollama http client).
 
         Call on process/app shutdown. Backends without an ``aclose`` are skipped.
+        A backend registered for both completions and embeddings (the OpenAI /
+        Ollama instances are shared) is closed once — dedupe by identity.
         """
-        for backend in self._backends.values():
+        seen: set[int] = set()
+        for backend in (*self._backends.values(), *self._embedding_backends.values()):
+            if id(backend) in seen:
+                continue
+            seen.add(id(backend))
             closer = getattr(backend, "aclose", None)
             if closer is not None:
                 await closer()

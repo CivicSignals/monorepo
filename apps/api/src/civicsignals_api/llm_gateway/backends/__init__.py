@@ -9,13 +9,14 @@ dependency raises :class:`~civicsignals_api.llm_gateway.types.BackendNotAvailabl
 from __future__ import annotations
 
 from .anthropic import AnthropicBackend
-from .fake import FakeBackend
+from .fake import FakeBackend, FakeEmbeddingBackend
 from .ollama import OllamaBackend
 from .openai import OpenAIBackend
 
 __all__ = [
     "AnthropicBackend",
     "FakeBackend",
+    "FakeEmbeddingBackend",
     "OllamaBackend",
     "OpenAIBackend",
 ]

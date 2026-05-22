@@ -74,6 +74,25 @@ class Settings(BaseSettings):
     # Example: {"classify": "anthropic:claude-3-5-haiku-latest"}.
     llm_task_models: dict[str, str] = Field(default_factory=dict)
 
+    # --- Embeddings (I1, doc 19 §4/§7.4) ------------------------------------
+    # Each extracted signal is embedded into ``signals_signal.vector_embedding``
+    # (a pgvector column) for fuzzy dedupe (E10) + smart-search / hybrid retrieval
+    # (I3). Embeddings route through the gateway like completions (no module calls a
+    # vendor SDK directly) but to a *separate* embeddings model — Anthropic has no
+    # first-party embeddings endpoint, so the default provider is OpenAI.
+    #
+    # ``embedding_model`` is "provider:model" (or just "model", using
+    # ``embedding_provider``). ``embedding_dim`` MUST equal the
+    # ``signals_signal.vector_embedding`` column width (``signals.models``
+    # ``EMBEDDING_DIM`` = 1536); the default model (OpenAI ``text-embedding-3-small``)
+    # natively outputs 1536 dims, so they line up with no truncation. A self-hoster
+    # pointing at an Ollama embeddings model whose native dim differs must set BOTH
+    # this and a matching migration — the embed service refuses a dim mismatch
+    # rather than silently writing a wrong-width vector.
+    embedding_provider: Literal["openai", "ollama"] = "openai"
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dim: int = 1536
+
     api_v1_prefix: str = Field(default="/api/v1")
 
     # ---------------------------------------------------------------------------

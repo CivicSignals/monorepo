@@ -21,6 +21,11 @@ TASK_TRANSLATE = "translate"
 # cheap, low-latency call on the user's search box, so it routes to a Haiku-class
 # model just like classification.
 TASK_SMART_SEARCH_REWRITE = "smart_search_rewrite"
+# Signal embedding (I1, doc 19 §4/§7.4): each extracted signal is embedded into the
+# ``signals_signal.vector_embedding`` pgvector column for fuzzy dedupe (E10) +
+# smart-search / hybrid retrieval (I3). Routes to an embeddings model (OpenAI /
+# Ollama), independent of the completion-task models.
+TASK_EMBED = "embed"
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,28 @@ class LLMResult:
     # callers can start passing it without a later signature change.
     prompt_name: str | None = None
     prompt_version: str | None = None
+
+
+@dataclass(frozen=True)
+class EmbeddingResult:
+    """One batch of text embeddings plus the accounting metadata (I1, doc 19 §7.4).
+
+    ``vectors[i]`` is the embedding for ``texts[i]`` (the gateway preserves order).
+    ``dim`` is the per-vector dimension (every vector in the batch shares it) — the
+    caller asserts it matches the ``signals_signal.vector_embedding`` column width
+    (``signals.models.EMBEDDING_DIM``). ``input_tokens`` is the total tokens billed
+    for the batch (embedding endpoints have no output tokens, so ``output_tokens``
+    is always 0 — kept for symmetry with :class:`LLMResult` so the same
+    :class:`~civicsignals_api.llm_gateway.accounting.TokenAccountant` records both).
+    """
+
+    vectors: list[list[float]]
+    model: str
+    provider: str
+    dim: int
+    input_tokens: int
+    # The logical task this batch was routed for (filled in by the gateway).
+    task: str | None = None
 
 
 class LLMError(Exception):
@@ -85,3 +112,25 @@ class LLMBackend(Protocol):
         temperature: float = 0.0,
         system: str | None = None,
     ) -> LLMResult: ...
+
+
+@runtime_checkable
+class LLMEmbeddingBackend(Protocol):
+    """The async contract for an embeddings backend (I1, doc 19 §7.4).
+
+    Separate from :class:`LLMBackend` because not every completion provider also
+    serves embeddings (Anthropic, e.g., has no first-party embeddings endpoint) and
+    the gateway routes the two independently. ``embed`` must return one vector per
+    input text, in input order, and raise :class:`TransientLLMError` for retryable
+    failures / :class:`BackendNotAvailableError` when its dependency is missing —
+    the same taxonomy :meth:`LLMBackend.complete` uses.
+    """
+
+    provider: str
+
+    async def embed(
+        self,
+        *,
+        texts: list[str],
+        model: str,
+    ) -> EmbeddingResult: ...

@@ -31,6 +31,13 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .embedding import (
+    EmbeddingDimMismatchError,
+    backfill_embeddings,
+    build_embedding_text,
+    embed_signals,
+    embedding_text_for_signal,
+)
 from .models import (
     SIGNAL_STATUS_NEW,
     SIGNAL_STATUS_PENDING_REVIEW,
@@ -331,12 +338,17 @@ __all__ = [
     "MAX_LIMIT",
     "PAYLOAD_BY_TYPE",
     "CandidateInput",
+    "EmbeddingDimMismatchError",
     "SignalPage",
     "SignalPayload",
     "SignalRead",
     "SignalType",
     "SignalValidationError",
+    "backfill_embeddings",
+    "build_embedding_text",
     "decode_cursor",
+    "embed_signals",
+    "embedding_text_for_signal",
     "encode_cursor",
     "get_signal",
     "list_signals",
