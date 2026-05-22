@@ -261,6 +261,13 @@ class SmartSearchResponse(BaseModel):
     the summarizer succeeded **and** there are results to summarize. Callers must
     tolerate ``None`` even when they requested a summary (graceful degradation on
     LLM failure, I4).
+
+    ``budget_exhausted`` (I5): ``True`` when the workspace has reached its daily
+    Smart Search LLM call cap and the response was produced by keyword-only
+    retrieval (BM25/FTS + structured filters) rather than the full LLM-assisted
+    path (NL rewrite + vector ANN + optional summary). Results are still returned
+    normally — this flag is informational, not an error. Clients may show a
+    "Daily AI search limit reached — showing keyword results" notice.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -273,3 +280,6 @@ class SmartSearchResponse(BaseModel):
     # I4: optional LLM summary of the top-N results. Absent (None) when not
     # requested, when there are no results, or when summarization failed.
     summary: str | None = None
+    # I5: True when the daily per-workspace LLM budget was reached and the
+    # response falls back to keyword-only retrieval (no LLM rewrite or summary).
+    budget_exhausted: bool = False

@@ -118,6 +118,24 @@ class Settings(BaseSettings):
     # Example: {"classify": "anthropic:claude-3-5-haiku-latest"}.
     llm_task_models: dict[str, str] = Field(default_factory=dict)
 
+    # --- Smart-search daily LLM budget (I5) ----------------------------------
+    # Soft cap on LLM-assisted smart-search calls per workspace per UTC day.
+    # When a workspace reaches this limit the endpoint falls back to keyword-only
+    # retrieval (BM25/FTS + structured filters, no LLM rewrite or summary) and
+    # returns ``budget_exhausted=True`` in the response — never a hard error.
+    # Set to 0 to disable the daily budget entirely (all requests go through the
+    # full LLM-assisted path, which is appropriate for self-hosted deployments
+    # where the operator controls LLM costs directly).
+    # Env-var: SMART_SEARCH_DAILY_LLM_CALL_LIMIT
+    smart_search_daily_llm_call_limit: int = Field(
+        default=50,
+        description=(
+            "Per-workspace daily cap on LLM-assisted smart-search calls. "
+            "When reached the endpoint falls back to keyword-only retrieval. "
+            "Set to 0 to disable (unlimited)."
+        ),
+    )
+
     # --- Embeddings (I1, doc 19 §4/§7.4) ------------------------------------
     # Each extracted signal is embedded into ``signals_signal.vector_embedding``
     # (a pgvector column) for fuzzy dedupe (E10) + smart-search / hybrid retrieval

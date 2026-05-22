@@ -15,7 +15,11 @@ I4: ``POST /smart-search`` now accepts ``summarize=true`` to request an optional
 LLM synthesis of the top-N results (see :class:`~.services.ResultSummarizer`). The
 LLM cost is metered against the workspace. ``summary`` is ``None`` when not requested,
 when there are no results, or when the summarizer fails (graceful degradation).
-# TODO I5: enforce a per-workspace smart-search token/cost budget before running.
+
+I5: A per-workspace daily LLM call budget is enforced inside
+:meth:`~.services.HybridRetriever.search`. When the workspace has reached its daily
+cap the response falls back to keyword-only retrieval and includes
+``budget_exhausted=True`` — the route itself is unchanged (no extra logic here).
 """
 
 from __future__ import annotations
