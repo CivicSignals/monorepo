@@ -360,3 +360,12 @@ async def test_ollama_does_not_close_injected_client() -> None:
     await backend.aclose()  # no-op for injected clients
     assert not injected.is_closed
     await injected.aclose()
+
+
+async def test_gateway_aclose_closes_backends() -> None:
+    ollama = OllamaBackend(base_url="http://localhost:11434")
+    ollama._get_client()  # type: ignore[attr-defined]  # force client creation
+    # FakeBackend has no aclose — gateway must skip it without error.
+    gw = LLMGateway({"ollama": ollama, "fake": FakeBackend()})
+    await gw.aclose()
+    assert ollama._client is None  # type: ignore[attr-defined]

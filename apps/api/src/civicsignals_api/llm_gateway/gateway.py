@@ -167,3 +167,15 @@ class LLMGateway:
     def reset_usage(self, workspace_id: str | None = None) -> None:
         """Reset accumulated usage for one workspace, or all if ``None``."""
         self._accountant.reset(workspace_id)
+
+    # -- lifecycle --------------------------------------------------------
+
+    async def aclose(self) -> None:
+        """Close any backends holding resources (e.g. the Ollama http client).
+
+        Call on process/app shutdown. Backends without an ``aclose`` are skipped.
+        """
+        for backend in self._backends.values():
+            closer = getattr(backend, "aclose", None)
+            if closer is not None:
+                await closer()
