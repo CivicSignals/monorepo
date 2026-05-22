@@ -39,6 +39,7 @@ from civicsignals_api.llm_gateway import (
 from civicsignals_api.modules.signals.models import EMBEDDING_DIM, Signal
 from civicsignals_api.modules.signals.schemas import SignalRead
 
+from .budget import DailyBudgetTracker, get_budget_tracker
 from .schemas import (
     EntityKind,
     FusionWeights,
@@ -535,6 +536,14 @@ class HybridRetriever:
     Holds the gateway (for embedding the query text) + a :class:`QueryRewriter`;
     each ``search`` call takes a DB session so the same retriever instance serves
     many requests.
+
+    I5 — budget enforcement: the retriever holds a :class:`~.budget.DailyBudgetTracker`
+    (default: the process-level singleton from :func:`~.budget.get_budget_tracker`).
+    Each ``search`` call checks the workspace's daily LLM call budget before
+    running the LLM-assisted path (rewrite + vector ANN + optional summary).
+    When the budget is exhausted the search falls back to keyword-only retrieval
+    (BM25/FTS + structured filters applied to the raw query text) and returns
+    ``budget_exhausted=True`` in the response — never a hard error.
     """
 
     def __init__(
@@ -543,10 +552,13 @@ class HybridRetriever:
         *,
         rewriter: QueryRewriter | None = None,
         summarizer: ResultSummarizer | None = None,
+        budget_tracker: DailyBudgetTracker | None = None,
     ) -> None:
         self._gateway = gateway or get_gateway()
         self._rewriter = rewriter or QueryRewriter(self._gateway)
         self._summarizer = summarizer or ResultSummarizer(self._gateway)
+        # I5: default to the process-level singleton; tests inject a fresh tracker.
+        self._budget = budget_tracker or get_budget_tracker()
 
     async def search(
         self,
@@ -563,6 +575,17 @@ class HybridRetriever:
     ) -> SmartSearchResponse:
         """Run hybrid retrieval for a natural-language ``query`` (doc 14 §6.2).
 
+        I5 — budget gating: before running the LLM-assisted path this method
+        calls :meth:`~.budget.DailyBudgetTracker.check_and_increment` for the
+        workspace.  When the workspace is **under** budget the full LLM-assisted
+        path runs (rewrite + vector ANN + optional summary) and the counter is
+        incremented by exactly 1.  When the workspace is **at or over** the daily
+        cap the search falls back to keyword-only retrieval (BM25/FTS over the
+        raw query text + the caller's explicit ``extra_filters``) and returns
+        ``budget_exhausted=True`` in the response — no hard error, no LLM call.
+        Counter is **not** incremented for keyword-only runs.
+
+        Steps (LLM-assisted path):
         1. Rewrite the NL query (I2) into structured filters + a residual text query.
         2. Merge ``extra_filters`` (explicit UI filter chips) over the rewrite's.
         3. Run vector ANN + BM25 FTS (both scoped to the merged filters) and a
@@ -571,9 +594,13 @@ class HybridRetriever:
         5. Optionally summarize the top-N results into a short NL paragraph (I4).
            Only on ``summarize=True`` and the first page (``cursor`` is ``None``);
            paginated follow-ups are never summarized. Failures are non-fatal.
-           # TODO I5: check per-workspace daily smart-search LLM budget here before
-           # calling the summarizer (I5 caps spend per workspace per day; F3 must
-           # land first to provide workspace budget data).
+
+        Steps (keyword-only fallback):
+        1. Use the raw ``query`` text directly for BM25/FTS (no LLM rewrite).
+        2. Apply ``extra_filters`` as the structured filter gate (no rewrite filters).
+        3. Fuse with BM25-only weights (no vector ANN); vector weight is zeroed
+           so only BM25 + filter results rank.
+        4. Return results with ``budget_exhausted=True``; no summary is generated.
 
         ``workspace_id`` scopes token accounting for the rewrite + query embed
         (doc 06 §7); the signal corpus itself is global (doc 14 §4.2).
@@ -581,6 +608,24 @@ class HybridRetriever:
         weights = weights or FusionWeights()
         offset = _decode_offset_cursor(cursor) if cursor else 0
 
+        # I5: check + (conditionally) increment the daily budget before any LLM call.
+        # ``workspace_id`` may be None for the rewrite endpoint (pre-workspace auth);
+        # with no workspace there is no budget to enforce.
+        llm_allowed = workspace_id is None or self._budget.check_and_increment(workspace_id)
+
+        if not llm_allowed:
+            # Budget exhausted: keyword-only fallback (BM25 + explicit filters, no LLM).
+            return await self._keyword_only_search(
+                session,
+                query,
+                extra_filters=extra_filters,
+                top_n=top_n,
+                candidate_limit=candidate_limit,
+                weights=weights,
+                offset=offset,
+            )
+
+        # Full LLM-assisted path.
         structured, _ = await self._rewriter.rewrite(query, workspace_id=workspace_id)
         filters = _merge_filters(structured.filters, extra_filters)
 
@@ -622,6 +667,70 @@ class HybridRetriever:
             query=structured,
             degraded=structured.degraded,
             summary=summary,
+            budget_exhausted=False,
+        )
+
+    async def _keyword_only_search(
+        self,
+        session: AsyncSession,
+        query: str,
+        *,
+        extra_filters: SearchFilters | None,
+        top_n: int,
+        candidate_limit: int,
+        weights: FusionWeights,
+        offset: int,
+    ) -> SmartSearchResponse:
+        """Keyword-only fallback when the workspace has exhausted its daily LLM budget.
+
+        Runs BM25/FTS over the raw query text and applies ``extra_filters`` as
+        the hard structured-filter gate.  No LLM call (no rewrite, no embed, no
+        summary).  Returns a :class:`SmartSearchResponse` with
+        ``budget_exhausted=True`` so the client can show an appropriate notice.
+
+        The ``query`` field of the response echoes the raw text back in a
+        :class:`StructuredQuery` with ``degraded=True`` (it was not rewritten)
+        so callers that display "we searched for …" still see something useful.
+        """
+        filters = extra_filters or SearchFilters()
+
+        # BM25-only: skip the vector ANN leg (no embed call).
+        bm25_ids = await self._bm25(
+            session, text=query.strip(), filters=filters, limit=candidate_limit
+        )
+        filter_ids = await self._filter_ids(session, filters, limit=candidate_limit)
+
+        # Fuse with vector weight zeroed so only BM25 ranks.
+        kw_weights = FusionWeights(vector=0.0, bm25=weights.bm25, rrf_k=weights.rrf_k)
+        fused = fuse_rankings(
+            vector_ids=[],
+            bm25_ids=bm25_ids,
+            filter_ids=filter_ids,
+            weights=kw_weights,
+        )
+
+        page = fused[offset : offset + top_n]
+        has_more = len(fused) > offset + top_n
+        next_cursor = _encode_offset_cursor(offset + top_n) if has_more else None
+
+        results = await self._hydrate(session, page)
+
+        # Echo the raw query back as a degraded StructuredQuery (no rewrite was run).
+        keyword_query = StructuredQuery(text=query.strip(), degraded=True)
+
+        log.info(
+            "smart_search.budget.keyword_fallback",
+            query_len=len(query),
+            n_results=len(results),
+        )
+
+        return SmartSearchResponse(
+            results=results,
+            next_cursor=next_cursor,
+            query=keyword_query,
+            degraded=True,
+            summary=None,
+            budget_exhausted=True,
         )
 
     # -- retriever (a): vector ANN -------------------------------------------
@@ -846,6 +955,7 @@ def _apply_filters(stmt: Any, filters: SearchFilters) -> Any:
 
 __all__ = [
     "SUMMARY_TOP_N",
+    "DailyBudgetTracker",
     "FusedHit",
     "FusionWeights",
     "HybridRetriever",
@@ -856,4 +966,5 @@ __all__ = [
     "SmartSearchResult",
     "StructuredQuery",
     "fuse_rankings",
+    "get_budget_tracker",
 ]
