@@ -120,7 +120,7 @@ Depending on your location, you may have the following rights regarding your per
 - **Restriction:** Request that we restrict processing in certain circumstances.
 - **Opt-out of sale / sharing (CCPA):** We do not sell personal information. The "Do Not Sell or Share" right is inherently honored.
 
-**Contact records:** If you are a public-sector professional whose contact information appears in CivicSignals as a result of scraping your official agency's website, you may submit an objection via `POST /contacts/{id}/object` (API) or by emailing privacy@civicsignals.io with your name and the URL of the official page where your information appeared. We will remove your record from search/extraction results within 30 days and suppress re-discovery for 24 months. We retain an opaque suppression hash to prevent re-indexing.
+**Contact records:** If you are a public-sector professional whose contact information appears in CivicSignals as a result of scraping your official agency's website, you may submit an objection by emailing privacy@civicsignals.io with your name and the URL of the official page where your information appeared. A self-service API endpoint (`POST /contacts/{id}/object`) is planned for a future release. We will remove your record from search/extraction results within 30 days and suppress re-discovery for 24 months. We retain an opaque suppression hash to prevent re-indexing.
 
 To exercise any of these rights, contact privacy@civicsignals.io. We will respond within 30 days. We may ask you to verify your identity before fulfilling your request.
 

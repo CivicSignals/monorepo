@@ -65,14 +65,14 @@ This FAQ explains what that means in plain language for the most common use case
 
 It does **not** require you to release:
 - Code that interacts with CivicSignals only through its published REST API
-- Separate services or applications that communicate with CivicSignals over a network but whose code is not integrated with CivicSignals's code
+- Separate services or applications that communicate with CivicSignals over a network but whose code is not integrated with CivicSignals' code
 - Your proprietary data, ICP configurations, or content
 
 ---
 
 ### Q7: Can I write a private connector or recipe without releasing it?
 
-**A:** Recipes (YAML files that define scraping logic) and connectors (code called by the recipe runner) that are integrated with CivicSignals's codebase are likely covered by AGPL-3.0 if you distribute or offer the system to outside users. Internal use is fine without release.
+**A:** Recipes (YAML files that define scraping logic) and connectors (code called by the recipe runner) that are integrated with CivicSignals' codebase are likely covered by AGPL-3.0 if you distribute or offer the system to outside users. Internal use is fine without release.
 
 If your recipe is purely declarative YAML (no custom Python code), it may be considered data/configuration rather than software — this is a nuanced legal question on which you should seek your own counsel.
 
@@ -108,7 +108,7 @@ CivicSignals uses AGPL-3.0-only precisely because we want to prevent "cloud clon
 
 ### Q12: I'm a developer contributing a pull request. What license do my contributions have?
 
-**A:** Contributions to CivicSignals are accepted under the **Developer Certificate of Origin (DCO)**, not a CLA. When you submit a pull request, you sign off that you have the right to contribute the code and agree that it will be licensed under AGPL-3.0-only. Sign off with `git commit -s`. See [CONTRIBUTING.md](../../CONTRIBUTING.md) for details.
+**A:** Contributions to CivicSignals are accepted under the **Developer Certificate of Origin (DCO)**, not a CLA. When you submit a pull request, you sign off that you have the right to contribute the code and agree that it will be licensed under AGPL-3.0-only. Sign off with `git commit -s`. See `CONTRIBUTING.md` in the repository root for details (forthcoming — task LC-10).
 
 ---
 
@@ -134,7 +134,7 @@ We considered MIT, Apache-2.0, GPL-3.0, SSPL, and Elastic License v2. We chose A
 ## More Information
 
 - Full license text: [LICENSE](../../LICENSE)
-- Contribution process: [CONTRIBUTING.md](../../CONTRIBUTING.md)
+- Contribution process: `CONTRIBUTING.md` in the repository root (forthcoming — task LC-10)
 - Commercial licensing inquiries: licensing@civicsignals.io
 - Legal questions: legal@civicsignals.io
 - OSI on AGPL-3.0: https://opensource.org/licenses/AGPL-3.0

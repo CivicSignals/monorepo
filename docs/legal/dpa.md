@@ -99,7 +99,7 @@ CivicSignals will notify you without undue delay, and in any case within 72 hour
 
 ## 9. Data Protection Impact Assessment
 
-CivicSignals will provide reasonable assistance to you in carrying out data protection impact assessments (DPIAs) or prior consultations with supervisory authorities where required by Applicable Data Protection Law, to the extent such assistance requires information in CivicSignals's possession.
+CivicSignals will provide reasonable assistance to you in carrying out data protection impact assessments (DPIAs) or prior consultations with supervisory authorities where required by Applicable Data Protection Law, to the extent such assistance requires information in CivicSignals' possession.
 
 ---
 

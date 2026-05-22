@@ -83,9 +83,9 @@ The entire backend is deployed from a **single Docker image** selected by the `P
 │  ▼                                                                           │
 │  ┌─────────────────────────────────────────────────────────────────────────┐│
 │  │  api process (FastAPI/uvicorn)                                          ││
-│  │  - Resolves workspace from auth token on EVERY request                  ││
-│  │  - Sets workspace context; SQLAlchemy listener enforces it on queries   ││
-│  │  - Validates X-Workspace-Id header matches token's workspace            ││
+│  │  - [Planned B5] Resolves workspace from auth token on EVERY request     ││
+│  │  - [Planned B7] SQLAlchemy listener enforces workspace on queries       ││
+│  │  - [Planned B5] Validates X-Workspace-Id header vs token's workspace    ││
 │  └────────────┬────────────────────────────────────────────────────────────┘│
 │               │ Celery tasks (Redis queue)                                   │
 │  ┌────────────▼────────────────────────────────────────────────────────────┐│
@@ -158,14 +158,14 @@ The entire backend is deployed from a **single Docker image** selected by the `P
 
 | STRIDE | Threat | Existing / Planned Mitigations | Residual Risk |
 |---|---|---|---|
-| **Spoofing** | Attacker forges or guesses `X-Workspace-Id` header to access another workspace | The workspace is resolved from the authenticated token, not from the header. The header is only used for routing hints when a user belongs to multiple workspaces and must match the token's workspace set. | LOW |
-| **Tampering** | Attacker modifies workspace_id in a query or request body | ORM-layer enforcement: a SQLAlchemy event listener injects `WHERE workspace_id = :ctx_workspace_id` on every workspace-scoped table. Tests assert that any query on workspace-scoped tables without the workspace context fails the build. | LOW |
-| **Repudiation** | Workspace member denies a privileged action | Append-only audit log (`audit_event` table) for all authenticated actions. API-layer enforcement; direct DB access is not available to users. | LOW |
-| **Information Disclosure** | Query returns rows from another workspace due to missing filter | Defense-in-depth: (1) SQLAlchemy listener, (2) integration tests that run cross-workspace queries and assert they return empty, (3) schemathesis property-based API tests. | LOW-MEDIUM — relies on correctness of the listener; any bypass is high severity. **Action R2:** pentest workspace isolation paths. |
-| **Denial of Service** | Large query or bulk action in one workspace degrades others | Per-workspace usage metering (N3); soft/hard limits (N4); WAF rate limits. | MEDIUM — not yet implemented at MVP. |
-| **Elevation of Privilege** | User in role `viewer` performs `admin` action | RBAC enforced in API decorators (B7); role stored server-side; no client-side elevation. | LOW pending B7 completion. |
+| **Spoofing** | Attacker forges or guesses `X-Workspace-Id` header to access another workspace | **[Planned B5]** The workspace will be resolved from the authenticated token, not the header. The header is used only for routing hints and must match the token's workspace set. | LOW when implemented |
+| **Tampering** | Attacker modifies workspace_id in a query or request body | **[Planned B7]** ORM-layer enforcement: a SQLAlchemy event listener will inject `WHERE workspace_id = :ctx_workspace_id` on every workspace-scoped table. Tests will assert that any such query without the workspace context fails the build. | LOW when implemented; MEDIUM currently (not yet in place) |
+| **Repudiation** | Workspace member denies a privileged action | **[Planned B9]** Append-only audit log (`audit_event` table) for all authenticated actions. API-layer enforcement; direct DB access not available to users. | LOW when implemented |
+| **Information Disclosure** | Query returns rows from another workspace due to missing filter | **[Planned B7/QA-2]** Defense-in-depth: (1) SQLAlchemy listener, (2) integration tests asserting cross-workspace queries return empty, (3) schemathesis property-based API tests. | MEDIUM currently; LOW when controls are in place. **Action R2:** pentest workspace isolation paths. |
+| **Denial of Service** | Large query or bulk action in one workspace degrades others | **[Planned N3/N4]** Per-workspace usage metering; soft/hard limits; WAF rate limits. | MEDIUM — not yet implemented at MVP. |
+| **Elevation of Privilege** | User in role `viewer` performs `admin` action | **[Planned B7]** RBAC enforced in API decorators; role stored server-side; no client-side elevation. | LOW pending B7 completion. |
 
-**Key mitigations:** `workspace_id` isolation is the single highest-value invariant in the system. A bypass is classified as Critical severity. See B7, B8, and the SQLAlchemy event listener in `db.py`.
+**Key mitigations:** `workspace_id` isolation is the single highest-value invariant in the system. A bypass is classified as Critical severity. Controls are being implemented under tasks B7, B8, B9. The SQLAlchemy event listener in `db.py` is the planned enforcement point.
 
 ---
 

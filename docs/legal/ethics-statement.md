@@ -69,7 +69,7 @@ We acknowledge that this places a burden on the individual rather than on the sy
 
 ## Our Stance on Public-Sector AI Procurement
 
-CivicSignals operates during a moment of rapid expansion of AI procurement in the public sector. Every state, city, and school district is evaluating AI tools. This creates more buying signals for CivicSignals's customers — and also raises questions about what CivicSignals's role is in this ecosystem.
+CivicSignals operates during a moment of rapid expansion of AI procurement in the public sector. Every state, city, and school district is evaluating AI tools. This creates more buying signals for CivicSignals' customers — and also raises questions about what CivicSignals' role is in this ecosystem.
 
 Our commitments:
 

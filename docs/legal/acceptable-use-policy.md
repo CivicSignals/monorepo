@@ -42,7 +42,7 @@ The following uses of the Service are prohibited, regardless of whether they vio
 
 ### 2.4 Scraping and Automated Access
 
-- You may **not** scrape, crawl, spider, or otherwise systematically extract data from CivicSignals's own web interface or API beyond the limits of your plan and the API's documented rate limits.
+- You may **not** scrape, crawl, spider, or otherwise systematically extract data from CivicSignals' own web interface or API beyond the limits of your plan and the API's documented rate limits.
 - You may **not** use bots, automated scripts, or mechanical means to access the web interface in ways not authorized by these Terms.
 - Authorized API access under your plan's rate limits is permitted and encouraged.
 
