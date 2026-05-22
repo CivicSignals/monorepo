@@ -25,6 +25,8 @@ from typing import Any
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from civicsignals_api import events
+
 from .models import IcpDefinition
 
 # Cursor pagination defaults (doc 06 §5, doc 08 §1.5).
@@ -185,6 +187,13 @@ async def create_icp(
     # can serialize the row after committing without a lazy refresh that would
     # fail in async context (``expire_on_commit=False`` keeps the loaded state).
     await session.refresh(icp)
+    # F6: notify the backfill listener that this workspace's ICP changed so it can
+    # re-score candidate signals. Only when active — an inactive ICP has no feed lens.
+    if icp.is_active:
+        await events.publish(
+            events.ICP_CHANGED,
+            {"workspace_id": str(icp.workspace_id), "icp_id": str(icp.id)},
+        )
     return icp
 
 
@@ -269,6 +278,13 @@ async def update_icp(
     # Reload server-managed columns (the ``updated_at`` onupdate trigger) so the
     # route can serialize the row post-commit without an async lazy refresh.
     await session.refresh(icp)
+    # F6: a patch to the active ICP's scoring criteria means the workspace feed
+    # may be stale — kick the backfill so re-scoring happens promptly.
+    if icp.is_active:
+        await events.publish(
+            events.ICP_CHANGED,
+            {"workspace_id": str(icp.workspace_id), "icp_id": str(icp.id)},
+        )
     return icp
 
 
@@ -295,4 +311,12 @@ async def set_active(
     # Reload server-managed columns (the ``updated_at`` onupdate trigger) so the
     # route can serialize the row post-commit without an async lazy refresh.
     await session.refresh(icp)
+    # F6: activating a (different) ICP lens changes the workspace's feed — trigger
+    # a backfill so the new ICP's scores are computed promptly. A *de*activation
+    # produces no feed (no active ICP), so no backfill needed.
+    if icp.is_active:
+        await events.publish(
+            events.ICP_CHANGED,
+            {"workspace_id": str(icp.workspace_id), "icp_id": str(icp.id)},
+        )
     return icp

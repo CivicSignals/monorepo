@@ -862,8 +862,9 @@ async def score_workspace_candidates(
     signal ids (the backfill pre-filters the historical window into these), score
     each against the workspace's active ICP and sparse-upsert the matches. Loads the
     active ICP once (unless passed in) so a long backfill does not re-query it per
-    signal. Returns the number of score rows written. The caller owns the
-    transaction.
+    signal. Returns the number of score rows written. Idempotent: re-running with the
+    same signal ids updates (via ON CONFLICT) existing score rows rather than
+    inserting duplicates (doc 14 §7.3). The caller owns the transaction.
     """
     from civicsignals_api.modules.icp import services as icp_services
 
@@ -886,6 +887,80 @@ async def score_workspace_candidates(
         if result is not None:
             written += 1
     return written
+
+
+# ---------------------------------------------------------------------------
+# Backfill candidate pre-filter (F6, doc 14 §7.1)
+# ---------------------------------------------------------------------------
+
+# How many candidates to score synchronously in the route path so the feed has
+# immediate results (doc 14 §7.2). The remaining candidates are handed to
+# ``signals.rescore_workspace`` (Celery, score queue) in bounded batches.
+BACKFILL_SYNC_LIMIT: int = 1_000
+
+# Batch size for the async (Celery) backfill pass (doc 14 §7.2). Each batch is a
+# separate DB transaction so a failure is bounded and the backfill can resume from
+# where the cursor left off.
+BACKFILL_BATCH_SIZE: int = 200
+
+# How far back the backfill looks (doc 14 §7.1). Signals older than this are
+# unlikely to be acted on even if matched; the value keeps the backfill bounded.
+BACKFILL_LOOKBACK_DAYS: int = 180
+
+
+async def candidate_signal_ids_for_icp(
+    session: AsyncSession,
+    icp: IcpDefinition,
+    *,
+    offset: int = 0,
+    limit: int | None = None,
+) -> list[uuid.UUID]:
+    """Fetch candidate signal ids that *could* match ``icp`` (the pre-filter, §6.1).
+
+    Runs the same SQL predicate as :func:`candidate_icp_filter` but in the
+    *workspace-centric* direction: given a fixed ICP, return the global signal ids
+    whose dimensions overlap it, ordered ``observed_at DESC`` (most recent first) so
+    the sync batch surfaces the freshest signals first.
+
+    The result is a flat list of ids; scoring (the expensive part) is deferred to
+    :func:`score_workspace_candidates`. ``offset`` + ``limit`` let the Celery task
+    page through the remainder after the sync batch claimed the first
+    :data:`BACKFILL_SYNC_LIMIT` rows.
+    """
+    from datetime import timedelta
+
+    from .models import SIGNAL_STATUS_MERGED
+
+    # Mirror the signal_matches_icp predicate as a SQL WHERE clause over the
+    # signals table.  We join to entities_entity when we need geo/kind/size dims;
+    # here we only need the signal_type dimension (the cheapest pre-filter) plus
+    # the entity join for country/state/size — same logic as the ICP candidate query
+    # in score_signal_for_all_workspaces.  To stay simple (and avoid a fat join),
+    # we load the signal ids and let score_signal_for_workspace do the full check.
+    #
+    # The cheap pre-filter here: restrict by signal_type if the ICP narrows it, and
+    # cutoff by lookback window.  The remaining dimensions are cheap to check in
+    # Python (via signal_matches_icp) since we only load the id + type here.
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=BACKFILL_LOOKBACK_DAYS)
+
+    stmt = (
+        select(Signal.id)
+        .where(Signal.status != SIGNAL_STATUS_MERGED)
+        .where(Signal.observed_at >= cutoff)
+    )
+
+    if icp.signal_types:
+        stmt = stmt.where(Signal.signal_type.in_(icp.signal_types))
+
+    stmt = stmt.order_by(Signal.observed_at.desc(), Signal.id.desc())
+    if offset:
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1088,9 @@ async def list_workspace_signals(
 
 
 __all__ = [
+    "BACKFILL_BATCH_SIZE",
+    "BACKFILL_LOOKBACK_DAYS",
+    "BACKFILL_SYNC_LIMIT",
     "DEDUPE_WINDOWS",
     "DEFAULT_CONFIG",
     "DEFAULT_DEDUPE_WINDOW",
@@ -1056,6 +1134,7 @@ __all__ = [
     "backfill_embeddings",
     "build_embedding_text",
     "candidate_icp_filter",
+    "candidate_signal_ids_for_icp",
     "compute_dedupe_hash",
     "compute_dedupe_hash_for_payload",
     "config_from_recipe",
