@@ -13,6 +13,7 @@ from civicsignals_api.api.v1 import api_router
 from civicsignals_api.config import get_settings
 from civicsignals_api.logging import configure_logging
 from civicsignals_api.middleware import RequestContextMiddleware
+from civicsignals_api.modules.admin.listeners import register_listeners
 from civicsignals_api.otel import init_otel, instrument_app
 from civicsignals_api.problems import install_problem_handlers
 from civicsignals_api.sentry import init_sentry
@@ -58,6 +59,11 @@ def create_app() -> FastAPI:
     app.add_route("/metrics", metrics, include_in_schema=False)
 
     app.include_router(api_router, prefix=settings.api_v1_prefix)
+
+    # B9: register in-process event-bus listeners that persist domain events as
+    # audit rows.  Must be called after the router is mounted so the DB engine is
+    # ready, but before the app starts serving requests.
+    register_listeners()
 
     @app.get("/healthz", tags=["meta"])
     async def healthz() -> dict[str, str]:
