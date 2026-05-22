@@ -109,17 +109,24 @@ Document:
 def truncate_document(text: str, *, max_chars: int = MAX_DOC_CHARS) -> tuple[str, bool]:
     """Truncate ``text`` to a char budget, cutting on a whitespace boundary.
 
-    Returns ``(text, truncated)``. Cutting near a space keeps the final token
-    intact and avoids feeding a split word to the model.
+    Returns ``(text, truncated)``. Cutting on a whitespace boundary keeps the
+    final token intact and avoids feeding a split word to the model. Any
+    whitespace counts (space, newline, tab) — text and HTML-derived content is
+    often newline-delimited, so a space-only search would split tokens.
     """
     if len(text) <= max_chars:
         return text, False
     cut = text[:max_chars]
-    space = cut.rfind(" ")
+    # Scan backwards for the last whitespace char of any kind.
+    boundary = -1
+    for i in range(len(cut) - 1, -1, -1):
+        if cut[i].isspace():
+            boundary = i
+            break
     # Only honour the boundary if it isn't pathologically early (a document with
-    # no spaces in the budget shouldn't collapse to almost nothing).
-    if space >= max_chars // 2:
-        cut = cut[:space]
+    # no whitespace in the budget shouldn't collapse to almost nothing).
+    if boundary >= max_chars // 2:
+        cut = cut[:boundary]
     return cut.rstrip(), True
 
 
@@ -247,7 +254,7 @@ class RelevanceClassifier:
                 truncated=truncated,
             )
 
-        relevant = bool(parsed.get("relevant", False))
+        relevant = _coerce_relevant(parsed.get("relevant"))
         confidence = _clamp_confidence(parsed.get("confidence"))
         reason = parsed.get("reason")
         return RelevanceVerdict(
@@ -282,6 +289,26 @@ class RelevanceClassifier:
         # populates the autoincrement id without ending the unit of work.
         await session.flush()
         return row
+
+
+_RELEVANT_TRUE_STRINGS: Final = frozenset({"true", "yes", "y", "1"})
+
+
+def _coerce_relevant(raw: object) -> bool:
+    """Coerce the model's ``relevant`` field to a bool, conservatively.
+
+    Plain ``bool(raw)`` is wrong here: the string ``"false"`` is truthy and any
+    non-zero number reads as ``True``, which would silently flip verdicts toward
+    relevant and inflate false positives. We accept real bools, recognise the
+    common string spellings, and treat anything else as not-relevant.
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int | float):
+        return raw != 0
+    if isinstance(raw, str):
+        return raw.strip().lower() in _RELEVANT_TRUE_STRINGS
+    return False
 
 
 def _clamp_confidence(raw: object) -> float:

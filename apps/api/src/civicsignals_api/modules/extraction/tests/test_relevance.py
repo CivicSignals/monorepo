@@ -107,6 +107,32 @@ async def test_confidence_clamped_into_range() -> None:
     assert verdict.confidence == 1.0
 
 
+async def test_relevant_string_false_is_not_truthy() -> None:
+    # `bool("false")` is True; the classifier must read the string "false" as not
+    # relevant rather than flipping the verdict (a false-positive risk).
+    reply = json.dumps({"relevant": "false", "confidence": 0.9})
+    gw, _ = _gateway(reply)
+    classifier = RelevanceClassifier(gateway=gw)
+    verdict = await classifier.classify(_doc("text"))
+    assert verdict.relevant is False
+
+
+async def test_relevant_string_true_is_accepted() -> None:
+    reply = json.dumps({"relevant": "true", "confidence": 0.9})
+    gw, _ = _gateway(reply)
+    classifier = RelevanceClassifier(gateway=gw)
+    verdict = await classifier.classify(_doc("text"))
+    assert verdict.relevant is True
+
+
+async def test_relevant_missing_defaults_to_false() -> None:
+    reply = json.dumps({"confidence": 0.9})
+    gw, _ = _gateway(reply)
+    classifier = RelevanceClassifier(gateway=gw)
+    verdict = await classifier.classify(_doc("text"))
+    assert verdict.relevant is False
+
+
 async def test_unparseable_reply_fails_open() -> None:
     gw, _ = _gateway("I think this is probably relevant, honestly.")
     classifier = RelevanceClassifier(gateway=gw)
@@ -188,6 +214,17 @@ def test_truncate_no_spaces_falls_back_to_hard_cut() -> None:
     out, truncated = truncate_document(text, max_chars=100)
     assert truncated is True
     assert len(out) == 100
+
+
+def test_truncate_cuts_on_newline_boundary() -> None:
+    # Newline-delimited content (common for text/HTML extraction) must cut on the
+    # newline, not split the final line — a space-only search would miss it.
+    text = "alpha\n" * 50  # 300 chars, only newlines as separators
+    out, truncated = truncate_document(text, max_chars=100)
+    assert truncated is True
+    assert len(out) <= 100
+    # No partial "alph"/"alp" tail.
+    assert out.endswith("alpha")
 
 
 async def test_long_document_is_truncated_before_llm() -> None:
