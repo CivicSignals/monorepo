@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://civicsignals.io/schema/connector.schema.json",
+  "title": "Connector descriptor",
+  "description": "Declares a source-type connector. Code-level connectors override behavior; YAML connectors are community-contributable. See doc 16 §17.1.",
+  "type": "object",
+  "required": ["id", "source_type", "discovery_strategy", "fetch_strategy", "parser_strategy"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$" },
+    "source_type": { "type": "string" },
+    "authority": { "type": "string", "description": "Who owns the data." },
+    "base_url": { "type": "string", "format": "uri" },
+    "discovery_strategy": {
+      "type": "string",
+      "enum": ["paginated_listing", "sitemap", "rss", "api", "manual_seed"]
+    },
+    "fetch_strategy": {
+      "type": "string",
+      "enum": ["static_html", "headless_browser", "api", "bulk_download", "foia_workflow"]
+    },
+    "parser_strategy": {
+      "type": "string",
+      "enum": ["structured_extraction", "llm_extraction", "pdf_text", "ocr"]
+    },
+    "rate_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests_per_minute": { "type": "integer", "minimum": 1, "default": 6 },
+        "politeness_seconds": { "type": "integer", "minimum": 0, "default": 10 }
+      }
+    },
+    "auth_requirement": {
+      "type": "string",
+      "enum": ["none", "api_key", "oauth", "vendor_login"],
+      "default": "none"
+    },
+    "robots_policy": {
+      "type": "string",
+      "enum": ["strict", "respect_with_overrides"],
+      "default": "strict"
+    },
+    "legal_notes": { "type": "string" },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "cron": { "type": "string" } }
+    },
+    "signal_types_produced": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

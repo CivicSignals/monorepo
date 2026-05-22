@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://civicsignals.io/schema/recipe.schema.json",
+  "title": "Recipe",
+  "description": "A per-tenant/per-source instantiation of a connector. Hundreds to thousands of these. Declarative YAML, schema-validated, contributable by community (doc 16 §17.4, doc 18 §3).",
+  "type": "object",
+  "required": ["recipe_id", "connector", "version", "entity"],
+  "additionalProperties": false,
+  "properties": {
+    "recipe_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$" },
+    "connector": { "type": "string", "description": "id of the connector this recipe instantiates" },
+    "version": { "type": "integer", "minimum": 1, "description": "runs are tagged with recipe_version; bump to roll forward/back" },
+    "entity": {
+      "type": "object",
+      "description": "How normalize() resolves the producing entity (doc 18 §2.4).",
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": { "type": "string", "description": "stable external id (NCES, IPEDS, FIPS, UEI) — preferred" },
+        "name": { "type": "string" },
+        "state": { "type": "string", "pattern": "^[A-Z]{2}$" },
+        "kind": { "type": "string" }
+      }
+    },
+    "tenant": {
+      "type": "object",
+      "description": "Per-tenant overrides for multi-tenant platform connectors (e.g. subdomain).",
+      "additionalProperties": true
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "cron": { "type": "string" } }
+    },
+    "prefilter": {
+      "type": "string",
+      "enum": ["classifier", "assume_relevant"],
+      "default": "classifier",
+      "description": "assume_relevant skips the Stage-2 relevance classifier for pre-vetted sources (doc 19 §3)."
+    },
+    "fields": {
+      "type": "object",
+      "description": "Field extraction map. Each field lists ordered selectors (primary → fallbacks) per doc 18 §3.4.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "selectors": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+          "required": { "type": "boolean", "default": false }
+        },
+        "required": ["selectors"]
+      }
+    },
+    "signal_types": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Signal types this recipe is expected to produce."
+    }
+  }
+}

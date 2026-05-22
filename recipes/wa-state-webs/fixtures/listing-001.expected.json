@@ -1,0 +1,9 @@
+{
+  "signal_type": "rfp_posted",
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "RFP 2025-014 — District-Wide Network Refresh",
+    "due_date": "2025-07-15"
+  }
+}

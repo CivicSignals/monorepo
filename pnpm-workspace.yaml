@@ -1,0 +1,6 @@
+# Turborepo / pnpm workspaces.
+# Python workspaces (apps/api, packages/sdk-py) are managed by uv, not pnpm,
+# but Turborepo still orchestrates their tasks via each workspace's package.json.
+packages:
+  - "apps/*"
+  - "packages/*"

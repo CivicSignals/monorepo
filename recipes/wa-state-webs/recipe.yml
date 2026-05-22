@@ -1,0 +1,38 @@
+# Example recipe — Washington State WEBS procurement portal.
+# Instantiates the generic `http_static` connector (TODO D6). Public listings
+# only; static HTML; no anti-bot measures (doc 16 §17.1). Serves as the golden
+# reference recipe for the fixture-validation harness.
+recipe_id: wa-state-webs
+connector: http_static
+version: 1
+
+entity:
+  name: Washington State Department of Enterprise Services
+  state: WA
+  kind: state_agency
+
+schedule:
+  cron: "0 */2 * * *" # every 2 hours
+
+# State portal RFP listings are pre-vetted, so skip the Stage-2 relevance
+# classifier (doc 19 §3).
+prefilter: assume_relevant
+
+# Ordered selectors: primary → fallbacks (doc 18 §3.4). A fallback hit flags the
+# extraction `degraded: true` and ticks the recipe drift counter.
+fields:
+  title:
+    selectors:
+      - "h1.solicitation-title"
+      - ".bid-header > h2"
+      - "main h1:first-of-type"
+    required: true
+  due_date:
+    selectors:
+      - ".bid-closing-date time"
+      - "td:contains('Bid Due') + td"
+    required: false
+
+signal_types:
+  - rfp_posted
+  - contract_award

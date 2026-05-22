@@ -1,0 +1,88 @@
+# =============================================================================
+# Existing documentation package — kept locally as reference, not committed.
+# (Per project setup: the pre-build doc package lives alongside the code but is
+# excluded from version control. Paths are anchored to repo root so that
+# README.md files inside apps/ and packages/ are still tracked.)
+# =============================================================================
+/01-product-brief.md
+/02-competitive-teardown.md
+/03-prd.md
+/04-user-journeys.md
+/05-wireframes.md
+/06-architecture.md
+/07-data-model.md
+/08-api-spec.md
+/09-nfr.md
+/10-delivery-plan.md
+/11-qa-test-plan.md
+/12-launch-checklist.md
+/13-shared-signal-strategy.md
+/14-signal-matching.md
+/15-cold-start.md
+/16-data-sources.md
+/17-glossary.md
+/18-ingestion-engineering.md
+/19-signal-processing.md
+/README.md
+/TODO.md
+/wireframes.html
+
+# =============================================================================
+# Secrets / environment
+# =============================================================================
+.env
+.env.*
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+
+# =============================================================================
+# Node / Turborepo / Next.js
+# =============================================================================
+node_modules/
+.pnpm-store/
+.turbo/
+.next/
+out/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+.vercel/
+
+# =============================================================================
+# Python / uv / FastAPI
+# =============================================================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.uv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# =============================================================================
+# Infra / local services
+# =============================================================================
+.docker-data/
+*.sqlite3
+playwright-report/
+test-results/
+
+# =============================================================================
+# Editors / OS
+# =============================================================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json

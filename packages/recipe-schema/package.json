@@ -1,0 +1,17 @@
+{
+  "name": "@civicsignals/recipe-schema",
+  "version": "0.1.0",
+  "description": "Canonical JSON Schema for connector descriptors + recipes. Source of truth shared by the Python runner and TS tooling.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "main": "index.js",
+  "files": ["schema", "index.js", "index.d.ts"],
+  "scripts": {
+    "lint": "node --check index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
