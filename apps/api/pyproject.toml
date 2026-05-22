@@ -89,6 +89,10 @@ dev = [
     # In-memory SQLite backend for billing unit tests (N1); avoids needing
     # Postgres for tests that don't touch CITEXT / pgvector.
     "aiosqlite>=0.20",
+    # Load test runner (QA-3). Locust is dev-only — it is NOT installed in the
+    # api runtime image (uv sync --no-dev in Dockerfile). Scenarios live in
+    # load/ at the repo root; the R3 task executes the real load runs.
+    "locust>=2.31",
 ]
 
 [build-system]
