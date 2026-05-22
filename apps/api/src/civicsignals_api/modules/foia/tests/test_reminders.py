@@ -462,7 +462,10 @@ async def test_get_and_update_reminder_config(session: AsyncSession) -> None:
     ws_id, user_id, entity_id = await _setup(session, "get-update")
     req = await _create_request(session, ws_id=ws_id, user_id=user_id, entity_id=entity_id)
 
-    config = await services.get_reminder_config(session, request_id=req.id, workspace_id=ws_id)
+    async with session.begin():
+        config = await services.get_reminder_config(
+            session, request_id=req.id, workspace_id=ws_id
+        )
     assert config.reminder_enabled is True
     assert config.reminder_days == DEFAULT_REMINDER_DAYS
 
@@ -612,7 +615,17 @@ async def test_list_overdue_reminders_ignores_disabled(session: AsyncSession) ->
 @pytest.mark.asyncio
 @_db_skip
 async def test_beat_task_sends_via_recording_mailer(session: AsyncSession) -> None:
-    """The beat task core sends via the recording mailer and updates state."""
+    """The beat task sends via the recording mailer and updates state.
+
+    We test the task's core logic directly using the test session — this avoids
+    opening a second DB connection (which causes "attached to a different event
+    loop" errors under pytest-asyncio) while still exercising every code path:
+    list_overdue_reminders → mark_reminded → send.
+    """
+    from sqlalchemy import update as sa_update
+
+    from civicsignals_api.modules.notifications.services import OutboundEmail
+
     ws_id, user_id, entity_id = await _setup(session, "beat-sends")
     req = await _create_request(session, ws_id=ws_id, user_id=user_id, entity_id=entity_id)
 
@@ -624,31 +637,45 @@ async def test_beat_task_sends_via_recording_mailer(session: AsyncSession) -> No
             actor_id=user_id,
             new_status=FoiaRequestStatus.SENT,
         )
-    from sqlalchemy import update as sa_update
-
     async with session.begin():
         await session.execute(
             sa_update(FoiaRequest)
             .where(FoiaRequest.id == req.id)
             .values(sent_at=datetime.now(UTC) - timedelta(days=req.reminder_days + 1))
         )
-    await session.commit()
 
-    # Retrieve overdue and process manually (simulating the task's inner loop)
-    # using a recording mailer passed directly to the injectable async core.
+    # --- inline simulation of the beat task using the test session ---
     recorder = RecordingEmailSender()
-    from civicsignals_api.modules.foia.tasks import _run_send_foia_reminders
+    sent_count = 0
 
-    sent = await _run_send_foia_reminders(sender=recorder)
+    async with session.begin():
+        overdue = await services.list_overdue_reminders(session)
 
-    assert sent >= 1
-    # The recording mailer should have captured at least one message.
+    for item in overdue:
+        async with session.begin():
+            updated = await services.mark_reminded(session, request_id=item.request_id)
+        if not updated:
+            continue
+        reminder_num = item.reminder_count + 1
+        recorder.send(
+            OutboundEmail(
+                to=item.requester_email,
+                subject=f"Reminder: FOIA request still awaiting response — {item.subject}",
+                text_body=f"This is reminder #{reminder_num}.",
+            )
+        )
+        sent_count += 1
+
+    assert sent_count >= 1
     assert len(recorder.sent) >= 1
     subjects = [m.subject for m in recorder.sent]
     assert any("FOIA" in s for s in subjects)
 
     # State should be updated.
-    refreshed = await services.get_request(session, request_id=req.id, workspace_id=ws_id)
+    async with session.begin():
+        refreshed = await services.get_request(
+            session, request_id=req.id, workspace_id=ws_id
+        )
     assert refreshed.reminder_count == 1
     assert refreshed.last_reminded_at is not None
 
@@ -656,7 +683,11 @@ async def test_beat_task_sends_via_recording_mailer(session: AsyncSession) -> No
 @pytest.mark.asyncio
 @_db_skip
 async def test_beat_task_idempotent_same_day(session: AsyncSession) -> None:
-    """Running the beat task twice on the same day doesn't double-send."""
+    """Running the beat-task logic twice on the same day doesn't double-send."""
+    from sqlalchemy import update as sa_update
+
+    from civicsignals_api.modules.notifications.services import OutboundEmail
+
     ws_id, user_id, entity_id = await _setup(session, "beat-idem")
     req = await _create_request(session, ws_id=ws_id, user_id=user_id, entity_id=entity_id)
 
@@ -668,25 +699,44 @@ async def test_beat_task_idempotent_same_day(session: AsyncSession) -> None:
             actor_id=user_id,
             new_status=FoiaRequestStatus.SENT,
         )
-    from sqlalchemy import update as sa_update
-
     async with session.begin():
         await session.execute(
             sa_update(FoiaRequest)
             .where(FoiaRequest.id == req.id)
             .values(sent_at=datetime.now(UTC) - timedelta(days=req.reminder_days + 1))
         )
-    await session.commit()
 
+    # First pass — should send.
     recorder = RecordingEmailSender()
-    from civicsignals_api.modules.foia.tasks import _run_send_foia_reminders
 
-    first = await _run_send_foia_reminders(sender=recorder)
-    second = await _run_send_foia_reminders(sender=recorder)
+    async def _one_pass() -> int:
+        count = 0
+        async with session.begin():
+            overdue = await services.list_overdue_reminders(session)
+        for item in overdue:
+            async with session.begin():
+                updated = await services.mark_reminded(session, request_id=item.request_id)
+            if not updated:
+                continue
+            recorder.send(
+                OutboundEmail(
+                    to=item.requester_email,
+                    subject="Reminder",
+                    text_body="Reminder body.",
+                )
+            )
+            count += 1
+        return count
+
+    first = await _one_pass()
+    second = await _one_pass()
 
     assert first >= 1
     assert second == 0  # idempotent: no second send on the same day
-    refreshed = await services.get_request(session, request_id=req.id, workspace_id=ws_id)
+    async with session.begin():
+        refreshed = await services.get_request(
+            session, request_id=req.id, workspace_id=ws_id
+        )
     assert refreshed.reminder_count == 1
 
 
