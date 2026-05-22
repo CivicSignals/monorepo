@@ -76,22 +76,52 @@
     },
     "fields": {
       "type": "object",
-      "description": "Field extraction map. Each field lists ordered selectors (primary → fallbacks) per doc 18 §3.4. D1 evaluates the primary (first) selector; the ordered fallback chain is wired up in D11.",
+      "description": "Field extraction map. Each field lists ordered selectors (primary → fallbacks) per doc 18 §3.4. The runner tries each selector in order, then (when `llm_assisted` is set) an LLM-assisted pass, then dead-letters. A non-primary win flags the document `degraded: true`.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "selectors": {
             "type": "array",
-            "items": { "type": "string" },
             "minItems": 1,
-            "description": "Ordered list: index 0 is the primary; later entries are fallbacks (D11). The runner records which index matched so a fallback hit can flag `degraded: true`."
+            "description": "Ordered list (doc 18 §3.4): index 0 is the primary; later entries are fallbacks. The runner tries each in order, first non-empty match wins, and records which index matched so a fallback hit can flag `degraded: true`. An item is either a bare string (a CSS selector) or an object `{ selector, type }` to declare an XPath fallback alongside CSS primaries.",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "description": "Shorthand for a CSS selector (type defaults to `css`)."
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["selector"],
+                  "properties": {
+                    "selector": { "type": "string", "description": "The CSS selector or XPath expression." },
+                    "type": {
+                      "type": "string",
+                      "enum": ["css", "xpath"],
+                      "default": "css",
+                      "description": "Selector dialect. `css` (default) uses the soup CSS engine; `xpath` evaluates against the parsed tree (requires the ingestion extra's lxml)."
+                    }
+                  }
+                }
+              ]
+            }
           },
           "attr": {
             "type": "string",
             "description": "Optional element attribute to read instead of text content (e.g. `datetime`, `href`)."
           },
-          "required": { "type": "boolean", "default": false }
+          "required": { "type": "boolean", "default": false },
+          "llm_assisted": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, after every CSS/XPath selector fails the runner attempts LLM-assisted extraction for this field via the LLM gateway (doc 18 §2.3, §3.4). Opt-in per field so we never pay for an LLM call on a field that is acceptable to leave empty; an LLM win still flags the document `degraded: true`."
+          },
+          "prompt_name": {
+            "type": "string",
+            "description": "Prompt-registry seam (TODO E3): the named prompt the LLM-assisted pass uses for this field. The runner falls back to a built-in default extraction prompt when omitted or when the registry is unavailable."
+          }
         },
         "required": ["selectors"]
       }
