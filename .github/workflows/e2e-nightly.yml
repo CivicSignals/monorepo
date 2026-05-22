@@ -1,0 +1,81 @@
+# QA-1 — Nightly E2E full suite (Playwright, chromium-full project).
+#
+# Runs all E2E specs including fixme tests (which Playwright auto-skips until
+# they are un-fixme'd as feature tasks merge). As CUF-1..CUF-9 tests become
+# enabled they appear here first — giving a nightly integration view before
+# the smoke job requires them on every PR.
+#
+# Schedule: 02:00 UTC daily (off-peak; avoids Tuesday 06:00 PT digest traffic
+# noted in doc 11 §7). Also runnable manually via workflow_dispatch.
+#
+# Future expansion (QA-5): add Firefox and WebKit projects here.
+name: E2E nightly (full suite)
+
+on:
+  schedule:
+    # 02:00 UTC every day.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Override base URL (default: http://localhost:3000)"
+        required: false
+        default: ""
+
+concurrency:
+  group: e2e-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TURBO_TELEMETRY_DISABLED: "1"
+  DO_NOT_TRACK: "1"
+
+jobs:
+  e2e-full:
+    name: E2E full suite (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node + pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      # Build the production bundle.
+      - name: Build web app
+        run: pnpm --filter @civicsignals/web build
+
+      # Install Chromium for the full project.
+      # QA-5 will add Firefox + WebKit here.
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Run the chromium-full project.
+      # fixme tests are auto-skipped by Playwright; they appear as "skipped" in
+      # the report, giving a clear view of what's pending vs what's actually run.
+      - name: Run full Playwright suite
+        working-directory: apps/web
+        env:
+          CI: "true"
+          # Next.js 15 standalone output: use the standalone server directly.
+          PLAYWRIGHT_START_CMD: "node .next/standalone/apps/web/server.js"
+          # Allow workflow_dispatch override of the base URL (e.g. staging).
+          PLAYWRIGHT_BASE_URL: ${{ inputs.base_url != '' && inputs.base_url || 'http://localhost:3000' }}
+          # When PLAYWRIGHT_BASE_URL points to an external staging server, skip
+          # the built-in webServer auto-start so we don't try to spin up Next.js.
+          PLAYWRIGHT_NO_WEBSERVER: ${{ inputs.base_url != '' && 'true' || '' }}
+        run: pnpm e2e
+
+      # Always upload the full report (including traces on failure).
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-nightly-report-${{ github.run_id }}
+          path: apps/web/playwright-report/
+          retention-days: 30
