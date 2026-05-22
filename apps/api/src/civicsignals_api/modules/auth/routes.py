@@ -542,8 +542,18 @@ async def google_oauth_callback(
         await session.rollback()
         logger.warning("google_oauth_provider_error", detail=str(exc))
         return _error_redirect("provider_error", "Google sign-in failed. Please try again.")
-    except IntegrityError:
+    except IntegrityError as exc:
         await session.rollback()
+        exc_str = str(exc.orig) if exc.orig else str(exc)
+        if "uq_auth_oauth_identity_provider_user" in exc_str:
+            # (provider, user_id) violated: this CivicSignals account already
+            # has a different Google account linked.
+            return _error_redirect(
+                "identity_conflict",
+                "Your CivicSignals account is already linked to a different Google account.",
+            )
+        # (provider, subject) violated: this Google account is linked to
+        # a different CivicSignals account.
         return _error_redirect(
             "identity_conflict",
             "This Google account is already linked to another CivicSignals account.",

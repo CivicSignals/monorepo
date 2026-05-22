@@ -790,8 +790,9 @@ def google_oauth_start(settings: Settings | None = None) -> GoogleOAuthStartResu
 
 
 # Type alias for the injectable HTTP-call factory used by the callback — a
-# callable that accepts the same kwargs as ``httpx.AsyncClient.post`` /
-# ``.get`` and returns the JSON body as a dict. Tests replace this with a mock.
+# **sync** callable that accepts keyword arguments and returns the JSON body as
+# a dict. The injectable path is called without ``await``; only the real httpx
+# branch is async. Tests supply a plain ``def`` that returns a canned dict.
 HttpPostFn = Callable[..., Any]
 
 

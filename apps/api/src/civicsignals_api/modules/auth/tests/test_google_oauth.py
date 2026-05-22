@@ -13,9 +13,10 @@ Covers:
 - Route-level tests (HTTP) via the ``client`` fixture from conftest, mocking
   Google token exchange and userinfo so no live Google call is made.
 
-``http_post`` / ``http_get`` are injected as sync callables that return dicts
-— the service's type alias is ``Callable[..., Any]`` so both sync and async
-callers work (tests use sync; the real code uses async httpx).
+``http_post`` / ``http_get`` are injected as **sync** callables that return dicts.
+The service's type alias is ``Callable[..., Any]``; the injectable path calls
+the function without ``await`` (sync contract only — the real code uses async
+httpx when no override is provided).
 """
 
 from __future__ import annotations
