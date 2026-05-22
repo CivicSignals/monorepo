@@ -10,11 +10,12 @@ doc came from (doc 07 ``ingestion_raw_document``, doc 18 §2.2, §3.6).
 ``UNIQUE (recipe_id, content_hash)`` makes the row upsert idempotent — a re-fetch
 of unchanged content for the same recipe dedupes (doc 07). The ``id`` PK is
 generated application-side (``models._new_uuid``), so this migration needs no
-server-side UUID function. Chains linearly off the entities head
-(``f8de6b788783``); the new table only depends on ``entities_entity`` existing.
+server-side UUID function. Chained after the contacts head (``a1b2c3d4e5f6``) to
+keep a single linear migration head; the new table only depends on
+``entities_entity`` existing, so the order relative to contacts is immaterial.
 
 Revision ID: 6159b96ba523
-Revises: f8de6b788783
+Revises: a1b2c3d4e5f6
 Create Date: 2026-05-22 06:57:55.902504
 """
 
@@ -27,7 +28,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "6159b96ba523"
-down_revision: str | None = "f8de6b788783"
+down_revision: str | None = "a1b2c3d4e5f6"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

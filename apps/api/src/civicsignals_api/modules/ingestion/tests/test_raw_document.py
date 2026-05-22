@@ -56,6 +56,20 @@ _TABLE_NAMES = (
 _BUCKET = "civic-raw-test"
 
 
+def _drop_managed_cascade(conn) -> None:  # type: ignore[no-untyped-def]
+    """Drop this test's managed tables with CASCADE.
+
+    CI shares one database, so another module's fixture may have left a table
+    that FKs into ``entities_entity`` (the global directory, doc 07 §3) — or
+    ``ingestion_raw_document`` itself may carry such a leftover. CASCADE removes
+    only the inbound FK constraints, never another module's table, so the drop
+    can't trip on ``DependentObjectsStillExistError``. Reverse order so a child
+    goes before its parent.
+    """
+    for name in reversed(_TABLE_NAMES):
+        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {name} CASCADE")
+
+
 @pytest_asyncio.fixture
 async def session() -> AsyncIterator[AsyncSession]:
     assert _DSN is not None
@@ -65,16 +79,14 @@ async def session() -> AsyncIterator[AsyncSession]:
         # entities_entity carries a pg_trgm trigram index (ensured by its own
         # before_create hook, but the extension must exist for create_all here).
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        # checkfirst=True so a partial leftover state from another module's
-        # fixture (CI shares one database) doesn't error this setup.
-        await conn.run_sync(Base.metadata.drop_all, tables=tables, checkfirst=True)
+        await conn.run_sync(_drop_managed_cascade)
         await conn.run_sync(Base.metadata.create_all, tables=tables, checkfirst=True)
     try:
         async with AsyncSession(engine) as sess:
             yield sess
     finally:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all, tables=tables, checkfirst=True)
+            await conn.run_sync(_drop_managed_cascade)
         await engine.dispose()
 
 

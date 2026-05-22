@@ -73,19 +73,33 @@ def _get_tables(names: tuple[str, ...]) -> list[Table]:
     return [Base.metadata.tables[n] for n in names]
 
 
+def _drop_managed_cascade(conn) -> None:  # type: ignore[no-untyped-def]
+    """Drop this test's managed tables with CASCADE, in reverse dependency order.
+
+    ``entities_entity`` is the *global* directory other modules FK into (doc 07
+    §3) — e.g. ``ingestion_raw_document.entity_id`` (D3). When a prior test in the
+    same session left such a dependent table around (the auth flow fixture does an
+    unfiltered ``create_all``), a plain metadata ``drop_all`` of these tables fails
+    with ``DependentObjectsStillExistError``. CASCADE removes only the inbound FK
+    constraints, leaving those other modules' tables intact — so this still never
+    drops another module's table; it just no longer trips over an inbound
+    reference. Mirrors the migration helper, which already drops with CASCADE.
+    """
+    for tbl in reversed(_ALL_TABLE_NAMES):
+        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+
+
 @pytest_asyncio.fixture
 async def session() -> AsyncIterator[AsyncSession]:
     assert _DSN is not None
     engine = create_async_engine(_DSN)
 
-    # Drop in reverse dependency order (contacts first, then entities).
-    drop_order = list(reversed(_ALL_TABLE_NAMES))
     create_order = list(_ALL_TABLE_NAMES)
 
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         # Drop existing tables if present from a previous failed run.
-        await conn.run_sync(Base.metadata.drop_all, tables=_get_tables(tuple(drop_order)))
+        await conn.run_sync(_drop_managed_cascade)
         # Create in dependency order.
         await conn.run_sync(Base.metadata.create_all, tables=_get_tables(tuple(create_order)))
 
@@ -97,7 +111,7 @@ async def session() -> AsyncIterator[AsyncSession]:
             yield sess
     finally:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all, tables=_get_tables(tuple(drop_order)))
+            await conn.run_sync(_drop_managed_cascade)
         await engine.dispose()
 
 
