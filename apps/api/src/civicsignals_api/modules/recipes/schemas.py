@@ -485,3 +485,48 @@ class DriftEvaluation(BaseModel):
     pause_reason: str | None = None
     llm_fallback_alert: bool = False
     issue_url: str | None = None
+
+
+# ----------------------------------------------------------------------------
+# Recipe scorecards (doc 19 §12.4, TODO E12)
+# ----------------------------------------------------------------------------
+
+
+class ScorecardHealthOut(StrEnum):
+    """Rolled-up health label for the quality dashboard (E12)."""
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    PAUSED = "paused"
+    UNKNOWN = "unknown"
+
+
+class RecipeScorecardOut(BaseModel):
+    """API response shape for one recipe's quality scorecard (E12).
+
+    Built from E7's ``RunMetric``/``DriftState`` data — no new tables.
+    ``window_24h`` / ``window_7d`` carry the raw rolling-window numbers;
+    ``health`` is the rolled-up dashboard label.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str
+    health: ScorecardHealthOut
+    drift_paused: bool
+    paused_reason: str | None = None
+    paused_at: datetime | None = None
+    drift_issue_url: str | None = None
+    last_run_at: datetime | None = None
+    window_24h: RollingMetrics
+    window_7d: RollingMetrics
+    computed_at: datetime
+
+
+class ScorecardPageOut(BaseModel):
+    """A cursor-paginated list of recipe scorecards (E12)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[RecipeScorecardOut]
+    next_cursor: str | None = None
