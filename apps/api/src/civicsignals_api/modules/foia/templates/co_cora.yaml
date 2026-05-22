@@ -1,0 +1,76 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: CO-CORA
+jurisdiction_name: Colorado Colorado Open Records Act
+state: CO
+statute: "Colo. Rev. Stat. §§ 24-72-200.1–24-72-309"
+deadline_days: 3
+deadline_note: >
+  The custodian must allow inspection within 3 business days (Colo. Rev.
+  Stat. § 24-72-203(1)(a)). For complex or voluminous requests the custodian
+  may extend by an additional 7 business days by written notice
+  (§ 24-72-203(1)(b)). Fees may be charged at actual cost (§ 24-72-205).
+fee_waiver_language: >
+  Pursuant to Colo. Rev. Stat. § 24-72-205(5), I request a fee waiver or
+  reduction because: (1) disclosure of the requested records is in the
+  public interest and will contribute to public understanding of the
+  operations of {entity_name}; (2) I am a {fee_waiver_basis} and not
+  requesting records for a commercial purpose. Please notify me of any
+  charges before proceeding if fees cannot be waived.
+submission_method_hint: >
+  Submit by email or mail to the custodian of records at the relevant
+  agency. Colorado does not require a specific form; a written request
+  identifying the records sought is sufficient.
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  Custodian of Records
+  {entity_name}
+  {records_officer_name}
+
+  **RE: Colorado Open Records Act (CORA) Request — Colo. Rev. Stat. §§ 24-72-200.1 et seq.**
+
+  Dear Custodian of Records:
+
+  Pursuant to the Colorado Open Records Act (CORA), Colo. Rev. Stat.
+  §§ 24-72-200.1 et seq., I hereby request access to and copies of the
+  following records maintained by {entity_name}:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that responsive records be provided in electronic format
+  (email or downloadable link) where available.
+
+  **Fee Waiver Request:**
+  {fee_waiver_language}
+
+  Pursuant to Colo. Rev. Stat. § 24-72-203(1)(a), I expect to be allowed
+  to inspect responsive records within 3 business days. If the scope of
+  the request requires additional time, please provide written notice of
+  any extension and its expected duration.
+
+  If any portion of this request is denied, please provide the applicable
+  statutory exemption and a brief description of the withheld records
+  sufficient for me to evaluate your determination.
+
+  Please confirm receipt of this request.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}

@@ -1,0 +1,79 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: FL-PRA
+jurisdiction_name: Florida Public Records Act (Sunshine Law)
+state: FL
+statute: "Fla. Stat. Ch. 119"
+deadline_days: 0
+deadline_note: >
+  Florida has no fixed statutory deadline; however, agencies must respond
+  within a "reasonable" time (Fla. Stat. § 119.07(1)(a)). Immediately
+  available records must be produced promptly. Failure to respond within
+  a reasonable time may support a petition for writ of mandamus. Attorney's
+  fees may be awarded to a prevailing requestor under § 119.12.
+fee_waiver_language: >
+  Pursuant to Fla. Stat. § 119.07(4), I request that any applicable
+  duplication fees be limited to the actual cost of duplication. I further
+  request a fee waiver or reduction on the ground that this request is made
+  in the public interest and not for commercial gain.
+submission_method_hint: >
+  Florida has broad public records access; requests may be made verbally,
+  in person, by email, or by mail. Written requests are recommended for a
+  clear record of the request.
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  Public Records Custodian
+  {entity_name}
+  {records_officer_name}
+
+  **RE: Public Records Request — Fla. Stat. Ch. 119**
+
+  Dear Public Records Custodian:
+
+  Pursuant to the Florida Public Records Act, Chapter 119, Florida Statutes,
+  I hereby request access to and copies of the following public records
+  maintained by {entity_name}:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that responsive records be produced in electronic format
+  (email attachment or downloadable link) where available. If records
+  exist only in paper form, please advise on the cost of reproduction.
+
+  **Fee Information:**
+  {fee_waiver_language}
+
+  I am a {fee_waiver_basis}. I am prepared to pay reasonable duplication
+  costs but request that you notify me before incurring costs exceeding
+  $25.00.
+
+  Pursuant to Fla. Stat. § 119.07(1)(a), I request that responsive records
+  be produced as promptly as possible. If you need clarification about the
+  scope of this request, please contact me.
+
+  If any records are withheld under a statutory exemption, please provide
+  a written statement identifying the specific exemption claimed and its
+  statutory citation, pursuant to § 119.07(1)(e).
+
+  Please confirm receipt of this request.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}

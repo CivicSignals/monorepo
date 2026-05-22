@@ -1,0 +1,79 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: US-FOIA
+jurisdiction_name: Federal Freedom of Information Act
+state: null
+statute: "5 U.S.C. § 552"
+deadline_days: 20
+deadline_note: >
+  20 business days from receipt (5 U.S.C. § 552(a)(6)(A)(i)). The agency may
+  invoke a 10-business-day extension for unusual circumstances (§ 552(a)(6)(B)).
+  Expedited processing may be requested where there is an imminent threat or
+  other compelling need (§ 552(a)(6)(E)).
+fee_waiver_language: >
+  I request a waiver of all fees associated with this request pursuant to
+  5 U.S.C. § 552(a)(4)(A)(iii), as disclosure of the requested records is in
+  the public interest because it is likely to contribute significantly to public
+  understanding of the operations or activities of the government and is not
+  primarily in my commercial interest. If a fee waiver is denied, I request
+  that I be notified of the estimated fees before processing continues, and I
+  am willing to pay fees up to $25.00.
+submission_method_hint: >
+  Submit by email or certified mail to the agency's FOIA Office. Most federal
+  agencies have online submission portals at www.foia.gov/agency-search.html.
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  FOIA Officer / Records Manager
+  {entity_name}
+  {records_officer_name}
+
+  Via Email / Certified Mail
+
+  **RE: Freedom of Information Act Request**
+
+  Dear FOIA Officer:
+
+  Pursuant to the Freedom of Information Act, 5 U.S.C. § 552, I hereby
+  request access to and copies of the following records:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that these records be provided in electronic format (PDF or
+  native electronic format) where available.
+
+  **Fee Waiver Request:**
+  {fee_waiver_language}
+
+  I am a {fee_waiver_basis}. Disclosure of the requested records will
+  contribute to public understanding of government operations and is not
+  primarily in my commercial interest.
+
+  If my request is denied in whole or in part, I ask that you justify
+  all deletions by reference to specific exemptions of the FOIA.
+
+  I expect a determination within 20 business days as required by
+  5 U.S.C. § 552(a)(6)(A)(i). If additional time is needed, please
+  inform me in writing.
+
+  Please confirm receipt of this request.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}

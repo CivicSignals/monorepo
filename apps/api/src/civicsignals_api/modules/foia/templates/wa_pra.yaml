@@ -1,0 +1,74 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: WA-PRA
+jurisdiction_name: Washington Public Records Act
+state: WA
+statute: "Wash. Rev. Code Ch. 42.56"
+deadline_days: 5
+deadline_note: >
+  Agencies must acknowledge a request and provide an estimated response date
+  within 5 business days of receipt (RCW 42.56.520). If the agency cannot
+  produce records within 5 business days, it must provide a reasonable
+  estimate of when records will be available. Failure to respond creates
+  liability for civil penalties of $5–$100 per day (RCW 42.56.565).
+fee_waiver_language: >
+  Pursuant to RCW 42.56.120(3), I request a waiver of all fees. I am a
+  {fee_waiver_basis} and the release of these records primarily benefits
+  the public and will not primarily serve a commercial interest.
+  If fees cannot be waived, please itemize the costs and notify me before
+  proceeding with charges exceeding $25.00.
+submission_method_hint: >
+  Submit by email, mail, or through the agency's online public records
+  portal (many Washington agencies use GovQA or similar platforms).
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  Public Records Officer
+  {entity_name}
+  {records_officer_name}
+
+  **RE: Public Records Request — RCW Ch. 42.56**
+
+  Dear Public Records Officer:
+
+  Pursuant to the Washington Public Records Act, RCW Chapter 42.56, I
+  hereby request access to and copies of the following public records
+  maintained by {entity_name}:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that responsive records be produced in electronic format
+  (email or downloadable link) where available.
+
+  **Fee Waiver Request:**
+  {fee_waiver_language}
+
+  Pursuant to RCW 42.56.520, I expect an acknowledgement of this request
+  within 5 business days, including an estimated date by which the records
+  will be available.
+
+  If any records are withheld, please identify the specific exemption
+  claimed under RCW Ch. 42.56 and provide a brief description of the
+  withheld records sufficient to evaluate the exemption claim.
+
+  Please confirm receipt of this request.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}
