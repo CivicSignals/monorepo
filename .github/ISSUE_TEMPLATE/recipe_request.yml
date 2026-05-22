@@ -1,0 +1,78 @@
+name: Recipe request
+description: Request ingestion coverage for a new public-data source
+title: "[Recipe]: "
+labels: ["recipe", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Recipes instantiate a connector for a specific source (a state portal, a
+        school district board-docs site, a city procurement page, etc.). Use this
+        to request coverage. If you'd like to contribute the recipe yourself, see
+        the recipe authoring guide and open a PR with golden fixtures.
+  - type: input
+    id: source-name
+    attributes:
+      label: Source name
+      description: The organization or portal this source belongs to.
+      placeholder: "e.g. State of Washington — WEBS procurement portal"
+    validations:
+      required: true
+  - type: input
+    id: source-url
+    attributes:
+      label: Source URL
+      description: The public URL where the data lives.
+      placeholder: "https://..."
+    validations:
+      required: true
+  - type: dropdown
+    id: signal-types
+    attributes:
+      label: Signal types
+      description: What kind of signals does this source carry?
+      multiple: true
+      options:
+        - RFP / bid postings
+        - Contracts / awards
+        - Budgets
+        - Board agendas / minutes
+        - Leadership changes
+        - Other (describe below)
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform (if known)
+      description: Many sources run on a known platform we already support.
+      options:
+        - Unknown
+        - BoardDocs
+        - Granicus / Peak
+        - CivicPlus
+        - Socrata
+        - CKAN
+        - ArcGIS REST
+        - Bonfire / Euna
+        - IonWave
+        - PlanetBids
+        - Other / custom
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else — auth requirements, robots.txt, pagination, JS-rendered content, sample documents.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: This source publishes data publicly (no login/paywall) or I have noted the access requirements above.
+          required: true
+        - label: I searched existing recipes and requests and this is not a duplicate.
+          required: true
