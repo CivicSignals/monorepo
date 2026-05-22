@@ -1,13 +1,14 @@
 "use client";
 
 import { useSearchParams } from "next/navigation";
+import { HubspotSettings } from "@/components/integrations/hubspot-settings";
 import { SalesforceSettings } from "@/components/integrations/salesforce-settings";
 import { SlackSettings } from "@/components/integrations/slack-settings";
 import { useActiveWorkspace, useWorkspaces } from "@/hooks/use-workspaces";
 
-// Integrations settings island (K2 + L1). Renders the Salesforce connection +
-// field-mapping UI and the Slack notification channel selector for the active
-// workspace. The OAuth callback redirects back here with
+// Integrations settings island (K2 + K3 + L1). Renders the Salesforce and
+// HubSpot connection + field-mapping UIs and the Slack notification channel
+// selector for the active workspace. The OAuth callback redirects back here with
 // ?integration=connected|error so we can surface the outcome.
 export function IntegrationsSettings() {
   const { data: workspaces } = useWorkspaces();
@@ -33,6 +34,13 @@ export function IntegrationsSettings() {
           Salesforce
         </h2>
         <SalesforceSettings workspaceId={active?.id} />
+      </section>
+
+      <section aria-labelledby="hubspot-heading">
+        <h2 id="hubspot-heading" className="mb-4 text-xl font-semibold">
+          HubSpot
+        </h2>
+        <HubspotSettings workspaceId={active?.id} />
       </section>
 
       <section aria-labelledby="slack-heading">

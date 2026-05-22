@@ -155,6 +155,26 @@ export function connectSalesforce(
   });
 }
 
+// K3: start the HubSpot OAuth flow. Mirrors connectSalesforce — the API surface
+// is provider-generic, so only the provider id + default target object differ
+// (HubSpot's Deal object's plural API name is "deals").
+export function connectHubspot(
+  token: string,
+  workspaceId: string,
+  name: string,
+): Promise<ConnectionCreated> {
+  return request<ConnectionCreated>("/integrations/connections", {
+    method: "POST",
+    body: JSON.stringify({
+      provider: "hubspot",
+      name,
+      default_targets: ["deals"],
+    }),
+    token,
+    workspaceId,
+  });
+}
+
 export function disconnect(
   token: string,
   workspaceId: string,

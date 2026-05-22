@@ -17,6 +17,7 @@ import {
   type FieldMappingInput,
   type PushInput,
   type PushLogEntry,
+  connectHubspot,
   connectSalesforce,
   deleteFieldMapping,
   disconnect,
@@ -78,6 +79,24 @@ export function useConnectSalesforce(workspaceId: string | undefined) {
       if (!token || !workspaceId)
         return Promise.reject(new Error("no active workspace"));
       return connectSalesforce(token, workspaceId, name);
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: connectionsKey(workspaceId),
+      });
+    },
+  });
+}
+
+/** Start the HubSpot OAuth flow (K3); resolves with a redirect_url to consent. */
+export function useConnectHubspot(workspaceId: string | undefined) {
+  const token = useSessionStore((s) => s.accessToken);
+  const queryClient = useQueryClient();
+  return useMutation<ConnectionCreated, Error, string>({
+    mutationFn: (name) => {
+      if (!token || !workspaceId)
+        return Promise.reject(new Error("no active workspace"));
+      return connectHubspot(token, workspaceId, name);
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({

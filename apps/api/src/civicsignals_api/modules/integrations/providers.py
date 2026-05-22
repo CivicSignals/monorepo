@@ -407,7 +407,8 @@ def is_registered(kind: IntegrationProviderKind) -> bool:
 # (create-or-update by external id for K4 idempotency), and scope-aware error
 # mapping. The HTTP layer is the injected ``httpx.AsyncClient`` so tests mock the
 # Salesforce REST transport (no live org).
-# TODO K3 (HubSpot) / L1 (Slack): register their own providers analogously.
+# K3 (HubSpot) registers its own provider analogously (see below); L1 (Slack)
+# registers a non-CRM provider for channel selection.
 
 # Salesforce REST API version we pin requests to (path segment, e.g. /v60.0/).
 SALESFORCE_API_VERSION = "v60.0"
@@ -713,6 +714,342 @@ class SalesforceProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
             external_id=new_id,
             response={"id": new_id, "success": bool(result_body.get("success", True))},
             provider_response_id=resp.headers.get("x-request-id"),
+            created=True,
+        )
+
+
+# --- HubSpot provider (K3) ----------------------------------------------------
+# K3 mirrors the Salesforce connector (K2) for HubSpot: object discovery (CRM v3
+# schemas), writable-property discovery (CRM v3 properties), and create-or-update
+# push of a **Deal** — or a configurable **custom object** — over the CRM v3 REST
+# API, using the prior ``external_id`` to upsert idempotently (the K4 seam).
+# HubSpot is standard OAuth2 authorization-code (the mixin handles exchange /
+# refresh). Unlike Salesforce there is no per-org instance host: every REST call
+# targets the fixed ``api.hubapi.com`` API base, so no ``instance_url`` is needed.
+# The HTTP layer is the injected ``httpx.AsyncClient`` so tests mock the HubSpot
+# REST transport (no live portal). Token material is never logged (§4.2).
+
+# HubSpot OAuth + CRM v3 hosts.
+HUBSPOT_AUTHORIZE_URL = "https://app.hubspot.com/oauth/authorize"
+HUBSPOT_TOKEN_URL = "https://api.hubapi.com/oauth/v1/token"
+HUBSPOT_API_BASE = "https://api.hubapi.com"
+# CRM REST version segment we pin requests to (e.g. /crm/v3/objects/deals).
+HUBSPOT_CRM_VERSION = "v3"
+# The default push target when a connection has no explicit target configured.
+# HubSpot's Deal object's plural API name is ``deals`` (used in the object path).
+HUBSPOT_DEFAULT_OBJECT = "deals"
+
+# Default scopes: CRM read/write for objects + schemas. ``oauth`` is implicitly
+# granted. Discovery (schemas/properties) is covered by ``crm.objects.*`` +
+# ``crm.schemas.*`` read scopes; a deal create/update needs the deals write scope.
+HUBSPOT_DEFAULT_SCOPES: tuple[str, ...] = (
+    "crm.objects.deals.read",
+    "crm.objects.deals.write",
+    "crm.objects.custom.read",
+    "crm.objects.custom.write",
+    "crm.schemas.deals.read",
+    "crm.schemas.custom.read",
+)
+
+# Standard HubSpot CRM object type names whose schemas the discovery endpoint
+# does not return (it only lists custom objects + a subset), so we always offer
+# the well-known standard objects the connector can push to.
+HUBSPOT_STANDARD_OBJECTS: tuple[tuple[str, str], ...] = (
+    ("deals", "Deal"),
+    ("contacts", "Contact"),
+    ("companies", "Company"),
+    ("tickets", "Ticket"),
+)
+
+
+@register_provider
+class HubSpotProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
+    """The HubSpot CRM connector (K3; mirrors K2 Salesforce, doc 03 F12).
+
+    OAuth2 authorization-code (the mixin handles exchange/refresh); ``push``
+    creates or updates a HubSpot **Deal** — or a configurable **custom object** —
+    over the CRM v3 REST API, using the prior ``external_id`` to upsert
+    idempotently (the K4 seam). Discovery lists the portal's pushable objects
+    (standard + custom) and their writable properties so the field-mapping UI can
+    populate. Vendor errors map onto the scope-aware :class:`PushErrorCode`
+    taxonomy. Token material is never logged (threat-model §4.2).
+
+    Unlike Salesforce there is no per-org ``instance_url``: every REST call
+    targets the fixed ``api.hubapi.com`` host. The non-secret portal id (``hub_id``)
+    is captured in ``provider_account`` for the UI to label the connection.
+
+    Config-gated: ``HUBSPOT_CLIENT_ID`` / ``HUBSPOT_CLIENT_SECRET`` (the route
+    returns a clear 422 when unset, like the other providers).
+    """
+
+    kind = IntegrationProviderKind.HUBSPOT
+    supports_discovery = True
+
+    def oauth_config(self) -> OAuthConfig:
+        return OAuthConfig(
+            authorize_url=HUBSPOT_AUTHORIZE_URL,
+            token_url=HUBSPOT_TOKEN_URL,
+            scopes=HUBSPOT_DEFAULT_SCOPES,
+            client_id=self.settings.hubspot_client_id,
+            client_secret=self.settings.hubspot_client_secret,
+        )
+
+    def parse_token_response(self, body: dict[str, object]) -> TokenSet:
+        """Map the HubSpot token body, capturing the non-secret portal id.
+
+        HubSpot returns ``access_token`` / ``refresh_token`` / ``expires_in`` (and
+        a ``hub_id`` on some responses); the base mixin handles the tokens +
+        expiry. The portal id (``hub_id``) is non-secret and persisted in
+        ``provider_account`` for the UI; the API base is fixed so it is not
+        required to route REST calls (unlike Salesforce's ``instance_url``).
+        """
+        tokens = super().parse_token_response(body)
+        account: dict[str, object] = {}
+        hub_id = body.get("hub_id")
+        if isinstance(hub_id, str | int):
+            account["hub_id"] = str(hub_id)
+        hub_domain = body.get("hub_domain")
+        if isinstance(hub_domain, str):
+            account["hub_domain"] = hub_domain
+        if not account:
+            return tokens
+        return TokenSet(
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            expires_at=tokens.expires_at,
+            scopes=tokens.scopes,
+            provider_account=account,
+        )
+
+    # -- HTTP helpers --------------------------------------------------------
+
+    def _auth_headers(self, access_token: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    async def _request(
+        self,
+        *,
+        method: str,
+        url: str,
+        access_token: str,
+        json_body: dict[str, object] | None = None,
+    ) -> httpx.Response:
+        """Issue a HubSpot CRM v3 REST call, mapping transport errors to typed.
+
+        Network failures become ``transient``; an HTTP error status is mapped via
+        :meth:`_raise_for_status`. Token material lives only in the request
+        header, never in raised messages.
+        """
+        try:
+            resp = await self.http.request(
+                method,
+                url,
+                headers=self._auth_headers(access_token),
+                json=json_body,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(PushErrorCode.TRANSIENT, "HubSpot request failed") from exc
+        return resp
+
+    def _raise_for_status(self, resp: httpx.Response, *, context: str) -> None:
+        """Raise a scope-aware :class:`ProviderError` for a non-2xx response.
+
+        HubSpot returns a JSON error envelope ``{message, category, correlationId,
+        errors:[…]}``; we surface ``message`` and the ``correlationId`` (the
+        portal-side request trace shown in the K5 recovery UI). ``category`` such
+        as ``VALIDATION_ERROR`` refines the HTTP-status → typed-error mapping.
+        """
+        if resp.is_success:
+            return
+        code = map_http_status_to_error_code(resp.status_code)
+        message = f"HubSpot {context} returned {resp.status_code}"
+        detail: dict[str, object] | None = None
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            detail = {k: body[k] for k in ("message", "category", "errors") if k in body}
+            msg = body.get("message")
+            if isinstance(msg, str) and msg:
+                message = msg
+            # A VALIDATION_ERROR category is a non-retryable payload problem even
+            # when HubSpot returns it with a 400/409 (already ``validation``).
+            if body.get("category") == "VALIDATION_ERROR":
+                code = PushErrorCode.VALIDATION
+        correlation_id = resp.headers.get("x-hubspot-correlation-id")
+        if correlation_id is None and isinstance(body, dict):
+            cid = body.get("correlationId")
+            if isinstance(cid, str):
+                correlation_id = cid
+        raise ProviderError(
+            code,
+            message,
+            provider_response_id=correlation_id,
+            response={"status_code": resp.status_code, "detail": detail},
+        )
+
+    # -- Discovery -----------------------------------------------------------
+
+    async def discover_objects(
+        self, *, access_token: str, provider_account: dict[str, object]
+    ) -> list[ObjectDescriptor]:
+        """List the HubSpot objects this connection can push to (K3).
+
+        Always offers the well-known standard objects (Deal/Contact/Company/
+        Ticket) the connector supports, then appends the portal's custom objects
+        from the CRM v3 schemas API. The field-mapping UI uses this to populate
+        the object dropdown.
+        """
+        objects: list[ObjectDescriptor] = [
+            ObjectDescriptor(name=name, label=label, custom=False)
+            for name, label in HUBSPOT_STANDARD_OBJECTS
+        ]
+        url = f"{HUBSPOT_API_BASE}/crm/{HUBSPOT_CRM_VERSION}/schemas"
+        resp = await self._request(method="GET", url=url, access_token=access_token)
+        self._raise_for_status(resp, context="schemas")
+        body = resp.json()
+        results = body.get("results") if isinstance(body, dict) else None
+        seen = {o.name for o in objects}
+        if isinstance(results, list):
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                # Custom objects expose ``name`` (the object type's API name) and
+                # ``labels.plural`` / ``labels.singular`` for display.
+                name = entry.get("fullyQualifiedName") or entry.get("name")
+                if not isinstance(name, str) or name in seen:
+                    continue
+                labels = entry.get("labels")
+                label = name
+                if isinstance(labels, dict):
+                    plural = labels.get("plural") or labels.get("singular")
+                    if isinstance(plural, str) and plural:
+                        label = plural
+                objects.append(ObjectDescriptor(name=name, label=label, custom=True))
+                seen.add(name)
+        return objects
+
+    async def describe_object(
+        self, *, access_token: str, provider_account: dict[str, object], object_name: str
+    ) -> list[FieldDescriptor]:
+        """List the writable properties on ``object_name`` (CRM v3 properties) (K3).
+
+        Returns the non-read-only, non-calculated properties so the mapping UI only
+        offers properties it can actually write; HubSpot does not flag a property
+        ``createable``/``updateable`` separately (a writable property is writable on
+        both), so both flags mirror the writable check. ``required`` reflects the
+        HubSpot ``required`` flag (rare for deal properties).
+        """
+        obj = object_name.replace("/", "")
+        url = f"{HUBSPOT_API_BASE}/crm/{HUBSPOT_CRM_VERSION}/properties/{obj}"
+        resp = await self._request(method="GET", url=url, access_token=access_token)
+        self._raise_for_status(resp, context=f"properties {object_name}")
+        body = resp.json()
+        results = body.get("results") if isinstance(body, dict) else None
+        fields: list[FieldDescriptor] = []
+        if isinstance(results, list):
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str):
+                    continue
+                # Skip properties we can never write: read-only, HubSpot-calculated,
+                # or system fields (``hs_`` calculated). ``modificationMetadata``
+                # carries the authoritative read-only flag when present.
+                if entry.get("calculated") or entry.get("hidden"):
+                    continue
+                mod = entry.get("modificationMetadata")
+                if isinstance(mod, dict) and mod.get("readOnlyValue") is True:
+                    continue
+                label = entry.get("label")
+                fields.append(
+                    FieldDescriptor(
+                        name=name,
+                        label=label if isinstance(label, str) else name,
+                        type=str(entry.get("type", "string")),
+                        required=bool(entry.get("required", False)),
+                        createable=True,
+                        updateable=True,
+                    )
+                )
+        return fields
+
+    # -- Push (create-or-update Deal / custom object) ------------------------
+
+    def _object_name(self, target: str) -> str:
+        """Resolve the HubSpot object API name from a push target.
+
+        ``target`` is the provider-qualified target (e.g. ``hubspot.deals`` or
+        ``hubspot.deal``, or a custom object's fully-qualified name). The bare
+        object name maps to the CRM object path segment (``deals`` by default);
+        the canonical ``deal``/``deals`` alias resolves to ``deals``.
+        """
+        _, _, obj = target.partition(".")
+        obj = obj.strip()
+        if not obj:
+            return HUBSPOT_DEFAULT_OBJECT
+        if obj.lower() in ("deal", "deals"):
+            return HUBSPOT_DEFAULT_OBJECT
+        return obj
+
+    async def push(self, *, access_token: str, request: PushRequest) -> PushResult:
+        """Create or update a HubSpot object from the mapped payload (K3).
+
+        ``request.payload`` is the already-mapped, secret-free body of HubSpot
+        property → value pairs (the field-mapping service shapes it). HubSpot wraps
+        property values in a ``{"properties": {...}}` envelope. When
+        ``request.external_id`` is present the push is an idempotent PATCH update
+        (the K4 seam); otherwise it is a POST create. The new/updated record id is
+        returned as ``external_id``. Vendor errors map to scope-aware codes.
+        """
+        object_name = self._object_name(request.target)
+        objects_base = f"{HUBSPOT_API_BASE}/crm/{HUBSPOT_CRM_VERSION}/objects/{object_name}"
+
+        # Strip control keys (e.g. ``__provider_account__`` injected by the push
+        # runner — HubSpot needs no instance host); only field/value pairs go up,
+        # wrapped in HubSpot's ``properties`` envelope. Values are stringified by
+        # HubSpot itself; we pass them through as-is.
+        properties = {k: v for k, v in request.payload.items() if not k.startswith("__")}
+        json_body: dict[str, object] = {"properties": properties}
+
+        if request.external_id:
+            # Idempotent update of the previously-created record (K4 upsert seam).
+            url = f"{objects_base}/{request.external_id}"
+            resp = await self._request(
+                method="PATCH", url=url, access_token=access_token, json_body=json_body
+            )
+            self._raise_for_status(resp, context=f"update {object_name}")
+            correlation_id = resp.headers.get("x-hubspot-correlation-id")
+            return PushResult(
+                external_id=request.external_id,
+                response={"id": request.external_id, "updated": True},
+                provider_response_id=correlation_id,
+                created=False,
+            )
+
+        # Create a new record.
+        resp = await self._request(
+            method="POST", url=objects_base, access_token=access_token, json_body=json_body
+        )
+        self._raise_for_status(resp, context=f"create {object_name}")
+        result_body = resp.json() if resp.content else {}
+        new_id = result_body.get("id") if isinstance(result_body, dict) else None
+        if not isinstance(new_id, str):
+            raise ProviderError(
+                PushErrorCode.UNKNOWN,
+                "HubSpot create returned no record id",
+                response={"keys": sorted(result_body) if isinstance(result_body, dict) else []},
+            )
+        return PushResult(
+            external_id=new_id,
+            response={"id": new_id},
+            provider_response_id=resp.headers.get("x-hubspot-correlation-id"),
             created=True,
         )
 
