@@ -5,7 +5,15 @@
 // Full suite:   runs nightly; fixme/skip tests are run with --grep skipping
 //               fixme tests (they're automatically skipped by Playwright).
 //
-// QA-5 will extend this config with Firefox + Safari projects (browser matrix).
+// QA-5: Browser matrix — three desktop engine projects (Chromium, Firefox,
+// WebKit/Safari). All existing specs are browser-agnostic and run unchanged on
+// every engine. If a future spec targets Chromium-only behaviour, gate it with
+// a project annotation: `test.use({ ...devices['Desktop Chrome'] })` inside the
+// spec, or add a `grep`/`grepInvert` to the relevant project below.
+//
+// Mobile-viewport sanity: NOT automated here — run manually on real devices or
+// with `playwright test --project=mobile-chrome` in a local environment before
+// any release that changes responsive layout. (QA-5 scope decision.)
 import { defineConfig, devices } from "@playwright/test";
 
 // The base URL is overridable via env so CI can point at a pre-built `next start`
@@ -44,20 +52,63 @@ export default defineConfig({
     : [["list"], ["html", { open: "never" }]],
 
   // --- Projects ---------------------------------------------------------------
-  // Smoke: Chromium only for PR checks (fast, reliable).
-  // Full:  Firefox + WebKit added by QA-5 (browser matrix task).
+  // QA-5: Three desktop engine projects — chromium, firefox, webkit.
+  // Each engine has two variants: smoke (grep: @smoke, PR checks) and full
+  // (all specs, nightly). The smoke projects are the CI default via `pnpm e2e:smoke`.
+  //
+  // WebKit system dependencies may not be available on every Linux runner (see
+  // https://playwright.dev/docs/browsers#webkit). If webkit deps are missing in
+  // CI the job is allowed to fail because e2e-smoke has `continue-on-error: true`.
   projects: [
+    // ---- Chromium (Desktop Chrome) -----------------------------------------
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
     {
       name: "chromium-smoke",
       use: { ...devices["Desktop Chrome"] },
       // Only smoke-tagged tests run in this project (tag: @smoke).
       grep: /@smoke/,
-      grepInvert: undefined,
     },
     {
       name: "chromium-full",
       use: { ...devices["Desktop Chrome"] },
       // Full project runs all tests; fixme tests are auto-skipped by Playwright.
+    },
+
+    // ---- Firefox (Desktop Firefox) -----------------------------------------
+    {
+      name: "firefox",
+      use: { ...devices["Desktop Firefox"] },
+    },
+    {
+      name: "firefox-smoke",
+      use: { ...devices["Desktop Firefox"] },
+      grep: /@smoke/,
+    },
+    {
+      name: "firefox-full",
+      use: { ...devices["Desktop Firefox"] },
+    },
+
+    // ---- WebKit / Safari engine (Desktop Safari) ---------------------------
+    // WebKit binary installs reliably on Linux CI; however OS-level deps
+    // (libwoff2, libflite, libhyphen, etc.) may be missing on minimal runners.
+    // Keep the projects here so the matrix is complete; rely on
+    // `continue-on-error: true` in e2e-smoke if webkit fails in CI.
+    {
+      name: "webkit",
+      use: { ...devices["Desktop Safari"] },
+    },
+    {
+      name: "webkit-smoke",
+      use: { ...devices["Desktop Safari"] },
+      grep: /@smoke/,
+    },
+    {
+      name: "webkit-full",
+      use: { ...devices["Desktop Safari"] },
     },
   ],
 
