@@ -63,8 +63,8 @@ class IcpDefinition(Base):
     __tablename__ = "icp_definition"
     __table_args__ = (
         # GIN indexes on the array dimensions back the matcher's ``@>`` filter
-        # (doc 14 §6.1). ``active`` is included on the signal-types index because
-        # the candidate query always filters ``active = true`` first.
+        # (doc 14 §6.1); the candidate query always filters ``is_active = true``
+        # first (served by ``uq_icp_definition_one_active_per_workspace``).
         Index("ix_icp_definition_countries", "countries", postgresql_using="gin"),
         Index("ix_icp_definition_states", "states", postgresql_using="gin"),
         Index("ix_icp_definition_entity_kinds", "entity_kinds", postgresql_using="gin"),

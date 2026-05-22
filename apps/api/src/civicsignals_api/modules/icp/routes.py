@@ -16,6 +16,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Response, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
@@ -43,6 +44,18 @@ def _not_found() -> ProblemException:
         code="not_found",
         title="ICP not found",
         detail="No such ICP in this workspace.",
+    )
+
+
+def _active_conflict() -> ProblemException:
+    # The partial unique index (one active ICP per workspace) can trip if two
+    # create/activate requests for the same workspace race past the in-txn
+    # deactivation. Map that to 409 rather than letting it surface as a 500.
+    return ProblemException(
+        status=status.HTTP_409_CONFLICT,
+        code="conflict",
+        title="Active ICP conflict",
+        detail="Another ICP was activated concurrently; retry the request.",
     )
 
 
@@ -98,6 +111,9 @@ async def create_icp(
     except services.IcpValidationError as exc:
         await session.rollback()
         raise _validation_problem(str(exc)) from exc
+    except IntegrityError as exc:  # concurrent activation race
+        await session.rollback()
+        raise _active_conflict() from exc
 
     response.headers["Location"] = f"/api/v1/icp/{icp.id}"
     return _icp_out(icp)
@@ -189,6 +205,9 @@ async def activate_icp(
     except services.IcpNotFoundError as exc:
         await session.rollback()
         raise _not_found() from exc
+    except IntegrityError as exc:  # concurrent activation race
+        await session.rollback()
+        raise _active_conflict() from exc
     return _icp_out(icp)
 
 

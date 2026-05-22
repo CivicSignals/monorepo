@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import IcpDefinition
@@ -124,7 +124,10 @@ async def _deactivate_others(
             IcpDefinition.workspace_id == workspace_id,
             IcpDefinition.is_active.is_(True),
         )
-        .values(is_active=False)
+        # A bulk UPDATE bypasses the ORM ``onupdate=func.now()`` hook, so set
+        # ``updated_at`` explicitly to keep the deactivated rows' timestamps in
+        # step with the activation change.
+        .values(is_active=False, updated_at=func.now())
     )
     if except_id is not None:
         stmt = stmt.where(IcpDefinition.id != except_id)

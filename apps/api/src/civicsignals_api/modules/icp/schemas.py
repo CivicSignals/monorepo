@@ -74,7 +74,7 @@ def _normalize_country(value: str) -> str:
 def _normalize_state(value: str) -> str:
     """Uppercase a US state / region code (doc 14 §3.1 ``states``)."""
     code = value.strip().upper()
-    if not (2 <= len(code) <= 2) or not code.isalpha():
+    if len(code) != 2 or not code.isalpha():
         raise ValueError(f"state must be a 2-letter code, got {value!r}")
     return code
 
@@ -111,7 +111,9 @@ class _IcpDimensionsMixin:
         if value is None:
             return None
         for key, weight in value.items():
-            if key not in SignalType.__members__.values():
+            # ``_value2member_map_`` keys on the enum *values* ("rfp_posted", …),
+            # so this is an unambiguous string-key membership test.
+            if key not in SignalType._value2member_map_:
                 raise ValueError(f"unknown signal_type in signal_weights: {key!r}")
             if not (0.0 <= float(weight) <= 1.0):
                 raise ValueError(f"weight for {key!r} must be in [0, 1], got {weight!r}")
