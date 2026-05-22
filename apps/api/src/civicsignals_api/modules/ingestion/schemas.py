@@ -8,6 +8,22 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class RawDocumentRef(BaseModel):
+    """A lightweight reference to a stored raw document (E1 discovery seam).
+
+    Just the identity + provenance the extraction beat task
+    (``run_pending_documents``) needs to create an ``extraction_job`` for a freshly
+    fetched document, without loading the full row or the bytes. ``created_at`` is
+    the cursor the task pages forward on (oldest first).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    recipe_id: str
+    created_at: datetime
+
+
 class StoredRawDocument(BaseModel):
     """A persisted ``ingestion_raw_document`` row + its S3 content address (D3).
 

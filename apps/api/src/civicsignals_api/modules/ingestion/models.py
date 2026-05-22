@@ -111,4 +111,8 @@ class RawDocument(Base):
         Index("ingestion_raw_document_entity_idx", "entity_id"),
         # Replay/extraction picks docs up by content hash (doc 18 §3.6).
         Index("ingestion_raw_document_content_hash_idx", "content_hash"),
+        # The extraction beat task (E1) pages new docs oldest-first on the keyset
+        # cursor (created_at, id) via ``services.list_raw_document_refs``; this
+        # composite index makes that scan an index range, not a seq scan.
+        Index("ingestion_raw_document_created_at_id_idx", "created_at", "id"),
     )
