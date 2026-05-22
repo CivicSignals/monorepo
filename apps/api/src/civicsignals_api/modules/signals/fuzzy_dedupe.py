@@ -294,7 +294,9 @@ async def apply_fuzzy_review(
             # Raising here prevents the review from being marked approved without
             # actually merging — the review queue's integrity is more important than
             # silently accepting a no-op approval.
-            raise FuzzyReviewSignalMissingError(review_id, review.candidate_signal_id, review.matched_signal_id)
+            raise FuzzyReviewSignalMissingError(
+                review_id, review.candidate_signal_id, review.matched_signal_id
+            )
         merge_signal(
             matched,
             new_doc_ids=[uuid.UUID(s) for s in candidate.raw_document_ids],

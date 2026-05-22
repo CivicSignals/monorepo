@@ -1,4 +1,4 @@
-"""E10: signals_fuzzy_review table for embedding-based fuzzy-dedupe human review queue.
+"""E10: signals_fuzzy_review table + merged_into column on signals_signal.
 
 Adds the ``signals_fuzzy_review`` table (doc 19 §7.4; E10). Each row represents a
 fuzzy-match candidate (high-stakes signal types: rfp_posted / contract_expiring)
@@ -6,8 +6,10 @@ that was routed to human review instead of auto-merging, during the first
 ``GRADUATION_COUNT`` (100) fuzzy matches per signal type. A reviewer approves
 (triggering a merge) or rejects (keeping the candidate as a distinct signal).
 
-No change to ``signals_signal`` itself — the pgvector column + ivfflat index
-(c1d2e3f4a5b6, e5fd99021455) already exist from I1.
+Also adds ``merged_into`` (UUID, nullable) to ``signals_signal`` — a soft-delete
+pointer set when a candidate is merged into a surviving signal (approve / auto-merge).
+Merged rows keep their raw_document_ids for the audit trail but are excluded from
+list_signals / feed queries (filtered on ``status != 'merged'``).
 
 Revision ID: e10a1b2c3d4e
 Revises: 17a4017e2617
@@ -68,8 +70,16 @@ def upgrade() -> None:
         ["matched_signal_id"],
     )
 
+    # Soft-delete support for merged candidates (E10 recovery fix).
+    # merged_into: loose UUID ref to the surviving signal after fuzzy-dedupe merge.
+    op.add_column(
+        "signals_signal",
+        sa.Column("merged_into", postgresql.UUID(as_uuid=True), nullable=True),
+    )
+
 
 def downgrade() -> None:
+    op.drop_column("signals_signal", "merged_into")
     op.drop_index("signals_fuzzy_review_matched_idx", table_name="signals_fuzzy_review")
     op.drop_index("signals_fuzzy_review_candidate_idx", table_name="signals_fuzzy_review")
     op.drop_index("signals_fuzzy_review_type_status_idx", table_name="signals_fuzzy_review")

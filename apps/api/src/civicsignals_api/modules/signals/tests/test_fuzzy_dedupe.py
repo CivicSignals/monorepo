@@ -45,7 +45,7 @@ from civicsignals_api.modules.signals.fuzzy_dedupe import (
     run_fuzzy_dedupe,
     should_auto_merge,
 )
-from civicsignals_api.modules.signals.models import EMBEDDING_DIM, Signal
+from civicsignals_api.modules.signals.models import EMBEDDING_DIM, SIGNAL_STATUS_MERGED, Signal
 from civicsignals_api.modules.signals.models_fuzzy_review import (
     REVIEW_STATUS_APPROVED,
     REVIEW_STATUS_PENDING,
@@ -440,6 +440,20 @@ async def test_auto_merge_after_graduation(session: AsyncSession) -> None:
     assert refreshed is not None
     assert len(refreshed.raw_document_ids) == existing_doc_count + 1
 
+    # Auto-merged candidate must be soft-deleted: status=merged, not in list_signals.
+    # (E10 recovery fix: Copilot finding — auto-merged row was left un-hidden.)
+    refreshed_candidate = await session.get(Signal, candidate.id)
+    assert refreshed_candidate is not None
+    assert refreshed_candidate.status == SIGNAL_STATUS_MERGED
+    assert refreshed_candidate.merged_into == existing.id
+
+    page = await services.list_signals(session)
+    listed_ids = {str(s.id) for s in page.items}
+    assert str(candidate.id) not in listed_ids, (
+        "auto-merged candidate must not appear in list_signals"
+    )
+    assert str(existing.id) in listed_ids, "surviving signal must still appear in list_signals"
+
 
 # ---------------------------------------------------------------------------
 # Review approve → merge
@@ -499,6 +513,19 @@ async def test_review_approve_merges_signals(session: AsyncSession) -> None:
     all_doc_ids = set(refreshed.raw_document_ids)
     assert all_doc_ids.issuperset(set(existing_doc_ids_before))
     assert set(candidate.raw_document_ids).issubset(all_doc_ids)
+
+    # Candidate row is soft-deleted: status=merged, merged_into points to survivor.
+    refreshed_candidate = await session.get(Signal, candidate.id)
+    assert refreshed_candidate is not None
+    assert refreshed_candidate.status == SIGNAL_STATUS_MERGED
+    assert refreshed_candidate.merged_into == existing.id
+
+    # list_signals must NOT include the merged candidate (E10 recovery fix: Copilot
+    # finding — approved merge left the duplicate row surfacing in results).
+    page = await services.list_signals(session)
+    listed_ids = {str(s.id) for s in page.items}
+    assert str(candidate.id) not in listed_ids, "merged candidate must not appear in list_signals"
+    assert str(existing.id) in listed_ids, "surviving signal must still appear in list_signals"
 
 
 # ---------------------------------------------------------------------------
@@ -699,3 +726,104 @@ async def test_fuzzy_query_respects_window(session: AsyncSession) -> None:
         config=cfg,
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# HTTP admin gate tests (no DB required — dependency override)
+# ---------------------------------------------------------------------------
+# These tests verify that the fuzzy-review endpoints return 401 when
+# unauthenticated and 403 when the user lacks admin role. They use FastAPI's
+# TestClient with dependency overrides so no live DB is needed.
+# (E10 recovery fix: Copilot finding — endpoints had NO auth dependency.)
+# ---------------------------------------------------------------------------
+
+
+def test_fuzzy_reviews_list_requires_auth() -> None:
+    """GET /signals/fuzzy-reviews returns 401 when no bearer token is provided."""
+    from fastapi.testclient import TestClient
+
+    from civicsignals_api.main import app
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.get("/api/v1/signals/fuzzy-reviews")
+    assert resp.status_code == 401
+
+
+def test_fuzzy_review_get_requires_auth() -> None:
+    """GET /signals/fuzzy-reviews/{id} returns 401 when unauthenticated."""
+    from fastapi.testclient import TestClient
+
+    from civicsignals_api.main import app
+
+    fake_id = uuid.uuid4()
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.get(f"/api/v1/signals/fuzzy-reviews/{fake_id}")
+    assert resp.status_code == 401
+
+
+def test_fuzzy_review_approve_requires_auth() -> None:
+    """POST /signals/fuzzy-reviews/{id}/approve returns 401 when unauthenticated."""
+    from fastapi.testclient import TestClient
+
+    from civicsignals_api.main import app
+
+    fake_id = uuid.uuid4()
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(f"/api/v1/signals/fuzzy-reviews/{fake_id}/approve")
+    assert resp.status_code == 401
+
+
+def test_fuzzy_review_reject_requires_auth() -> None:
+    """POST /signals/fuzzy-reviews/{id}/reject returns 401 when unauthenticated."""
+    from fastapi.testclient import TestClient
+
+    from civicsignals_api.main import app
+
+    fake_id = uuid.uuid4()
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(f"/api/v1/signals/fuzzy-reviews/{fake_id}/reject")
+    assert resp.status_code == 401
+
+
+def test_fuzzy_review_list_non_admin_gets_403_or_404() -> None:
+    """Non-admin member cannot access fuzzy-review endpoints (E10 security fix).
+
+    Uses a fake ``require_workspace`` that returns a viewer-role context so the
+    RequireAdmin dependency sees an insufficient role → 403. (A non-member
+    yields 404 — both are acceptable and better than 200.)
+    """
+    from typing import Any
+    from unittest.mock import MagicMock
+
+    from fastapi.testclient import TestClient
+
+    from civicsignals_api.main import app
+    from civicsignals_api.modules.accounts.models import MembershipRole
+    from civicsignals_api.modules.auth.dependencies import WorkspaceContext, require_workspace
+
+    fake_workspace = MagicMock()
+    fake_workspace.id = uuid.uuid4()
+    fake_membership = MagicMock()
+    fake_membership.role = MembershipRole.VIEWER
+
+    viewer_ctx = WorkspaceContext(
+        user=MagicMock(),
+        workspace=fake_workspace,
+        membership=fake_membership,
+    )
+
+    def _viewer_ctx() -> Any:
+        return viewer_ctx
+
+    app.dependency_overrides[require_workspace] = _viewer_ctx
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.get(
+                "/api/v1/signals/fuzzy-reviews",
+                headers={"X-Workspace-Id": str(fake_workspace.id)},
+            )
+        assert resp.status_code in (403, 404), (
+            f"Expected 403 or 404 for non-admin, got {resp.status_code}: {resp.text}"
+        )
+    finally:
+        app.dependency_overrides.pop(require_workspace, None)

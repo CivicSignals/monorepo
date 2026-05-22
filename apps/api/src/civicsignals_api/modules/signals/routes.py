@@ -8,11 +8,16 @@ joins on top. Writes happen only through the extraction funnel (E1 →
 ``services.promote_candidate_to_signal``), never via HTTP.
 
   GET  /signals                              — list global signals (cursor-paginated)
-  GET  /signals/{id}                         — get one signal
   GET  /signals/fuzzy-reviews                — list fuzzy-dedupe review rows (admin)
   GET  /signals/fuzzy-reviews/{id}           — get one review row
   POST /signals/fuzzy-reviews/{id}/approve   — approve → merge candidate into match
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
+  GET  /signals/{id}                         — get one signal
+
+Route ordering note: ``/fuzzy-reviews`` and its sub-paths MUST be registered before
+``/{signal_id}`` (the parameterised catch-all) so that FastAPI's routing evaluates
+the static prefix first. Moving ``/{signal_id}`` to the end of the file preserves
+this invariant regardless of how many fuzzy-review endpoints are added later.
 
 Fuzzy-review endpoints are admin-gated (doc 19 §7.4 — the review queue is an
 internal tool to validate the 0.92 cosine threshold before enabling auto-merge).
@@ -87,18 +92,6 @@ async def list_signals(
         return _problem(400, "Invalid cursor", "The supplied cursor is malformed.")
 
 
-@router.get("/{signal_id}", response_model=SignalRead, summary="Get one signal")
-async def get_signal(
-    signal_id: uuid.UUID,
-    session: SessionDep,
-) -> SignalRead | JSONResponse:
-    """Fetch one global signal by id."""
-    signal = await services.get_signal(session, signal_id)
-    if signal is None:
-        return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
-    return signal
-
-
 # ---------------------------------------------------------------------------
 # Fuzzy-review schemas (E10, doc 19 §7.4)
 # ---------------------------------------------------------------------------
@@ -139,6 +132,9 @@ class FuzzyReviewDecisionIn(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Fuzzy-review endpoints (admin-gated; E10, doc 19 §7.4)
+#
+# IMPORTANT: these routes are registered BEFORE /{signal_id} (below) so the
+# static ``/fuzzy-reviews`` prefix is matched first by FastAPI's router.
 # ---------------------------------------------------------------------------
 
 
@@ -271,3 +267,20 @@ async def reject_fuzzy_review(
         )
     await session.commit()
     return FuzzyReviewRead.model_validate(row)
+
+
+# ---------------------------------------------------------------------------
+# Parameterised signal endpoint — MUST be last so static prefixes above win.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{signal_id}", response_model=SignalRead, summary="Get one signal")
+async def get_signal(
+    signal_id: uuid.UUID,
+    session: SessionDep,
+) -> SignalRead | JSONResponse:
+    """Fetch one global signal by id."""
+    signal = await services.get_signal(session, signal_id)
+    if signal is None:
+        return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
+    return signal
