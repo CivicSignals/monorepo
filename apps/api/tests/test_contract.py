@@ -6,8 +6,11 @@ The schema is loaded from the ASGI app in-process — no running server needed.
 Coverage today
 --------------
 Only endpoints reachable without authentication are tested:
-  - GET /healthz          (always public)
-  - GET /api/v1/openapi.json  (always public)
+  - GET /healthz          (always public; declared as a path operation in the schema)
+
+Note: ``/api/v1/openapi.json`` is the schema endpoint itself and is NOT included
+as an operation in the OpenAPI spec (FastAPI excludes it to avoid recursion).
+It is already tested by ``tests/test_health.py::test_openapi_published``.
 
 This is intentional — the auth module (B1) is not yet merged, so there are
 no bearer-authenticated endpoints to test. As endpoints land, add them in the
@@ -61,8 +64,12 @@ _schema = from_asgi("/api/v1/openapi.json", app)
 # ---------------------------------------------------------------------------
 
 _PUBLIC_PATHS: list[str] = [
+    # GET /healthz is the only path operation declared in the schema today
+    # that requires no authentication. /api/v1/openapi.json is the schema
+    # endpoint itself and FastAPI does not include it as a path operation
+    # (it would create a self-referential loop). That endpoint is covered by
+    # tests/test_health.py::test_openapi_published instead.
     "/healthz",
-    "/api/v1/openapi.json",
 ]
 
 _public_schema = _schema.include(path=_PUBLIC_PATHS)
@@ -104,13 +111,7 @@ def test_openapi_contract_public(case):  # type: ignore[no-untyped-def]
     - status_code_conformance: status code must appear in the declared
       responses for this operation.
     """
-    response = case.call_and_validate()
-    # Belt-and-suspenders: explicitly assert no 5xx even though
-    # call_and_validate already applies not_a_server_error.
-    assert response.status_code < 500, (
-        f"Server error {response.status_code} on {case.method} {case.path}: "
-        f"{response.text[:200]}"
-    )
+    case.call_and_validate()
 
 
 # ---------------------------------------------------------------------------
