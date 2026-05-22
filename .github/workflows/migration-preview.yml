@@ -1,0 +1,152 @@
+# Migration SQL preview (task A4).
+#
+# On every PR that touches apps/api (migrations, models, or alembic config),
+# generate the pending-migration SQL (`alembic upgrade head --sql`) and attach
+# it as a build artifact + post a summary comment on the PR.
+#
+# Non-blocking: continue-on-error — a broken migration preview never fails CI.
+# Requires: postgres service, uv/Python 3.12, alembic in the API deps.
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Migration preview
+
+on:
+  pull_request:
+    paths:
+      - "apps/api/**"
+      - "infra/docker-compose.yml"
+
+permissions:
+  contents: read
+  pull-requests: write   # needed to post a PR comment
+
+jobs:
+  migration-preview:
+    name: Alembic migration SQL preview
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: civic
+          POSTGRES_PASSWORD: civic
+          POSTGRES_DB: civicsignals_preview
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U civic"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_DIRECT_URL: postgresql+asyncpg://civic:civic@localhost:5432/civicsignals_preview
+      DATABASE_URL: postgresql+asyncpg://civic:civic@localhost:5432/civicsignals_preview
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (Python 3.12)
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      - name: Install API deps
+        working-directory: apps/api
+        run: uv sync --frozen
+
+      # Generate the SQL that would be applied if we ran `alembic upgrade head`
+      # against a clean database.  This shows reviewers exactly what DDL will
+      # run on the staging/production VPS.
+      - name: Generate migration SQL
+        id: sql
+        working-directory: apps/api
+        run: |
+          set -euo pipefail
+          # Run against the empty preview DB to capture all migrations from scratch.
+          uv run alembic upgrade head --sql > /tmp/migration-preview.sql 2>&1 || true
+          LINE_COUNT=$(wc -l < /tmp/migration-preview.sql)
+          echo "line_count=${LINE_COUNT}" >> "$GITHUB_OUTPUT"
+          # Truncate the preview to 500 lines for the PR comment; full version is the artifact.
+          head -500 /tmp/migration-preview.sql > /tmp/migration-preview-truncated.sql
+          if [ "$LINE_COUNT" -gt 500 ]; then
+            echo "... (truncated; download the full artifact for the complete SQL)" >> /tmp/migration-preview-truncated.sql
+          fi
+          CONTENT=$(cat /tmp/migration-preview-truncated.sql)
+          # Use multiline output via delimiter
+          {
+            echo "preview<<MIGRATION_EOF"
+            echo "${CONTENT}"
+            echo "MIGRATION_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload migration SQL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-sql-pr-${{ github.event.pull_request.number }}
+          path: /tmp/migration-preview.sql
+          retention-days: 30
+
+      # Post (or update) a collapsible comment on the PR so reviewers can see
+      # the pending DDL without downloading the artifact.
+      - name: Post PR comment with migration preview
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const marker = '<!-- migration-preview-comment -->';
+            const existing = comments.find(c => c.body.includes(marker));
+
+            const lineCount = '${{ steps.sql.outputs.line_count }}';
+            const preview = `${{ steps.sql.outputs.preview }}`;
+            const artifactUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            // Build body without leading indentation — 4+ leading spaces
+            // turn lines into a Markdown code block.
+            const lines = [
+              marker,
+              '## Alembic migration SQL preview',
+              '',
+              'Pending DDL for this PR (generated against a clean DB — shows all migrations from baseline):',
+              '',
+              `**Lines:** ${lineCount}`,
+              '',
+              '<details>',
+              '<summary>Click to expand migration SQL</summary>',
+              '',
+              '```sql',
+              preview,
+              '```',
+              '',
+              '</details>',
+              '',
+              `> Full SQL attached as a [build artifact](${artifactUrl}).`,
+              '> _Non-blocking — this comment is informational only._',
+            ];
+            const body = lines.join('\n');
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
