@@ -6,7 +6,7 @@ locally (doc 06 §10).
 
 | Path                       | Purpose                                                        |
 |----------------------------|----------------------------------------------------------------|
-| `docker-compose.dev.yml`   | Local dev stack (`make dev`). TODO A2.                         |
+| `docker-compose.dev.yml`   | Local dev stack (`make dev`). See `docs/dev-environment.md`.   |
 | `docker-compose.yml`       | Single-host production / self-host quickstart. TODO O2.        |
 | `nginx/nginx.conf`         | Reverse proxy: `/api` → api, rest → web. TLS added in A4/A5.   |
 | `deploy/deploy.sh`         | SSH pull-and-restart deploy, run from CI. TODO A4.            |
