@@ -1,0 +1,130 @@
+# Staging deploy — Phase 0 single-VPS (doc 06 §10, task A4).
+#
+# Triggers:
+#   - After the CI workflow passes on a push to main  (workflow_run)
+#   - Manual dispatch (workflow_dispatch) for hotfixes / re-deploys
+#
+# See migration-preview.yml for the PR migration SQL preview (separate workflow).
+#
+# Guard: if STAGING_SSH_HOST is absent (forks, contributors without secrets)
+# the deploy step is skipped cleanly — CI stays green for everyone.
+#
+# Required GitHub secrets (repo Settings → Secrets → Actions; or set on the
+# "staging" Environment for extra protection rules):
+#
+#   STAGING_SSH_HOST    — hostname or IP of the staging VPS
+#   STAGING_SSH_USER    — SSH username (e.g. civicsignals)
+#   STAGING_SSH_KEY     — Private SSH key (PEM/OpenSSH format)
+#   STAGING_DEPLOY_DIR  — Absolute path on VPS (default: /opt/civicsignals)
+#
+# Optional:
+#   STAGING_SLACK_WEBHOOK — Slack incoming-webhook URL for deploy notifications
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Deploy (staging)
+
+on:
+  # Deploy only after CI passes on the main branch.
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+
+  # Manual trigger: optionally specify an image tag.
+  workflow_dispatch:
+    inputs:
+      civic_version:
+        description: "Image tag to deploy (e.g. sha-abc1234 or v1.2.3). Defaults to 'latest'."
+        required: false
+        default: "latest"
+
+# Serialize deploys — let the in-flight deploy finish before the next begins.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+
+    # workflow_run: only deploy when CI succeeded (not on cancel/failure).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success')
+
+    # GitHub Environment — deployments surface in the repo UI.
+    # Add protection rules here to require a reviewer before production deploys.
+    environment:
+      name: staging
+      url: https://staging.civicsignals.io   # update once DNS is live
+
+    steps:
+      # ------------------------------------------------------------------ meta
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.civic_version }}"
+            [ -z "${TAG}" ] && TAG="latest"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # Derive the short SHA used by release-images.yml (sha-<7char>).
+            FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+            TAG="sha-${FULL_SHA:0:7}"
+          else
+            TAG="latest"
+          fi
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Deploying tag: ${TAG}"
+
+      # ------------------------------------------------------------------ guard
+      - name: Check secrets present
+        id: secrets-check
+        run: |
+          if [ -z "${{ secrets.STAGING_SSH_HOST }}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_SSH_HOST secret is absent — deploy skipped (fork / no secrets configured)."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------------------ ssh
+      - name: Set up SSH key
+        if: steps.secrets-check.outputs.present == 'true'
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.STAGING_SSH_KEY }}" > ~/.ssh/staging_deploy
+          chmod 600 ~/.ssh/staging_deploy
+          # Add host key to known_hosts to avoid interactive prompt.
+          ssh-keyscan -H "${{ secrets.STAGING_SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      # ------------------------------------------------------------------ deploy
+      - name: Deploy
+        if: steps.secrets-check.outputs.present == 'true'
+        env:
+          DEPLOY_HOST: "${{ secrets.STAGING_SSH_USER || 'civicsignals' }}@${{ secrets.STAGING_SSH_HOST }}"
+          DEPLOY_DIR: "${{ secrets.STAGING_DEPLOY_DIR || '/opt/civicsignals' }}"
+          CIVIC_VERSION: "${{ steps.tag.outputs.version }}"
+          SSH_OPTS: "-i ~/.ssh/staging_deploy -o StrictHostKeyChecking=no -o BatchMode=yes"
+        run: bash infra/deploy/deploy.sh
+
+      # ------------------------------------------------------------------ notify
+      - name: Notify success
+        if: steps.secrets-check.outputs.present == 'true' && success()
+        run: |
+          echo "::notice::Staging deploy of ${{ steps.tag.outputs.version }} succeeded."
+          # TODO A6: post to STAGING_SLACK_WEBHOOK when observability is wired
+
+      - name: Notify failure
+        if: steps.secrets-check.outputs.present == 'true' && failure()
+        run: |
+          echo "::error::Staging deploy of ${{ steps.tag.outputs.version }} FAILED — check logs and rollback if needed."
+          # TODO A6: post to STAGING_SLACK_WEBHOOK when observability is wired
