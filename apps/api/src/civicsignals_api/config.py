@@ -37,6 +37,24 @@ class Settings(BaseSettings):
     secret_key: str = "dev-only-change-me"
     access_token_ttl_seconds: int = 3600
 
+    # --- Auth / JWT (B1) -----------------------------------------------------
+    # Bearer JWTs are signed with ``jwt_secret`` (falls back to ``secret_key``)
+    # using ``jwt_algorithm``. ``jwt_issuer`` is set as the ``iss`` claim and
+    # verified on decode. Access tokens expire after ``access_token_ttl_seconds``
+    # (above); refresh tokens after ``refresh_token_ttl_seconds``. The
+    # email-verification token (single-use, hashed at rest) lives for
+    # ``email_verification_ttl_seconds``. ``web_base_url`` builds the link in the
+    # verification email (points at the web app's /verify-email page).
+    jwt_secret: str | None = None
+    jwt_algorithm: str = "HS256"
+    jwt_issuer: str = "civicsignals"
+    refresh_token_ttl_seconds: int = 60 * 60 * 24 * 30  # 30 days
+    email_verification_ttl_seconds: int = 60 * 60 * 24  # 24 hours
+    # Require email verification before /auth/login succeeds. Defaults off so the
+    # dev/self-host first-run flow is frictionless; Cloud sets it true.
+    require_email_verification: bool = False
+    web_base_url: str = "http://localhost:3000"
+
     # LLM gateway (doc 06 §7, doc 18 §6.6). Vendor SDKs are imported lazily by
     # the backends; only the keys/base URLs configured here are needed.
     llm_default_provider: Literal["anthropic", "openai", "ollama"] = "anthropic"

@@ -1,5 +1,7 @@
-// Site-wide navigation header. Intentionally minimal; expands as auth (B1) lands.
+// Site-wide navigation header. Auth state (sign in / sign out) is a client
+// island (AuthNav, B1); the rest stays a server component.
 import Link from "next/link";
+import { AuthNav } from "@/components/auth/auth-nav";
 
 // Internal routes that exist in the App Router.
 const INTERNAL_LINKS = [{ href: "/pricing" as const, label: "Pricing" }];
@@ -47,15 +49,7 @@ export function SiteHeader() {
               </a>
             </li>
           ))}
-          <li>
-            {/* TODO B1: replace with /signup route once auth lands */}
-            <a
-              href="/signup"
-              className="ml-2 rounded-md bg-primary px-3 py-1.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-            >
-              Get started
-            </a>
-          </li>
+          <AuthNav />
         </ul>
       </nav>
     </header>

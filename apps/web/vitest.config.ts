@@ -9,6 +9,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 export default defineConfig({
+  // Automatic JSX runtime so component tests (.tsx) need no explicit React
+  // import; the per-file `// @vitest-environment jsdom` pragma opts those into a
+  // DOM. Data/logic tests keep the lighter node default below.
+  esbuild: {
+    jsx: "automatic",
+    jsxImportSource: "react",
+  },
   test: {
     environment: "node",
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
