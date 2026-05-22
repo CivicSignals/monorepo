@@ -1,7 +1,690 @@
-"""Public service interface for the integrations module.
+"""Public service interface for the integrations module (K1).
 
-Other modules call integrations only through the functions defined here — never by
-importing integrations's models or routes directly (doc 06 §3).
+Other modules call integrations only through the functions defined here — never
+by importing integrations's models or routes directly (doc 06 §3). This is the
+generic outbound-integration framework K2/K3/K4/K5/L1/L3 build on:
+
+- **Secrets at rest.** :class:`TokenCipher` Fernet-encrypts OAuth access/refresh
+  tokens (they must be *recoverable* to call the provider, so — unlike B8 API
+  tokens, which are hashed — they are symmetrically encrypted). Tokens are never
+  logged (threat-model §4.2).
+- **OAuth flow.** :func:`start_oauth` builds the authorize URL + a signed,
+  expiring ``state`` (CSRF/replay guard binding workspace + connection); the
+  callback validates the state and exchanges the code via the provider, storing
+  encrypted tokens. :func:`ensure_fresh_access_token` auto-refreshes on expiry.
+- **Push framework.** :func:`execute_push` runs a provider push, records every
+  attempt to the push-log with scope-aware typed errors, and computes the
+  retry/dead-letter schedule. :func:`due_failed_pushes` is the surface the
+  ``retry_failed_pushes`` Celery task drives.
+
+The HTTP layer is injectable (``http_client`` arg / a default factory) so tests
+mock the transport.
 """
 
 from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import secrets
+import time
+import uuid as _uuid_module
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from urllib.parse import urlencode
+from uuid import UUID
+
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from civicsignals_api.config import Settings, get_settings
+
+from .models import (
+    NON_RETRYABLE_ERROR_CODES,
+    Connection,
+    ConnectionStatus,
+    IntegrationProviderKind,
+    PushErrorCode,
+    PushLog,
+    PushStatus,
+)
+from .providers import (
+    IntegrationProvider,
+    ProviderError,
+    PushRequest,
+    PushResult,
+    TokenSet,
+    get_provider,
+    is_registered,
+)
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class IntegrationError(Exception):
+    """Base for integration-layer failures the routes map to RFC 7807 problems."""
+
+
+class ProviderNotConfiguredError(IntegrationError):
+    """The requested provider has no OAuth client wired up (settings missing)."""
+
+
+class ProviderNotRegisteredError(IntegrationError):
+    """No provider class is registered for the requested kind (K2/K3/L1 pending)."""
+
+
+class OAuthStateError(IntegrationError):
+    """The OAuth callback ``state`` was missing, tampered, expired, or replayed."""
+
+
+class ConnectionNotConnectedError(IntegrationError):
+    """A push/refresh was attempted on a connection with no usable token."""
+
+
+# ---------------------------------------------------------------------------
+# Token encryption at rest (Fernet)
+# ---------------------------------------------------------------------------
+
+
+class TokenCipher:
+    """Symmetric encryption for integration OAuth tokens at rest (K1).
+
+    OAuth access/refresh tokens must be **decryptable** (to call the provider),
+    so — unlike B8 API tokens (hashed, never recovered) — they are Fernet-
+    encrypted. The key is taken from ``integrations_token_encryption_key`` (a raw
+    Fernet key if it looks like one, else any passphrase HKDF/SHA-256-derived
+    into a 32-byte Fernet key). Falls back to ``secret_key`` in dev so tests run
+    without extra setup. Plaintext tokens never leave this object as logs.
+    """
+
+    def __init__(self, key_material: str) -> None:
+        self._fernet = Fernet(self._derive_key(key_material))
+
+    @staticmethod
+    def _derive_key(key_material: str) -> bytes:
+        # Accept a ready-made urlsafe-base64 32-byte Fernet key verbatim so
+        # operators can rotate with a real key; otherwise derive one so any
+        # passphrase works (dev/self-host convenience).
+        raw = key_material.encode("utf-8")
+        try:
+            decoded = base64.urlsafe_b64decode(raw)
+            if len(decoded) == 32:
+                return raw
+        except (binascii.Error, ValueError):
+            pass
+        digest = hashlib.sha256(raw).digest()
+        return base64.urlsafe_b64encode(digest)
+
+    def encrypt(self, plaintext: str) -> str:
+        return self._fernet.encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+    def decrypt(self, ciphertext: str) -> str:
+        try:
+            return self._fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        except InvalidToken as exc:
+            raise IntegrationError("token decryption failed (wrong key?)") from exc
+
+
+def token_cipher(settings: Settings | None = None) -> TokenCipher:
+    """Return the configured :class:`TokenCipher` (dev falls back to secret_key)."""
+    settings = settings or get_settings()
+    key = settings.integrations_token_encryption_key or settings.secret_key
+    return TokenCipher(key)
+
+
+# ---------------------------------------------------------------------------
+# OAuth ``state`` signing (CSRF + replay guard)
+# ---------------------------------------------------------------------------
+# The ``state`` round-trips the workspace + connection id through the provider's
+# consent screen. It is HMAC-signed (so a forged state is rejected) and carries
+# a timestamp (so a captured state expires). It is *not* a session — it only
+# binds the callback back to the connection it started.
+
+
+def _state_secret(settings: Settings) -> bytes:
+    return (settings.jwt_secret or settings.secret_key).encode("utf-8")
+
+
+def sign_oauth_state(
+    *, workspace_id: UUID, connection_id: UUID, settings: Settings | None = None
+) -> str:
+    """Mint a signed, timestamped OAuth ``state`` binding workspace+connection."""
+    settings = settings or get_settings()
+    payload = {
+        "w": str(workspace_id),
+        "c": str(connection_id),
+        "n": secrets.token_urlsafe(8),
+        "t": int(time.time()),
+    }
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+    sig = hmac.new(_state_secret(settings), body.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthState:
+    workspace_id: UUID
+    connection_id: UUID
+
+
+def verify_oauth_state(state: str, *, settings: Settings | None = None) -> OAuthState:
+    """Validate a signed ``state`` and return its bound ids, or raise.
+
+    Rejects (with :class:`OAuthStateError`) a missing, malformed, tampered
+    (bad HMAC), or expired (older than the configured TTL) state.
+    """
+    settings = settings or get_settings()
+    try:
+        body, sig = state.split(".", 1)
+    except ValueError as exc:
+        raise OAuthStateError("malformed state") from exc
+    expected = hmac.new(_state_secret(settings), body.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise OAuthStateError("state signature mismatch")
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
+        issued_at = int(payload["t"])
+        workspace_id = UUID(str(payload["w"]))
+        connection_id = UUID(str(payload["c"]))
+    except (binascii.Error, ValueError, KeyError, TypeError) as exc:
+        raise OAuthStateError("unreadable state") from exc
+    if time.time() - issued_at > settings.integrations_oauth_state_ttl_seconds:
+        raise OAuthStateError("state expired")
+    return OAuthState(workspace_id=workspace_id, connection_id=connection_id)
+
+
+# ---------------------------------------------------------------------------
+# HTTP client factory (injectable for tests)
+# ---------------------------------------------------------------------------
+
+
+def default_http_client() -> httpx.AsyncClient:
+    """Create the default async HTTP client used for provider calls."""
+    return httpx.AsyncClient(timeout=30.0)
+
+
+def _resolve_provider(
+    kind: IntegrationProviderKind, settings: Settings, http: httpx.AsyncClient
+) -> IntegrationProvider:
+    if not is_registered(kind):
+        raise ProviderNotRegisteredError(f"no provider registered for '{kind.value}'")
+    return get_provider(kind, settings, http)
+
+
+# ---------------------------------------------------------------------------
+# Connection CRUD (workspace-scoped, B5)
+# ---------------------------------------------------------------------------
+
+
+async def create_connection(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    provider: IntegrationProviderKind,
+    name: str,
+    created_by_user_id: UUID | None,
+    default_targets: Sequence[str] | None = None,
+) -> Connection:
+    """Create a connection in ``pending_oauth`` (or pending-secret) state.
+
+    The caller commits. For OAuth providers the connection is created first so
+    the OAuth ``state`` can bind to its id; tokens are filled in by the callback.
+    """
+    connection = Connection(
+        workspace_id=workspace_id,
+        provider=provider,
+        name=name,
+        status=ConnectionStatus.PENDING_OAUTH,
+        created_by_user_id=created_by_user_id,
+        default_targets=list(default_targets or []),
+    )
+    session.add(connection)
+    await session.flush()
+    return connection
+
+
+async def get_connection(
+    session: AsyncSession, workspace_id: UUID, connection_id: UUID
+) -> Connection | None:
+    """Return a connection by id *scoped to ``workspace_id``*, or ``None``.
+
+    Scoping to the workspace here (not just by id) is the isolation guard: a
+    caller in workspace A can never resolve workspace B's connection.
+    """
+    result = await session.execute(
+        select(Connection).where(
+            Connection.id == connection_id,
+            Connection.workspace_id == workspace_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_connection_unscoped(session: AsyncSession, connection_id: UUID) -> Connection | None:
+    """Return a connection by id alone (OAuth callback resolves via signed state).
+
+    Used only after :func:`verify_oauth_state` has already proven the caller is
+    completing the flow it started; the state carries the workspace binding.
+    """
+    result = await session.execute(select(Connection).where(Connection.id == connection_id))
+    return result.scalar_one_or_none()
+
+
+async def list_connections(session: AsyncSession, workspace_id: UUID) -> list[Connection]:
+    """List a workspace's connections, newest first.
+
+    Includes revoked rows so a reconnect is discoverable in the UI (doc 04 J7).
+    """
+    result = await session.execute(
+        select(Connection)
+        .where(Connection.workspace_id == workspace_id)
+        .order_by(Connection.id.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def delete_connection(session: AsyncSession, connection: Connection) -> None:
+    """Hard-delete a connection (admin disconnect). The caller commits.
+
+    Push-log rows cascade-delete with the connection (the connection is the
+    evidence anchor; a disconnected provider's pushes are no longer actionable).
+    """
+    await session.delete(connection)
+    await session.flush()
+
+
+# ---------------------------------------------------------------------------
+# OAuth flow
+# ---------------------------------------------------------------------------
+
+
+def oauth_redirect_uri(settings: Settings | None = None) -> str:
+    """The fixed callback URI the provider redirects back to after consent."""
+    settings = settings or get_settings()
+    base = settings.integrations_oauth_redirect_base_url.rstrip("/")
+    return f"{base}{settings.api_v1_prefix}/integrations/oauth/callback"
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthStart:
+    """The authorize redirect for a freshly-created OAuth connection."""
+
+    connection: Connection
+    redirect_url: str
+
+
+def build_authorize_url(provider: IntegrationProvider, *, state: str, redirect_uri: str) -> str:
+    """Build the provider's authorize URL with our client/scope/state params."""
+    config = provider.oauth_config()
+    params = {
+        "response_type": "code",
+        "client_id": config.client_id or "",
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(config.scopes),
+        "state": state,
+        **config.extra_authorize_params,
+    }
+    sep = "&" if "?" in config.authorize_url else "?"
+    return f"{config.authorize_url}{sep}{urlencode(params)}"
+
+
+async def start_oauth(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    provider: IntegrationProviderKind,
+    name: str,
+    created_by_user_id: UUID | None,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> OAuthStart:
+    """Create a pending connection and return the provider authorize redirect.
+
+    Raises :class:`ProviderNotRegisteredError` (K2/K3/L1 not landed yet) or
+    :class:`ProviderNotConfiguredError` (operator hasn't supplied client creds).
+    The caller commits.
+    """
+    settings = settings or get_settings()
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        prov = _resolve_provider(provider, settings, http)
+        config = prov.oauth_config()
+        if not config.configured:
+            raise ProviderNotConfiguredError(
+                f"provider '{provider.value}' OAuth client is not configured"
+            )
+        connection = await create_connection(
+            session,
+            workspace_id=workspace_id,
+            provider=provider,
+            name=name,
+            created_by_user_id=created_by_user_id,
+        )
+        state = sign_oauth_state(
+            workspace_id=workspace_id, connection_id=connection.id, settings=settings
+        )
+        redirect_url = build_authorize_url(
+            prov, state=state, redirect_uri=oauth_redirect_uri(settings)
+        )
+        return OAuthStart(connection=connection, redirect_url=redirect_url)
+    finally:
+        if own_http:
+            await http.aclose()
+
+
+def _apply_tokenset(connection: Connection, tokens: TokenSet, cipher: TokenCipher) -> None:
+    """Persist a :class:`TokenSet` onto a connection (tokens encrypted)."""
+    connection.access_token_encrypted = cipher.encrypt(tokens.access_token)
+    if tokens.refresh_token is not None:
+        connection.refresh_token_encrypted = cipher.encrypt(tokens.refresh_token)
+    connection.token_expires_at = tokens.expires_at
+    if tokens.scopes:
+        connection.scopes = list(tokens.scopes)
+    if tokens.provider_account:
+        connection.provider_account = dict(tokens.provider_account)
+    connection.status = ConnectionStatus.HEALTHY
+    if connection.connected_at is None:
+        connection.connected_at = datetime.now(UTC)
+
+
+async def complete_oauth(
+    session: AsyncSession,
+    *,
+    code: str,
+    state: str,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> Connection:
+    """Validate the callback ``state``, exchange ``code``, store encrypted tokens.
+
+    Raises :class:`OAuthStateError` (bad/expired state) or
+    :class:`IntegrationError` (unknown connection / exchange failure). The caller
+    commits.
+    """
+    settings = settings or get_settings()
+    parsed = verify_oauth_state(state, settings=settings)
+    connection = await get_connection_unscoped(session, parsed.connection_id)
+    if connection is None or connection.workspace_id != parsed.workspace_id:
+        raise IntegrationError("unknown connection for this state")
+
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        prov = _resolve_provider(connection.provider, settings, http)
+        try:
+            tokens = await prov.exchange_code(code=code, redirect_uri=oauth_redirect_uri(settings))
+        except ProviderError as exc:
+            connection.status = ConnectionStatus.NEEDS_REAUTH
+            await session.flush()
+            raise IntegrationError(f"token exchange failed: {exc.message}") from exc
+    finally:
+        if own_http:
+            await http.aclose()
+
+    _apply_tokenset(connection, tokens, token_cipher(settings))
+    await session.flush()
+    return connection
+
+
+async def ensure_fresh_access_token(
+    session: AsyncSession,
+    connection: Connection,
+    *,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> str:
+    """Return a usable plaintext access token, refreshing it if expired.
+
+    The auto-refresh seam: if the stored token is expired (or missing) and a
+    refresh token is present, exchange it and persist the new (encrypted) token.
+    Raises :class:`ConnectionNotConnectedError` when there is nothing to use and
+    marks the connection ``needs_reauth`` when the refresh itself fails. The
+    caller commits.
+    """
+    settings = settings or get_settings()
+    cipher = token_cipher(settings)
+
+    if connection.access_token_encrypted is None:
+        raise ConnectionNotConnectedError("connection has no access token")
+
+    if not connection.is_token_expired:
+        return cipher.decrypt(connection.access_token_encrypted)
+
+    if connection.refresh_token_encrypted is None:
+        connection.status = ConnectionStatus.NEEDS_REAUTH
+        await session.flush()
+        raise ConnectionNotConnectedError("access token expired and no refresh token")
+
+    refresh_token = cipher.decrypt(connection.refresh_token_encrypted)
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        prov = _resolve_provider(connection.provider, settings, http)
+        try:
+            tokens = await prov.refresh(refresh_token=refresh_token)
+        except ProviderError as exc:
+            connection.status = ConnectionStatus.NEEDS_REAUTH
+            await session.flush()
+            raise ConnectionNotConnectedError(f"token refresh failed: {exc.message}") from exc
+    finally:
+        if own_http:
+            await http.aclose()
+
+    _apply_tokenset(connection, tokens, cipher)
+    await session.flush()
+    return tokens.access_token
+
+
+# ---------------------------------------------------------------------------
+# Push framework + push-log
+# ---------------------------------------------------------------------------
+
+
+def _retry_delay_seconds(attempt: int, settings: Settings) -> int:
+    """Exponential backoff (base * 2**(attempt-1)) capped at the configured max."""
+    base = settings.integrations_push_retry_base_seconds
+    delay: int = base * (2 ** max(0, attempt - 1))
+    cap: int = settings.integrations_push_retry_max_seconds
+    return delay if delay < cap else cap
+
+
+async def create_push_log(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    target: str,
+    request: dict[str, object],
+    signal_id: str | None = None,
+    pipeline_item_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> PushLog:
+    """Create a ``pending`` push-log row for an outbound push. Caller commits."""
+    log = PushLog(
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+        target=target,
+        request=dict(request),
+        signal_id=signal_id,
+        pipeline_item_id=pipeline_item_id,
+        idempotency_key=idempotency_key,
+        status=PushStatus.PENDING,
+    )
+    session.add(log)
+    await session.flush()
+    return log
+
+
+def _record_success(log: PushLog, result: PushResult) -> None:
+    log.status = PushStatus.SUCCESS
+    log.external_id = result.external_id
+    log.response = dict(result.response)
+    log.provider_response_id = result.provider_response_id
+    log.error_code = None
+    log.error_message = None
+    log.retry_at = None
+    log.attempted_at = datetime.now(UTC)
+    log.attempt_count += 1
+
+
+def _record_failure(log: PushLog, exc: ProviderError, settings: Settings) -> None:
+    log.attempt_count += 1
+    log.attempted_at = datetime.now(UTC)
+    log.error_code = exc.code
+    log.error_message = exc.message
+    log.provider_response_id = exc.provider_response_id
+    if exc.response is not None:
+        log.response = dict(exc.response)
+
+    exhausted = log.attempt_count >= settings.integrations_push_max_attempts
+    non_retryable = exc.code in NON_RETRYABLE_ERROR_CODES
+    if exhausted or non_retryable:
+        log.status = PushStatus.DEAD_LETTER
+        log.retry_at = None
+    else:
+        log.status = PushStatus.FAILED
+        log.retry_at = datetime.now(UTC) + timedelta(
+            seconds=_retry_delay_seconds(log.attempt_count, settings)
+        )
+
+
+async def execute_push(
+    session: AsyncSession,
+    *,
+    connection: Connection,
+    log: PushLog,
+    request: PushRequest,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> PushLog:
+    """Run one push attempt against the provider and record it to the push-log.
+
+    Auto-refreshes the access token first (so a 401 is avoided where possible),
+    then calls the provider's ``push``. On success records the external id; on a
+    :class:`ProviderError` records the scope-aware typed error and computes the
+    retry/dead-letter schedule. An ``auth`` failure also flips the connection to
+    ``needs_reauth`` (K5 recovery). Never raises on a provider failure — the
+    outcome lives in the returned log. The caller commits.
+    """
+    settings = settings or get_settings()
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        prov = _resolve_provider(connection.provider, settings, http)
+        try:
+            access_token = await ensure_fresh_access_token(
+                session, connection, settings=settings, http_client=http
+            )
+        except ConnectionNotConnectedError as exc:
+            _record_failure(log, ProviderError(PushErrorCode.AUTH, str(exc)), settings)
+            connection.status = ConnectionStatus.NEEDS_REAUTH
+            await session.flush()
+            return log
+
+        try:
+            result = await prov.push(access_token=access_token, request=request)
+        except ProviderError as exc:
+            _record_failure(log, exc, settings)
+            if exc.code is PushErrorCode.AUTH:
+                connection.status = ConnectionStatus.NEEDS_REAUTH
+            elif exc.code in (PushErrorCode.RATE_LIMITED, PushErrorCode.TRANSIENT):
+                connection.status = ConnectionStatus.DEGRADED
+            await session.flush()
+            return log
+    finally:
+        if own_http:
+            await http.aclose()
+
+    _record_success(log, result)
+    connection.last_push_at = datetime.now(UTC)
+    connection.status = ConnectionStatus.HEALTHY
+    await session.flush()
+    return log
+
+
+# ---------------------------------------------------------------------------
+# Retry sweeper surface (driven by the retry_failed_pushes Celery task)
+# ---------------------------------------------------------------------------
+
+
+async def due_failed_pushes(
+    session: AsyncSession, *, now: datetime | None = None, limit: int = 100
+) -> list[PushLog]:
+    """Return failed push-log rows whose ``retry_at`` is due (oldest first)."""
+    now = now or datetime.now(UTC)
+    result = await session.execute(
+        select(PushLog)
+        .where(
+            PushLog.status == PushStatus.FAILED,
+            PushLog.retry_at.is_not(None),
+            PushLog.retry_at <= now,
+        )
+        .order_by(PushLog.retry_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+# ---------------------------------------------------------------------------
+# Push-log read surface (cursor pagination, same UUID-v7 keyset as admin/B9)
+# ---------------------------------------------------------------------------
+
+DEFAULT_LIMIT: int = 25
+MAX_LIMIT: int = 100
+
+
+def _encode_cursor(row_id: UUID) -> str:
+    return base64.urlsafe_b64encode(row_id.bytes).decode("ascii")
+
+
+def _decode_cursor(cursor: str) -> UUID:
+    try:
+        return _uuid_module.UUID(bytes=base64.urlsafe_b64decode(cursor.encode("ascii")))
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("invalid cursor") from exc
+
+
+@dataclass(slots=True)
+class PushLogPage:
+    items: list[PushLog]
+    next_cursor: str | None
+
+
+async def list_push_log(
+    session: AsyncSession,
+    workspace_id: UUID,
+    *,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    connection_id: UUID | None = None,
+    status: PushStatus | None = None,
+) -> PushLogPage:
+    """Return a cursor-paginated, newest-first page of push-log rows.
+
+    Scoped to ``workspace_id`` (workspace isolation). Optional filters narrow by
+    connection or status. ``cursor`` is the opaque ``next_cursor`` returned
+    verbatim (keyset on the time-ordered UUID v7 id).
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    stmt = select(PushLog).where(PushLog.workspace_id == workspace_id).order_by(PushLog.id.desc())
+    if connection_id is not None:
+        stmt = stmt.where(PushLog.connection_id == connection_id)
+    if status is not None:
+        stmt = stmt.where(PushLog.status == status)
+    if cursor is not None:
+        stmt = stmt.where(PushLog.id < _decode_cursor(cursor))
+    stmt = stmt.limit(limit + 1)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
+    return PushLogPage(items=items, next_cursor=next_cursor)

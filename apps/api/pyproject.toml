@@ -28,6 +28,11 @@ dependencies = [
     "python-multipart>=0.0.12",
     "structlog>=24.4",
     "tenacity>=9.0",
+    # Symmetric encryption of integration OAuth tokens at rest (K1). Unlike API
+    # tokens (B8, hashed — never recovered), OAuth access/refresh tokens must be
+    # *decryptable* to call the provider, so they are Fernet-encrypted with a
+    # key derived from INTEGRATIONS_TOKEN_ENCRYPTION_KEY (threat-model §4.2).
+    "cryptography>=43.0",
     "pyyaml>=6.0",
     # Recipe DSL + runner (D1). jsonschema validates recipe YAML against the
     # canonical draft-07 schema (packages/recipe-schema); beautifulsoup4 backs
