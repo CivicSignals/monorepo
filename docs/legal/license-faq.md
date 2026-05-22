@@ -15,7 +15,7 @@ This FAQ explains what that means in plain language for the most common use case
 - **AGPL-3.0 is a strong copyleft license.** If you distribute or deploy modified versions of CivicSignals, you must release your modifications under AGPL-3.0.
 - **"Use it over a network" counts as distribution.** Unlike GPL-3.0, AGPL-3.0 closes the "ASP loophole": offering the software as a service to users counts as distribution and triggers the copyleft obligations.
 - **CivicSignals Cloud is the commercial service.** If you need to build a service on top of CivicSignals without releasing your proprietary modifications, you must purchase a commercial license from CivicSignals, Inc.
-- **Unmodified use is simpler.** Running the unmodified CivicSignals Core for your own organization's internal use is permitted under AGPL-3.0 without the copyleft obligations being triggered (there is no "distribution" to outside users).
+- **Unmodified use is simpler.** Running the unmodified CivicSignals Core for your own personal use is permitted under AGPL-3.0 without copyleft obligations being triggered. Internal organizational deployment of a modified version may trigger AGPL §13 obligations even for internal network users — seek legal counsel for your specific situation.
 
 ---
 
@@ -23,7 +23,7 @@ This FAQ explains what that means in plain language for the most common use case
 
 ### Q1: I'm a mid-market company. Can I use CivicSignals Core for free?
 
-**A:** Yes. You can run the unmodified CivicSignals Core (docker-compose / Helm) for your organization's internal use at no cost. You can also modify it for internal use — the AGPL copyleft is triggered only when you distribute the software or make it available to users outside your organization over a network.
+**A:** Yes. You can run the unmodified CivicSignals Core (docker-compose / Helm) for your organization's internal use at no cost. You can also modify it — however, note that AGPL-3.0 §13 may trigger source-offer obligations when a modified version is made available to any network users, including internal employees. For internal-only tooling that is not exposed over a network, there is generally no copyleft obligation. We recommend seeking legal counsel for your specific deployment. When in doubt, contact licensing@civicsignals.io.
 
 ---
 
@@ -41,7 +41,7 @@ This FAQ explains what that means in plain language for the most common use case
 
 ### Q4: What if I modify CivicSignals Core for my own internal use?
 
-**A:** You are free to modify it. AGPL-3.0 only requires you to release your modifications if you distribute the software or offer it as a service to outside users. Internal modifications that never leave your organization (including your employees and contractors) are not subject to the release requirement.
+**A:** You are free to modify it. Whether AGPL-3.0 requires you to release those modifications depends on how the modified software is used. AGPL-3.0 §13 can trigger source-offer obligations when a modified version is made available to network users — this may include internal employees depending on the deployment. Modifications to tools you use only locally (not over a network) generally do not trigger the obligation. This is a nuanced area; consult legal counsel for your specific situation, or contact licensing@civicsignals.io.
 
 ---
 
