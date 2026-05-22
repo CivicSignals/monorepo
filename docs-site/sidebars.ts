@@ -10,13 +10,43 @@ import type { SidebarsConfig } from "@docusaurus/plugin-content-docs";
  *   Recipes  → Q5
  */
 const sidebars: SidebarsConfig = {
-  // TODO Q2 — Product docs (tour, onboarding, ICP, saved searches, FOIA, integrations)
   productSidebar: [
     {
       type: "category",
       label: "Product",
       items: [
         "product/intro",
+        {
+          type: "category",
+          label: "Get started",
+          collapsed: false,
+          items: [
+            "product/getting-started",
+            "product/onboarding",
+          ],
+        },
+        {
+          type: "category",
+          label: "Core features",
+          collapsed: false,
+          items: [
+            "product/icp",
+            "product/entities",
+            "product/pipeline",
+            "product/foia",
+            "product/integrations",
+          ],
+        },
+        {
+          type: "category",
+          label: "Signal discovery",
+          collapsed: false,
+          items: [
+            "product/feed",
+            "product/saved-searches",
+            "product/smart-search",
+          ],
+        },
       ],
     },
   ],
