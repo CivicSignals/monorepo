@@ -546,18 +546,27 @@ async def google_oauth_callback(
         await session.rollback()
         exc_str = str(exc.orig) if exc.orig else str(exc)
         if "uq_auth_oauth_identity_provider_user" in exc_str:
-            # (provider, user_id) violated: this CivicSignals account already
+            # (provider, user_id) constraint: this CivicSignals account already
             # has a different Google account linked.
             return _error_redirect(
                 "identity_conflict",
                 "Your CivicSignals account is already linked to a different Google account.",
             )
-        # (provider, subject) violated: this Google account is linked to
-        # a different CivicSignals account.
-        return _error_redirect(
-            "identity_conflict",
-            "This Google account is already linked to another CivicSignals account.",
-        )
+        if "uq_auth_oauth_identity_provider_subject" in exc_str:
+            # (provider, subject) constraint: this Google account is linked to
+            # a different CivicSignals account.
+            return _error_redirect(
+                "identity_conflict",
+                "This Google account is already linked to another CivicSignals account.",
+            )
+        # Unrelated integrity error — log and surface as a generic server error.
+        logger.error("google_oauth_unexpected_integrity_error", exc=str(exc))
+        raise ProblemException(
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            code="internal_error",
+            title="Internal server error",
+            detail="An unexpected error occurred during sign-in. Please try again.",
+        ) from exc
 
     # Emit login audit event (best-effort).
     try:
@@ -569,13 +578,15 @@ async def google_oauth_callback(
         logger.warning("google_oauth_login_event_failed", user_id=str(result.user.id))
 
     pair = _token_pair(result.user.id, settings)
-    # Redirect to the web app callback page with the token in the URL fragment
-    # (not query string) so it doesn't appear in server logs or Referer headers.
-    # urlencode ensures special characters in token values are percent-encoded.
+    # Redirect to the web app callback page with the access token in the URL
+    # fragment (not query string) so it doesn't appear in server logs or
+    # Referer headers. urlencode ensures special characters are percent-encoded.
+    # Refresh token is intentionally omitted from the fragment: the web client
+    # does not yet have secure refresh-token storage (B3 follow-up), and
+    # exposing a long-lived token in the fragment increases exposure risk.
     fragment = urlencode(
         {
             "access_token": pair.access_token,
-            "refresh_token": pair.refresh_token,
             "expires_in": pair.expires_in,
             "token_type": "bearer",
         }

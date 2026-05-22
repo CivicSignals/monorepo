@@ -719,24 +719,22 @@ def _verify_state(state_token: str, settings: Settings) -> bool:
 
 
 def _derive_redirect_uri(settings: Settings) -> str:
-    """Return the OAuth redirect URI (override > derived from api_base_url).
+    """Return the OAuth redirect URI.
 
     The redirect URI must point to the *API* callback endpoint
     ``/api/v1/auth/oauth/google/callback`` so Google sends the authorization
-    code directly to the server. The server then issues the JWT and redirects
-    the browser to the web app. Use ``google_oauth_redirect_uri`` to override
-    when a reverse-proxy changes the apparent host.
+    code directly to the server (not the web app). The server exchanges the
+    code, issues a JWT, and then redirects the browser to the web callback page.
 
-    ``web_base_url`` is the web app origin; ``api_v1_prefix`` is ``/api/v1``.
-    We reconstruct the API origin from ``web_base_url`` by default, but the
-    most reliable approach is to set ``GOOGLE_OAUTH_REDIRECT_URI`` explicitly
-    in production.
+    **In all non-default deployments** (staging, production, custom dev ports,
+    or behind a reverse-proxy) you **must** set ``GOOGLE_OAUTH_REDIRECT_URI``
+    explicitly. The fallback is a convenience default for the standard local
+    dev setup only (API on :8000, no override configured).
     """
     if settings.google_oauth_redirect_uri:
         return settings.google_oauth_redirect_uri
-    # Derive the API base from the web base URL by replacing the port / path.
-    # Default local: web=http://localhost:3000 → api=http://localhost:8000/api/v1
-    # This default is only used in dev; production always sets the override.
+    # Fallback: standard local dev layout — api on port 8000.
+    # This will NOT work in any other environment; set GOOGLE_OAUTH_REDIRECT_URI.
     return f"http://localhost:8000{settings.api_v1_prefix}/auth/oauth/google/callback"
 
 
@@ -805,7 +803,9 @@ async def _exchange_code_for_tokens(
     """Exchange an authorization code for an access token at Google's token URL.
 
     Returns the raw token response dict. ``http_post`` is injectable so tests
-    can supply a mock without live Google calls.
+    can supply a **sync** mock without live Google calls. The callable is invoked
+    without ``await`` — it must be a plain synchronous function (not a coroutine).
+    When ``http_post`` is ``None`` (production), the async httpx branch is used.
 
     Raises :class:`OAuthProviderError` when ``GOOGLE_OAUTH_CLIENT_SECRET`` is not
     configured (the exchange would fail at Google with a cryptic error otherwise).
@@ -856,7 +856,8 @@ async def _fetch_userinfo(
     Uses the access token rather than raw id_token validation so we avoid
     implementing JWT signature verification for Google's keys (the userinfo
     endpoint is always authenticated by the access token). ``http_get`` is
-    injectable for tests.
+    injectable for tests as a **sync** callable (called without ``await``);
+    when ``None`` (production) the async httpx branch is used.
     """
     if http_get is not None:
         return http_get(  # type: ignore[no-any-return]

@@ -3,7 +3,7 @@
 // B2 — Google OAuth2 callback page.
 //
 // The API redirects here after a successful Google sign-in:
-//   {web_base_url}/auth/callback/google#access_token=...&refresh_token=...&expires_in=...
+//   {web_base_url}/auth/callback/google#access_token=...&expires_in=...&token_type=bearer
 //
 // The token is in the URL *fragment* (not query string) so it never appears in
 // server logs or the Referer header. This page reads the fragment client-side,
