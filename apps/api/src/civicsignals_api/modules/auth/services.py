@@ -268,8 +268,13 @@ async def consume_password_reset_token(
     - Marks all *other* pending reset tokens for the same user consumed so that
       old reset links can no longer be replayed.
     """
+    # SELECT FOR UPDATE locks the token row so concurrent requests with the same
+    # token serialize here rather than both seeing consumed_at IS NULL and both
+    # proceeding to set a new password (TOCTOU race, threat-model §4.2).
     result = await session.execute(
-        select(PasswordResetToken).where(PasswordResetToken.token_hash == _hash_token(raw_token))
+        select(PasswordResetToken)
+        .where(PasswordResetToken.token_hash == _hash_token(raw_token))
+        .with_for_update()
     )
     record = result.scalar_one_or_none()
     if record is None:
