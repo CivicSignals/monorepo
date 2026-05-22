@@ -24,6 +24,9 @@ dependencies = [
     "structlog>=24.4",
     "tenacity>=9.0",
     "pyyaml>=6.0",
+    # Recipe DSL validation against the canonical draft-07 JSON Schema
+    # (packages/recipe-schema) — the source of truth for the recipe runner (D1).
+    "jsonschema>=4.23",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +53,13 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
     "schemathesis>=3.36",
+    # The default HTML extractor for the recipe runner (D1) lives in the
+    # `ingestion` optional extra at runtime (worker_ingest image). Mirror it here
+    # so the recipe-runner + golden-fixture tests can run under `uv run pytest`.
+    "beautifulsoup4>=4.12",
+    "types-jsonschema>=4.23",
+    "types-beautifulsoup4>=4.12",
+    "types-pyyaml>=6.0",
 ]
 
 [build-system]

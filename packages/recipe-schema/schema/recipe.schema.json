@@ -9,7 +9,7 @@
   "properties": {
     "recipe_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$" },
     "connector": { "type": "string", "description": "id of the connector this recipe instantiates" },
-    "version": { "type": "integer", "minimum": 1, "description": "runs are tagged with recipe_version; bump to roll forward/back" },
+    "version": { "type": "integer", "minimum": 1, "description": "recipe_version — runs are tagged with this; bump to roll forward/back (doc 18 §3.5)" },
     "entity": {
       "type": "object",
       "description": "How normalize() resolves the producing entity (doc 18 §2.4).",
@@ -28,8 +28,45 @@
     },
     "schedule": {
       "type": "object",
+      "description": "Per-recipe cadence. The scheduler (TODO D4) reads `cron`; the runner's fetch step reads `fetch.politeness_seconds` to space same-host requests (doc 18 §2.2).",
       "additionalProperties": false,
-      "properties": { "cron": { "type": "string" } }
+      "properties": {
+        "cron": { "type": "string", "description": "cron expression for the scheduled run cadence" }
+      }
+    },
+    "fetch": {
+      "type": "object",
+      "description": "Fetch-time politeness and legal posture (doc 18 §2.2, doc 16 §18). Overrides the connector descriptor's rate_limit defaults.",
+      "additionalProperties": false,
+      "properties": {
+        "respect_robots_txt": {
+          "type": "boolean",
+          "default": true,
+          "description": "Honor the source's robots.txt. Recipes that disable this are rejected in PR review (doc 16 §18); the field exists so the posture is explicit and auditable."
+        },
+        "politeness_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 10,
+          "description": "Minimum delay between requests to the same host (doc 18 §2.2). Default 10s; configurable upward."
+        },
+        "jitter_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0,
+          "description": "Random extra delay (0..jitter) added to each politeness wait to avoid lockstep request patterns."
+        },
+        "user_agent": {
+          "type": "string",
+          "description": "Identified bot UA (doc 16 §18). Defaults to the platform UA when omitted."
+        },
+        "max_redirects": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Cap redirects to fail visibly on redirect loops (doc 18 §4, static-HTML)."
+        }
+      }
     },
     "prefilter": {
       "type": "string",
@@ -39,12 +76,21 @@
     },
     "fields": {
       "type": "object",
-      "description": "Field extraction map. Each field lists ordered selectors (primary → fallbacks) per doc 18 §3.4.",
+      "description": "Field extraction map. Each field lists ordered selectors (primary → fallbacks) per doc 18 §3.4. D1 evaluates the primary (first) selector; the ordered fallback chain is wired up in D11.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "selectors": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+          "selectors": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "Ordered list: index 0 is the primary; later entries are fallbacks (D11). The runner records which index matched so a fallback hit can flag `degraded: true`."
+          },
+          "attr": {
+            "type": "string",
+            "description": "Optional element attribute to read instead of text content (e.g. `datetime`, `href`)."
+          },
           "required": { "type": "boolean", "default": false }
         },
         "required": ["selectors"]
