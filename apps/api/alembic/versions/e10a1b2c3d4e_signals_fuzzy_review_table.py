@@ -39,7 +39,7 @@ def upgrade() -> None:
         sa.Column(
             "status",
             sa.String(length=32),
-            server_default="pending",
+            server_default=sa.text("'pending'"),
             nullable=False,
         ),
         sa.Column("reviewed_at", sa.DateTime(timezone=True), nullable=True),

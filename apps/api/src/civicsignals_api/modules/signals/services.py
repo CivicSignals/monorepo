@@ -64,6 +64,7 @@ from .fuzzy_dedupe import (
     FuzzyDedupeResult,
     FuzzyReviewAlreadyDecidedError,
     FuzzyReviewNotFoundError,
+    FuzzyReviewSignalMissingError,
     apply_fuzzy_review,
     is_high_stakes_type,
     run_fuzzy_dedupe,
@@ -281,7 +282,7 @@ async def store_signal(
     # E10: embedding-based fuzzy dedupe for high-stakes types (doc 19 §7.4).
     # Only runs when exact-match found nothing (we are here) and the type qualifies.
     if is_high_stakes_type(payload.signal_type, config=fuzzy_config):
-        await run_fuzzy_dedupe(
+        fuzzy_result = await run_fuzzy_dedupe(
             session,
             candidate_signal=row,
             signal_type=payload.signal_type,
@@ -290,6 +291,13 @@ async def store_signal(
             config=fuzzy_config,
             now=now,
         )
+        if fuzzy_result.auto_merged and fuzzy_result.matched_signal_id is not None:
+            # Auto-merge folded the new evidence into the surviving signal; return
+            # the matched (surviving) signal instead of the candidate row so callers
+            # always receive the authoritative deduped signal.
+            surviving = await session.get(Signal, fuzzy_result.matched_signal_id)
+            if surviving is not None:
+                return surviving
 
     return row
 
@@ -514,6 +522,7 @@ __all__ = [
     "FuzzyDedupeResult",
     "FuzzyReviewAlreadyDecidedError",
     "FuzzyReviewNotFoundError",
+    "FuzzyReviewSignalMissingError",
     "ScoreResult",
     "SignalFuzzyReview",
     "SignalPage",

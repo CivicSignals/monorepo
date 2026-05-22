@@ -289,14 +289,19 @@ async def apply_fuzzy_review(
     if approved:
         candidate = await session.get(Signal, review.candidate_signal_id)
         matched = await session.get(Signal, review.matched_signal_id)
-        if candidate is not None and matched is not None:
-            merge_signal(
-                matched,
-                new_doc_ids=[uuid.UUID(s) for s in candidate.raw_document_ids],
-                new_confidence=candidate.confidence,
-                now=now,
-            )
-            await session.flush()
+        if candidate is None or matched is None:
+            # One or both signal rows were deleted after the review was created.
+            # Raising here prevents the review from being marked approved without
+            # actually merging — the review queue's integrity is more important than
+            # silently accepting a no-op approval.
+            raise FuzzyReviewSignalMissingError(review_id, review.candidate_signal_id, review.matched_signal_id)
+        merge_signal(
+            matched,
+            new_doc_ids=[uuid.UUID(s) for s in candidate.raw_document_ids],
+            new_confidence=candidate.confidence,
+            now=now,
+        )
+        await session.flush()
         review.status = REVIEW_STATUS_APPROVED
         log.info(
             "signals.fuzzy_dedupe.review_approved",
@@ -529,6 +534,29 @@ class FuzzyReviewAlreadyDecidedError(Exception):
         self.current_status = status
 
 
+class FuzzyReviewSignalMissingError(Exception):
+    """One or both signal rows referenced by a review no longer exist.
+
+    Raised when approving a review whose candidate or matched signal row has been
+    deleted between review creation and approval. The review is left as ``pending``
+    so it can be investigated rather than being silently marked approved with no merge.
+    """
+
+    def __init__(
+        self,
+        review_id: uuid.UUID,
+        candidate_signal_id: uuid.UUID,
+        matched_signal_id: uuid.UUID,
+    ) -> None:
+        super().__init__(
+            f"fuzzy review {review_id}: signal row(s) missing "
+            f"(candidate={candidate_signal_id}, matched={matched_signal_id})"
+        )
+        self.review_id = review_id
+        self.candidate_signal_id = candidate_signal_id
+        self.matched_signal_id = matched_signal_id
+
+
 __all__ = [
     "DEFAULT_FUZZY_CONFIG",
     "FUZZY_COSINE_THRESHOLD",
@@ -538,6 +566,7 @@ __all__ = [
     "FuzzyDedupeResult",
     "FuzzyReviewAlreadyDecidedError",
     "FuzzyReviewNotFoundError",
+    "FuzzyReviewSignalMissingError",
     "apply_fuzzy_review",
     "create_fuzzy_review",
     "find_fuzzy_duplicate",

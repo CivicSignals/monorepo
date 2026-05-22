@@ -227,6 +227,12 @@ async def approve_fuzzy_review(
             "Fuzzy review already decided",
             f"Review {review_id} is already in status {exc.current_status!r}.",
         )
+    except services.FuzzyReviewSignalMissingError as exc:
+        return _problem(
+            409,
+            "Signal row(s) missing",
+            str(exc),
+        )
     await session.commit()
     return FuzzyReviewRead.model_validate(row)
 
