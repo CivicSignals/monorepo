@@ -23,13 +23,20 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from civicsignals_api.ids import uuid7
 
 from .models import DEFAULT_STAGES, ItemStatus, PipelineItem, PipelineStage
 
 # Pagination defaults (doc 06 §5, doc 08 §1.5).
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 100
+
+# Sentinel for distinguishing "field omitted" from "field explicitly set to None"
+# in update payloads (used by update_item).
+_UNSET: object = object()
 
 
 # ---------------------------------------------------------------------------
@@ -108,24 +115,35 @@ class ItemPage:
 async def provision_default_stages(session: AsyncSession, *, workspace_id: uuid.UUID) -> None:
     """Seed the nine default Kanban stages for a workspace (PRD F14.1, J1).
 
-    Idempotent: skips if any stage already exists for the workspace. Called by
-    the workspace-creation flow (B5) or lazily on first stage-list request when
-    the workspace has no stages yet. The caller commits.
+    Idempotent and concurrency-safe: uses INSERT … ON CONFLICT DO NOTHING so
+    concurrent first-use requests converge without raising IntegrityError.
+    Called lazily on first stage-list or item-create request when the workspace
+    has no stages yet. The caller commits.
+
+    # TODO J2: consider calling this from workspace-creation (B5) so all
+    # workspaces have stages from day one rather than lazily.
     """
     existing = await session.execute(
         select(PipelineStage.id).where(PipelineStage.workspace_id == workspace_id).limit(1)
     )
     if existing.first() is not None:
-        return  # already provisioned
+        return  # already provisioned — fast path avoids pg_insert overhead
+
+    # Use INSERT … ON CONFLICT DO NOTHING so concurrent first-use requests don't
+    # race into a UNIQUE violation on (workspace_id, name).
     for name, position, is_default in DEFAULT_STAGES:
-        session.add(
-            PipelineStage(
+        stmt = (
+            pg_insert(PipelineStage)
+            .values(
+                id=uuid7(),  # Python-side default; pg_insert bypasses ORM defaults
                 workspace_id=workspace_id,
                 name=name,
                 position=position,
                 is_default=is_default,
             )
+            .on_conflict_do_nothing(constraint="uq_pipeline_stage_ws_name")
         )
+        await session.execute(stmt)
     await session.flush()
 
 
@@ -478,23 +496,28 @@ async def update_item(
     item_id: uuid.UUID,
     *,
     title: str | None = None,
-    notes: str | None = None,
-    value_estimate: Decimal | None = None,
+    notes: object = _UNSET,
+    value_estimate: object = _UNSET,
     status: ItemStatus | None = None,
-    owner_id: uuid.UUID | None = None,
+    owner_id: object = _UNSET,
 ) -> PipelineItem:
-    """Partial update of a pipeline item. The caller commits."""
+    """Partial update of a pipeline item.
+
+    Fields use ``_UNSET`` as a sentinel to distinguish "not provided" from
+    "explicitly set to null". Passing ``notes=None``, ``value_estimate=None``,
+    or ``owner_id=None`` clears those nullable fields. The caller commits.
+    """
     item = await get_item(session, workspace_id, item_id)
     if title is not None:
         item.title = title
-    if notes is not None:
-        item.notes = notes
-    if value_estimate is not None:
-        item.value_estimate = value_estimate
+    if notes is not _UNSET:
+        item.notes = None if notes is None else str(notes)
+    if value_estimate is not _UNSET:
+        item.value_estimate = None if value_estimate is None else Decimal(str(value_estimate))
     if status is not None:
         item.status = status
-    if owner_id is not None:
-        item.owner_id = owner_id
+    if owner_id is not _UNSET:
+        item.owner_id = None if owner_id is None else uuid.UUID(str(owner_id))
     await session.flush()
     await session.refresh(item)
     return item

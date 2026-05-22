@@ -31,6 +31,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Response, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
@@ -121,6 +122,7 @@ async def list_stages(
         # This is a no-op when the workspace already had stages (nothing was added).
         await session.commit()
     except ValueError as exc:
+        await session.rollback()
         raise _bad_request("Invalid cursor.") from exc
     return StagePage(items=[_stage_out(s) for s in page.items], next_cursor=page.next_cursor)
 
@@ -146,7 +148,7 @@ async def create_stage(
             is_default=body.is_default,
         )
         await session.commit()
-    except services.StageNameConflictError as exc:
+    except (services.StageNameConflictError, IntegrityError) as exc:
         await session.rollback()
         raise _conflict(
             f"A stage named '{body.name}' already exists in this workspace."
@@ -197,7 +199,7 @@ async def update_stage(
     except services.StageNotFoundError as exc:
         await session.rollback()
         raise _not_found("Stage") from exc
-    except services.StageNameConflictError as exc:
+    except (services.StageNameConflictError, IntegrityError) as exc:
         await session.rollback()
         raise _conflict(
             f"A stage named '{body.name}' already exists in this workspace."
@@ -242,7 +244,11 @@ async def reorder_stages(
     Supply the full ordered list of stage ids; positions are rebuilt 0-based
     in the given order. All workspace stage ids must be present exactly once.
     """
-    ordered_ids = [item.id for item in body.stages]
+    # Sort by the client-supplied position so the explicit field is the source of
+    # truth. Positions need not be contiguous — only the sort order matters here;
+    # the service rebuilds 0-based positions from the resulting list.
+    sorted_stages = sorted(body.stages, key=lambda s: s.position)
+    ordered_ids = [item.id for item in sorted_stages]
     try:
         stages = await services.reorder_stages(session, ctx.workspace_id, ordered_ids)
         await session.commit()
@@ -354,16 +360,21 @@ async def update_item(
     session: SessionDep,
 ) -> ItemOut:
     """Partial update: title, notes, value_estimate, status, owner_id."""
+    # Use _UNSET sentinel for nullable fields so the service can distinguish
+    # "field omitted" (no-op) from "field set to null" (clear the column).
+    set_fields = body.model_fields_set
     try:
         item = await services.update_item(
             session,
             ctx.workspace_id,
             item_id,
             title=body.title,
-            notes=body.notes,
-            value_estimate=body.value_estimate,
+            notes=body.notes if "notes" in set_fields else services._UNSET,
+            value_estimate=(
+                body.value_estimate if "value_estimate" in set_fields else services._UNSET
+            ),
             status=body.status,
-            owner_id=body.owner_id,
+            owner_id=body.owner_id if "owner_id" in set_fields else services._UNSET,
         )
         await session.commit()
     except services.ItemNotFoundError as exc:

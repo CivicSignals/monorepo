@@ -16,7 +16,7 @@ Ownership:
   # TODO J1-signal-fk: add REFERENCES signals_signal(id) once signals land.
 
 Stages per PRD F14.1:
-  Saved → Researching → Contacted → MeetingBooked → Qualified → Proposal/RFP
+  Saved → Researching → Contacted → Meeting Booked → Qualified → Proposal / RFP
   → Won / Lost / Disqualified
 
 These nine default stages are seeded by ``services.provision_default_stages``

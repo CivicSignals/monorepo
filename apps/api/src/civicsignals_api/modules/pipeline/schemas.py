@@ -95,7 +95,10 @@ class ItemUpdate(BaseModel):
     notes: str | None = None
     value_estimate: Decimal | None = Field(default=None, ge=Decimal("0"))
     status: ItemStatus | None = None
-    owner_id: UUID | None = None  # accounts_member.id; set to None to un-assign
+    owner_id: UUID | None = Field(
+        default=None,
+        description="accounts_member.id; omit to leave unchanged, send null to un-assign.",
+    )
 
 
 class ItemMove(BaseModel):

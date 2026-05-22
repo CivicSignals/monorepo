@@ -339,6 +339,19 @@ def test_assign_and_unassign_owner(client: TestClient) -> None:
     assert resp.status_code == 200
     assert resp.json()["owner_id"] == member_id
 
+    # Unassign: send owner_id: null — should clear the column
+    resp2 = client.patch(
+        f"{ITEMS}/{created['id']}",
+        json={"owner_id": None},
+        headers=_auth(token, ws),
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["owner_id"] is None
+
+    # Verify the unassignment persists
+    fetched = client.get(f"{ITEMS}/{created['id']}", headers=_auth(token, ws)).json()
+    assert fetched["owner_id"] is None
+
 
 def test_delete_item(client: TestClient) -> None:
     token = _signup(client, "item-delete@example.com")
