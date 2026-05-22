@@ -54,7 +54,7 @@ jobs:
     steps:
       # ------------------------------------------------------------------ setup
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up QEMU (cross-arch emulation)
         uses: docker/setup-qemu-action@v3
