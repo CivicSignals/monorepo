@@ -9,14 +9,20 @@ useDefault = true
 
 [allowlist]
 description = """
-Kubernetes manifests reference ConfigMap/Secret KEY NAMES via `key: <NAME>` inside
-`valueFrom` blocks (e.g. `key: S3_RAW_BUCKET`). These are configuration key *names*,
-not secret values — actual secrets are injected from Kubernetes Secrets at deploy time.
-The default `generic-api-key` rule false-positives on the uppercase key name, so we
-allowlist lines that are exactly a `key:` reference to an UPPER_SNAKE_CASE config key.
-This does not suppress real secret values (quoted/base64/mixed-case high-entropy strings).
+Two classes of documented false positives:
+1. Kubernetes manifests reference ConfigMap/Secret KEY NAMES via `key: <NAME>` inside
+   `valueFrom` blocks (e.g. `key: S3_RAW_BUCKET`) — configuration key *names*, not secret
+   values; the default `generic-api-key` rule false-positives on the uppercase key name.
+2. Documentation under `docs-site/docs/` and `docs/` contains illustrative API/auth
+   EXAMPLE snippets (Authorization: Bearer <token>, sample keys) that are placeholders,
+   not real secrets. Real secrets must never live in documentation.
+Neither suppresses real secret values committed in source/config.
 """
 regexTarget = "line"
 regexes = [
   '''^\s*key:\s*[A-Z][A-Z0-9_]+\s*$''',
+]
+paths = [
+  '''docs-site/docs/.*\.mdx?$''',
+  '''docs/.*\.md$''',
 ]
