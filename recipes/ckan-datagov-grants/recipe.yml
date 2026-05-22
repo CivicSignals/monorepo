@@ -1,0 +1,52 @@
+# Example recipe — WA state grants catalog via CKAN datastore (doc 18 §5 wave 2 #10).
+# Instantiates the multi-tenant `ckan` connector (TODO D7) for one tenant +
+# datastore resource. Synthetic example: demonstrates per-tenant config + the
+# `dd[data-key=...]` selectors over the connector's JSON->HTML projection. Public
+# open-data; no API key required (api_key optional, for private datasets).
+recipe_id: ckan-datagov-grants
+connector: ckan
+version: 1
+
+entity:
+  name: Washington State Department of Commerce
+  state: WA
+  kind: state_agency
+
+schedule:
+  cron: "0 7 * * *" # daily
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  ckan:
+    domain: data.wa.gov
+    resource_id: 11112222-3333-4444-5555-666677778888
+    page_size: 100
+    max_pages: 20
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='program_title']"
+      - "dd[data-key='title']"
+    required: true
+  agency:
+    selectors:
+      - "dd[data-key='agency']"
+    required: false
+  funding_amount:
+    selectors:
+      - "dd[data-key='funding_amount']"
+    required: false
+  posted_date:
+    selectors:
+      - "dd[data-key='posted_date']"
+    required: false
+
+signal_types:
+  - budget
+  - rfp_posted

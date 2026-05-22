@@ -1,0 +1,10 @@
+{
+  "signal_types": ["board_decision", "rfp_posted", "budget"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "City Council Regular Session — May 2025",
+    "meeting_date": "2025-05-20",
+    "agenda_summary": "Council adopted the capital improvement plan and directed staff to release a solicitation for downtown streetscape construction services."
+  }
+}

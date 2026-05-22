@@ -1,8 +1,9 @@
-"""Connector registry + dispatch (doc 18 §1, §5; TODO D6).
+"""Connector registry + dispatch (doc 18 §1, §5; TODO D6, D7).
 
-Asserts the five wave-1 connectors register under their type names, that
-``connector_for`` resolves a recipe to its connector and parses the per-connector
-config block, and that an unknown connector / bad config fails loudly.
+Asserts the wave-1 generic primitives *and* the wave-2 multi-tenant platforms
+register under their type names, that ``connector_for`` resolves a recipe to its
+connector and parses the per-connector config block, and that an unknown connector
+/ bad config fails loudly.
 """
 
 from __future__ import annotations
@@ -45,6 +46,18 @@ def test_all_wave1_connectors_registered() -> None:
         "pdf_extractor",
         "rest_api_pager",
         "bulk_download",
+    }
+
+
+def test_all_wave2_platform_connectors_registered() -> None:
+    # The six multi-tenant platforms (doc 18 §5 wave 2; D7).
+    assert set(registered_names()) >= {
+        "boarddocs",
+        "granicus_peak",
+        "civicplus",
+        "socrata",
+        "ckan",
+        "arcgis_rest",
     }
 
 
