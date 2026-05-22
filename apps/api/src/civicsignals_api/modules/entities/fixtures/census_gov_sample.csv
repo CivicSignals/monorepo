@@ -1,0 +1,9 @@
+GID,GOVT_NAME,GOVT_TYPE,STABBR,STATE_FIPS,COUNTY_FIPS,PLACE_FIPS,WEBSITE,POPULATION
+53-00000-1000-0001,State of Washington,state,WA,53,,,https://www.wa.gov,7785000
+48-00000-1000-0001,State of Texas,state,TX,48,,,https://www.texas.gov,30030000
+53-00033-2000-0001,King County,county,WA,53,53033,,https://kingcounty.gov,2270000
+48-00201-2000-0001,Harris County,county,TX,48,48201,,https://www.harriscountytx.gov,4780000
+53-00033-3000-5363000,City of Seattle,city,WA,53,53033,5363000,https://www.seattle.gov,737000
+48-00201-3000-4835000,City of Houston,city,TX,48,48201,4835000,https://www.houstontx.gov,2300000
+53-00033-5000-0001,King County Library System,library_system,WA,53,53033,,https://kcls.org,
+48-00201-7000-0001,Metropolitan Transit Authority of Harris County,transit,TX,48,48201,,https://www.ridemetro.org,
