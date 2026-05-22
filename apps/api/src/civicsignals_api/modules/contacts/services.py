@@ -234,6 +234,11 @@ async def upsert_contact(session: AsyncSession, inp: ContactInput) -> Contact:
         # ``index_where`` matches the partial index predicate so Postgres can
         # identify the constraint (partial indexes require the predicate to be
         # stated in the ON CONFLICT clause — see Postgres §7.8.4).
+        #
+        # We return only the ``id`` column (not the full ORM-mapped object) to
+        # avoid triggering lazy-load errors in async SQLAlchemy. After the
+        # INSERT/UPDATE we fetch the row via ``session.get`` which is properly
+        # awaited.
         from sqlalchemy import text as _text
 
         update_set = {
@@ -249,10 +254,14 @@ async def upsert_contact(session: AsyncSession, inp: ContactInput) -> Contact:
                 index_where=_text("canonical_email IS NOT NULL"),
                 set_=update_set,
             )
-            .returning(Contact)
+            .returning(Contact.id)
         )
         result = await session.execute(stmt)
-        contact = result.scalar_one()
+        contact_id: uuid.UUID = result.scalar_one()
+        # Fetch the full ORM object through the async session.
+        fetched = await session.get(Contact, contact_id)
+        assert fetched is not None, "upsert returned an id but row not found"
+        contact = fetched
     else:
         # No email → always insert a new row.
         contact = Contact(**contact_values)
