@@ -21,6 +21,10 @@ TASK_TRANSLATE = "translate"
 # cheap, low-latency call on the user's search box, so it routes to a Haiku-class
 # model just like classification.
 TASK_SMART_SEARCH_REWRITE = "smart_search_rewrite"
+# Smart-search result summarization (I4): an optional LLM synthesis of the top-N
+# ranked results into a short natural-language paragraph. Routed to a cheap
+# Haiku-class model to keep the per-query cost low; default off (summarize=false).
+TASK_SMART_SEARCH_SUMMARY = "smart_search_summary"
 # Signal embedding (I1, doc 19 §4/§7.4): each extracted signal is embedded into the
 # ``signals_signal.vector_embedding`` pgvector column for fuzzy dedupe (E10) +
 # smart-search / hybrid retrieval (I3). Routes to an embeddings model (OpenAI /

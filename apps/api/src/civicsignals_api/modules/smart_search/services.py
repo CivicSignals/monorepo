@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.llm_gateway import (
     TASK_SMART_SEARCH_REWRITE,
+    TASK_SMART_SEARCH_SUMMARY,
     LLMError,
     LLMGateway,
     LLMResult,
@@ -56,6 +57,20 @@ log = structlog.get_logger(__name__)
 # default below, with no change to this call site.
 REWRITE_PROMPT_NAME = "smart_search_rewrite"
 REWRITE_PROMPT_VERSION = "v1"
+
+# Summarization (I4) — prompt registry seam (TODO E3): same approach as the rewrite.
+# The name ``smart_search_summary`` resolves to the versioned prompt once E3 lands.
+SUMMARY_PROMPT_NAME = "smart_search_summary"
+SUMMARY_PROMPT_VERSION = "v1"
+
+# Cap the number of results fed to the summarizer to bound the prompt size and
+# per-query LLM token cost (I4). The summarizer always operates on the first page
+# of results regardless of ``top_n``; a caller that requests page 2+ via ``cursor``
+# gets no summary (only first-page calls make sense to summarize).
+SUMMARY_TOP_N = 5
+# Max characters of title + summary included per signal in the summary prompt.
+# Truncation avoids runaway prompts for signals with very long summaries.
+_SUMMARY_SIGNAL_CHARS = 400
 
 # Allowed enum values, sourced from the schema Literals so the prompt and the
 # repair pass never drift from the validated filter fields (doc 08 §3.2).
@@ -92,6 +107,15 @@ Rules:
 - Put words that are NOT captured by a filter into "text".
 - Use "entities" for named organizations/places; do NOT guess IDs.
 - If nothing maps to a filter, return all of the user's query as "text".
+"""
+
+# TODO E3: inline default summary prompt. Move to
+# apps/api/prompts/smart_search_summary/v1.md once the prompt registry exists;
+# reference it via SUMMARY_PROMPT_NAME/SUMMARY_PROMPT_VERSION.
+_SUMMARY_SYSTEM_PROMPT = """\
+You synthesize the top results from a CivicSignals smart search into a concise
+natural-language paragraph for a sales professional. You write in active, specific
+prose — not bullet points. You do not invent facts beyond what the results contain.
 """
 
 
@@ -402,6 +426,108 @@ def fuse_rankings(
     return hits
 
 
+class ResultSummarizer:
+    """LLM synthesis of the top-N hybrid-retrieval results (I4).
+
+    Given the original NL ``query`` and a list of :class:`SmartSearchResult` objects,
+    produces a short natural-language paragraph that synthesises the most relevant
+    results — e.g. "Here are 3 RFPs matching your search for cybersecurity services.
+    The most relevant is … from …, due …".
+
+    The summarizer is **optional** and **non-fatal**: if the LLM call fails, or if
+    there are no results, it returns ``None`` so the caller can omit the field from
+    the response without breaking the search.
+
+    Token cost is bounded by:
+    - capping the number of results fed into the prompt at :data:`SUMMARY_TOP_N`;
+    - truncating each result's title + summary text to :data:`_SUMMARY_SIGNAL_CHARS`
+      characters so a result with a very long summary does not blow up the prompt.
+
+    Token usage is metered against ``workspace_id`` via the gateway accountant
+    (doc 06 §7); the ``TASK_SMART_SEARCH_SUMMARY`` task routes to a cheap Haiku-class
+    model (I4 cost note: Haiku keeps the per-call cost at ~$0.0001-0.0005).
+    """
+
+    def __init__(self, gateway: LLMGateway | None = None) -> None:
+        self._gateway = gateway or get_gateway()
+
+    async def summarize(
+        self,
+        query: str,
+        results: Sequence[SmartSearchResult],
+        *,
+        workspace_id: str | None = None,
+    ) -> str | None:
+        """Synthesize ``results`` (top-N) into a short paragraph.
+
+        Returns ``None`` when there are no results or on any LLM failure (graceful
+        degradation — callers must not depend on a summary being present).
+        """
+        if not results:
+            return None
+
+        top = list(results[:SUMMARY_TOP_N])
+        prompt = self._build_prompt(query, top)
+        try:
+            # E2 seam: ``prompt=`` is set, so the gateway uses the raw inline
+            # text and treats ``prompt_name``/``prompt_version`` as provenance
+            # metadata only (no registry lookup). Once E3 lands, remove
+            # ``prompt=`` and ``system=`` here; the registry will resolve
+            # ``SUMMARY_PROMPT_NAME`` to ``apps/api/prompts/
+            # smart_search_summary/v1.md`` and render both body + system.
+            result = await self._gateway.complete(
+                prompt=prompt,
+                task=TASK_SMART_SEARCH_SUMMARY,
+                system=_SUMMARY_SYSTEM_PROMPT,
+                workspace_id=workspace_id,
+                max_tokens=256,
+                temperature=0.3,
+                prompt_name=SUMMARY_PROMPT_NAME,
+                prompt_version=SUMMARY_PROMPT_VERSION,
+            )
+        except LLMError:
+            log.warning("smart_search.summarize.llm_error", exc_info=True)
+            return None
+
+        text = result.text.strip()
+        return text or None
+
+    @staticmethod
+    def _build_prompt(query: str, results: list[SmartSearchResult]) -> str:
+        """Build the user-turn prompt for the summarizer.
+
+        Short and token-efficient: the query, the count, and one truncated
+        "title — entity — summary" line per result. The model fills in prose.
+        """
+        lines = [
+            f"Search query: {query}",
+            f"Number of results: {len(results)}",
+            "",
+            "Top results (title | entity | excerpt):",
+        ]
+        for i, r in enumerate(results, 1):
+            sig = r.signal
+            title = (sig.title or "").strip()
+            summary = (sig.summary or "").strip()
+            entity = (sig.entity_name_raw or "").strip()
+            # Truncate the combined text to bound the prompt size.
+            snippet = f"{title} — {entity} — {summary}"
+            if len(snippet) > _SUMMARY_SIGNAL_CHARS:
+                snippet = snippet[: _SUMMARY_SIGNAL_CHARS - 1] + "…"
+            lines.append(f"{i}. {snippet}")
+
+        lines.extend(
+            [
+                "",
+                "Write a concise 1-3 sentence synthesis of these results for a "
+                "sales professional. Be specific: name the most relevant result, "
+                "the issuing entity, and any key details (due date, dollar amount). "
+                "Do not invent facts beyond what is listed above.",
+            ]
+        )
+        return "\n".join(lines)
+
+
 class HybridRetriever:
     """Hybrid retrieval over the global signal corpus (TODO I3, doc 14 §6.2).
 
@@ -416,9 +542,11 @@ class HybridRetriever:
         gateway: LLMGateway | None = None,
         *,
         rewriter: QueryRewriter | None = None,
+        summarizer: ResultSummarizer | None = None,
     ) -> None:
         self._gateway = gateway or get_gateway()
         self._rewriter = rewriter or QueryRewriter(self._gateway)
+        self._summarizer = summarizer or ResultSummarizer(self._gateway)
 
     async def search(
         self,
@@ -431,6 +559,7 @@ class HybridRetriever:
         candidate_limit: int = 100,
         weights: FusionWeights | None = None,
         cursor: str | None = None,
+        summarize: bool = False,
     ) -> SmartSearchResponse:
         """Run hybrid retrieval for a natural-language ``query`` (doc 14 §6.2).
 
@@ -439,6 +568,12 @@ class HybridRetriever:
         3. Run vector ANN + BM25 FTS (both scoped to the merged filters) and a
            structured-filter id query, then fuse.
         4. Hydrate the top-N (after the cursor offset) into :class:`SignalRead`.
+        5. Optionally summarize the top-N results into a short NL paragraph (I4).
+           Only on ``summarize=True`` and the first page (``cursor`` is ``None``);
+           paginated follow-ups are never summarized. Failures are non-fatal.
+           # TODO I5: check per-workspace daily smart-search LLM budget here before
+           # calling the summarizer (I5 caps spend per workspace per day; F3 must
+           # land first to provide workspace budget data).
 
         ``workspace_id`` scopes token accounting for the rewrite + query embed
         (doc 06 §7); the signal corpus itself is global (doc 14 §4.2).
@@ -473,11 +608,20 @@ class HybridRetriever:
         next_cursor = _encode_offset_cursor(offset + top_n) if has_more else None
 
         results = await self._hydrate(session, page)
+
+        # I4: optional LLM summary. Only on the first page (offset == 0) because a
+        # paginated second page is out-of-context for the original NL query's summary,
+        # and because callers on page 2+ already have the first-page summary cached.
+        summary: str | None = None
+        if summarize and offset == 0:
+            summary = await self._summarizer.summarize(query, results, workspace_id=workspace_id)
+
         return SmartSearchResponse(
             results=results,
             next_cursor=next_cursor,
             query=structured,
             degraded=structured.degraded,
+            summary=summary,
         )
 
     # -- retriever (a): vector ANN -------------------------------------------
@@ -701,10 +845,12 @@ def _apply_filters(stmt: Any, filters: SearchFilters) -> Any:
 
 
 __all__ = [
+    "SUMMARY_TOP_N",
     "FusedHit",
     "FusionWeights",
     "HybridRetriever",
     "QueryRewriter",
+    "ResultSummarizer",
     "SearchFilters",
     "SmartSearchResponse",
     "SmartSearchResult",

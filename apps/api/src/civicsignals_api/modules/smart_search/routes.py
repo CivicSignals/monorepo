@@ -1,7 +1,7 @@
 """HTTP endpoints for the smart_search module, mounted under `/api/v1/smart-search`.
 
   POST /smart-search/rewrite  — NL -> structured query rewrite (TODO I2)
-  POST /smart-search          — hybrid retrieval: ranked signals (TODO I3)
+  POST /smart-search          — hybrid retrieval: ranked signals (TODO I3, I4)
 
 Hybrid retrieval (doc 14 §6.2) runs behind ``require_workspace``: the signal corpus
 is global (doc 14 §4.2), but the search runs in a workspace context so the rewrite +
@@ -11,7 +11,10 @@ search box is usable before workspace plumbing — it only meters usage when a h
 is present. Cursor pagination + RFC 7807 errors (doc 06 §5). ``api/v1.py`` already
 imports and mounts this router — do not add it there.
 
-# TODO I4: summarize the top results (the gateway summary task) onto the response.
+I4: ``POST /smart-search`` now accepts ``summarize=true`` to request an optional
+LLM synthesis of the top-N results (see :class:`~.services.ResultSummarizer`). The
+LLM cost is metered against the workspace. ``summary`` is ``None`` when not requested,
+when there are no results, or when the summarizer fails (graceful degradation).
 # TODO I5: enforce a per-workspace smart-search token/cost budget before running.
 """
 
@@ -82,11 +85,13 @@ async def smart_search(
     # boost ranking later. ``RequireViewer`` = any member (a read).
     ctx: RequireViewer,
 ) -> SmartSearchResponse | JSONResponse:
-    """Hybrid retrieval over the global signal corpus (TODO I3).
+    """Hybrid retrieval over the global signal corpus (I3) with optional summary (I4).
 
     NL ``query`` -> rewrite (I2) -> vector ANN + BM25 + structured-filter
     intersection, fused with weighted RRF -> a ranked, cursor-paginated page of
-    signals with scores + which retrievers matched (doc 14 §6.2).
+    signals with scores + which retrievers matched (doc 14 §6.2). Set
+    ``summarize=true`` to receive a short NL synthesis of the top results; the
+    summary is omitted (``null``) when there are no results or on LLM failure.
     """
     retriever = HybridRetriever()
     try:
@@ -99,6 +104,7 @@ async def smart_search(
             candidate_limit=body.candidate_limit,
             weights=body.weights,
             cursor=body.cursor,
+            summarize=body.summarize,
         )
     except ValueError:
         return _problem(400, "Invalid cursor", "The supplied cursor is malformed.")
