@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -403,6 +404,26 @@ def _setup_slack_connection(
 @pytest.mark.skipif(not _DB_AVAILABLE, reason="no DB available import")
 class TestSlackChannelAPI:
     """Live-DB API tests for Slack channel list + select endpoints (L1)."""
+
+    @pytest.fixture(autouse=True)
+    def _slack_configured(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Configure the Slack OAuth client on the app regardless of test order.
+
+        ``get_settings`` is ``@lru_cache``d; when the full suite caches settings
+        without Slack creds before this class runs, the endpoints would otherwise
+        see the provider as unconfigured (HTTP 422 ``provider_not_configured``).
+        Set the creds in the env + clear the cache so each request re-reads a
+        Slack-configured ``Settings`` (and restore afterwards). Order-independent.
+        """
+        from civicsignals_api.config import get_settings
+
+        monkeypatch.setenv("SLACK_CLIENT_ID", "slack-client-id")
+        monkeypatch.setenv("SLACK_CLIENT_SECRET", "slack-client-secret")
+        get_settings.cache_clear()
+        try:
+            yield
+        finally:
+            get_settings.cache_clear()
 
     def test_list_channels_endpoint_returns_mocked_channels(self, client: Any) -> None:
         """GET .../slack/channels calls SlackProvider.list_channels (mocked HTTP)."""
