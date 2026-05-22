@@ -1,4 +1,4 @@
-"""Public service interface for the pipeline module (J1).
+"""Public service interface for the pipeline module (J1, J3).
 
 Other modules call pipeline only through the functions defined here — never by
 importing pipeline's models or routes directly (doc 06 §3).
@@ -12,6 +12,17 @@ next request and filter ``id > cursor_id``.
 
 All functions are workspace-scoped: callers pass ``workspace_id`` and the
 service NEVER queries across workspace boundaries.
+
+J3 Activity log
+---------------
+:func:`record_activity` is the write surface for the append-only activity log.
+It is called directly from pipeline mutations (create_item, move_item,
+assign_owner, set_value, update_item) and from the comment endpoint.  The
+K-chain integration push handler will call it via the ``integration_push`` seam
+(# TODO K).
+
+:func:`list_activity` is the cursor-paginated read surface used by
+``GET /pipeline/items/{id}/activity``.
 """
 
 from __future__ import annotations
@@ -28,7 +39,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.ids import uuid7
 
-from .models import DEFAULT_STAGES, ItemStatus, PipelineItem, PipelineStage
+from .models import (
+    DEFAULT_STAGES,
+    ActivityType,
+    ItemStatus,
+    PipelineItem,
+    PipelineItemActivity,
+    PipelineStage,
+)
 
 # Pagination defaults (doc 06 §5, doc 08 §1.5).
 DEFAULT_LIMIT = 25
@@ -87,8 +105,16 @@ class ReorderError(PipelineError):
 
 
 # ---------------------------------------------------------------------------
-# Stage data class
+# Data classes
 # ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ActivityPage:
+    """A cursor-paginated page of pipeline item activity entries."""
+
+    items: list[PipelineItemActivity]
+    next_cursor: str | None
 
 
 @dataclass(slots=True)
@@ -412,16 +438,18 @@ async def create_item(
     owner_id: uuid.UUID | None = None,
     notes: str | None = None,
     value_estimate: Decimal | None = None,
+    actor_id: uuid.UUID | None = None,
 ) -> PipelineItem:
     """Create a pipeline item in the workspace.
 
     If ``stage_id`` is omitted the workspace's default stage is used (lazy-
-    provisioning default stages if needed). The caller commits.
+    provisioning default stages if needed). Records a ``created`` activity entry
+    (J3). The caller commits.
     """
     await provision_default_stages(session, workspace_id=workspace_id)
     resolved_stage_id = stage_id or await _default_stage_id(session, workspace_id)
     # Verify the stage belongs to this workspace.
-    await get_stage(session, workspace_id, resolved_stage_id)
+    stage = await get_stage(session, workspace_id, resolved_stage_id)
     item = PipelineItem(
         workspace_id=workspace_id,
         stage_id=resolved_stage_id,
@@ -434,6 +462,15 @@ async def create_item(
     )
     session.add(item)
     await session.flush()
+    # J3: record creation activity.
+    await record_activity(
+        session,
+        item_id=item.id,
+        workspace_id=workspace_id,
+        activity_type=ActivityType.CREATED,
+        payload={"stage_id": str(resolved_stage_id), "stage_name": stage.name},
+        actor_id=actor_id,
+    )
     return item
 
 
@@ -503,12 +540,14 @@ async def update_item(
     value_estimate: object = UNSET,
     status: ItemStatus | None = None,
     owner_id: object = UNSET,
+    actor_id: uuid.UUID | None = None,
 ) -> PipelineItem:
     """Partial update of a pipeline item.
 
     Fields use ``UNSET`` as a sentinel to distinguish "not provided" from
     "explicitly set to null". Passing ``notes=None``, ``value_estimate=None``,
-    or ``owner_id=None`` clears those nullable fields. The caller commits.
+    or ``owner_id=None`` clears those nullable fields. Records activity entries
+    for value_estimate and owner_id changes (J3). The caller commits.
     """
     item = await get_item(session, workspace_id, item_id)
     if title is not None:
@@ -516,11 +555,37 @@ async def update_item(
     if notes is not UNSET:
         item.notes = None if notes is None else str(notes)
     if value_estimate is not UNSET:
-        item.value_estimate = None if value_estimate is None else Decimal(str(value_estimate))
+        old_value = str(item.value_estimate) if item.value_estimate is not None else None
+        new_val = None if value_estimate is None else Decimal(str(value_estimate))
+        new_value = str(new_val) if new_val is not None else None
+        item.value_estimate = new_val
+        if old_value != new_value:
+            await session.flush()
+            await record_activity(
+                session,
+                item_id=item_id,
+                workspace_id=workspace_id,
+                activity_type=ActivityType.VALUE_CHANGED,
+                payload={"old_value": old_value, "new_value": new_value},
+                actor_id=actor_id,
+            )
     if status is not None:
         item.status = status
     if owner_id is not UNSET:
-        item.owner_id = None if owner_id is None else uuid.UUID(str(owner_id))
+        old_owner = str(item.owner_id) if item.owner_id is not None else None
+        new_oid = None if owner_id is None else uuid.UUID(str(owner_id))
+        new_owner = str(new_oid) if new_oid is not None else None
+        item.owner_id = new_oid
+        if old_owner != new_owner:
+            await session.flush()
+            await record_activity(
+                session,
+                item_id=item_id,
+                workspace_id=workspace_id,
+                activity_type=ActivityType.ASSIGNED,
+                payload={"old_owner_id": old_owner, "new_owner_id": new_owner},
+                actor_id=actor_id,
+            )
     await session.flush()
     await session.refresh(item)
     return item
@@ -533,19 +598,36 @@ async def move_item(
     *,
     stage_id: uuid.UUID,
     status: ItemStatus | None = None,
+    actor_id: uuid.UUID | None = None,
 ) -> PipelineItem:
     """Move an item to a different stage (J2 Kanban DnD seam).
 
     Verifies the target stage belongs to the same workspace. Optionally updates
-    status at the same time (e.g. dragging to Won → status=won). The caller
-    commits.
+    status at the same time (e.g. dragging to Won → status=won). Records a
+    ``stage_changed`` activity entry (J3). The caller commits.
     """
     item = await get_item(session, workspace_id, item_id)
-    await get_stage(session, workspace_id, stage_id)  # workspace check
+    from_stage_id = item.stage_id
+    from_stage = await get_stage(session, workspace_id, from_stage_id)
+    to_stage = await get_stage(session, workspace_id, stage_id)  # workspace check
     item.stage_id = stage_id
     if status is not None:
         item.status = status
     await session.flush()
+    # J3: record stage transition (even if from == to, so audit is complete).
+    await record_activity(
+        session,
+        item_id=item_id,
+        workspace_id=workspace_id,
+        activity_type=ActivityType.STAGE_CHANGED,
+        payload={
+            "from_stage_id": str(from_stage_id),
+            "from_stage_name": from_stage.name,
+            "to_stage_id": str(stage_id),
+            "to_stage_name": to_stage.name,
+        },
+        actor_id=actor_id,
+    )
     await session.refresh(item)
     return item
 
@@ -556,11 +638,25 @@ async def assign_owner(
     item_id: uuid.UUID,
     *,
     owner_id: uuid.UUID | None,
+    actor_id: uuid.UUID | None = None,
 ) -> PipelineItem:
-    """Set (or clear) the assignee on a pipeline item. The caller commits."""
+    """Set (or clear) the assignee on a pipeline item.
+
+    Records an ``assigned`` activity entry (J3). The caller commits.
+    """
     item = await get_item(session, workspace_id, item_id)
+    old_owner = str(item.owner_id) if item.owner_id is not None else None
+    new_owner = str(owner_id) if owner_id is not None else None
     item.owner_id = owner_id
     await session.flush()
+    await record_activity(
+        session,
+        item_id=item_id,
+        workspace_id=workspace_id,
+        activity_type=ActivityType.ASSIGNED,
+        payload={"old_owner_id": old_owner, "new_owner_id": new_owner},
+        actor_id=actor_id,
+    )
     await session.refresh(item)
     return item
 
@@ -571,11 +667,25 @@ async def set_value(
     item_id: uuid.UUID,
     *,
     value_estimate: Decimal | None,
+    actor_id: uuid.UUID | None = None,
 ) -> PipelineItem:
-    """Set or clear the value estimate on an item. The caller commits."""
+    """Set or clear the value estimate on an item.
+
+    Records a ``value_changed`` activity entry (J3). The caller commits.
+    """
     item = await get_item(session, workspace_id, item_id)
+    old_value = str(item.value_estimate) if item.value_estimate is not None else None
+    new_value = str(value_estimate) if value_estimate is not None else None
     item.value_estimate = value_estimate
     await session.flush()
+    await record_activity(
+        session,
+        item_id=item_id,
+        workspace_id=workspace_id,
+        activity_type=ActivityType.VALUE_CHANGED,
+        payload={"old_value": old_value, "new_value": new_value},
+        actor_id=actor_id,
+    )
     return item
 
 
@@ -675,3 +785,108 @@ async def rollup_by_stage(
     total_value: Decimal | None = sum(valued, Decimal("0")) if valued else None
 
     return PipelineRollup(stages=stage_rows, total_items=total_items, total_value=total_value)
+
+
+# ---------------------------------------------------------------------------
+# Activity log (J3)
+# ---------------------------------------------------------------------------
+
+
+async def record_activity(
+    session: AsyncSession,
+    *,
+    item_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    activity_type: ActivityType,
+    payload: dict[str, object] | None = None,
+    actor_id: uuid.UUID | None = None,
+) -> PipelineItemActivity:
+    """Append one activity row for a pipeline item and flush (caller commits).
+
+    Append-only: this function only ever INSERTs.  No UPDATE or DELETE is issued
+    against ``pipeline_item_activity``.
+
+    Called from within pipeline mutations (create_item, move_item, assign_owner,
+    set_value, update_item) and from the comment endpoint.  The K-chain
+    integration push handler will call this directly for ``integration_push``
+    events (# TODO K).
+
+    ``actor_id`` is the ``accounts_member.id`` of the person who triggered the
+    action; pass ``None`` for system-generated events.
+    """
+    entry = PipelineItemActivity(
+        item_id=item_id,
+        workspace_id=workspace_id,
+        actor_id=actor_id,
+        activity_type=activity_type,
+        payload=dict(payload) if payload else {},
+    )
+    session.add(entry)
+    await session.flush()
+    return entry
+
+
+async def list_activity(
+    session: AsyncSession,
+    *,
+    item_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> ActivityPage:
+    """Cursor-paginated timeline of activity for a pipeline item (J3).
+
+    Ordered by ``created_at ASC, id ASC`` (oldest-first — a chronological
+    timeline). Workspace-scoped: only returns rows where
+    ``workspace_id = workspace_id``, preventing cross-workspace leaks.
+
+    Cursor encodes the last returned row's UUID v7 id (same scheme as
+    stages/items). The next page starts *after* that row (``id > cursor_id``).
+    UUID v7 is time-ordered so ``id > cursor_id`` is equivalent to
+    ``created_at > cursor_created_at`` for the same workspace.
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    stmt = (
+        select(PipelineItemActivity)
+        .where(
+            PipelineItemActivity.item_id == item_id,
+            PipelineItemActivity.workspace_id == workspace_id,
+        )
+        .order_by(PipelineItemActivity.created_at.asc(), PipelineItemActivity.id.asc())
+    )
+    if cursor is not None:
+        cursor_id = decode_cursor(cursor)
+        stmt = stmt.where(PipelineItemActivity.id > cursor_id)
+    stmt = stmt.limit(limit + 1)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = encode_cursor(items[-1].id) if has_more and items else None
+    return ActivityPage(items=items, next_cursor=next_cursor)
+
+
+async def add_comment(
+    session: AsyncSession,
+    *,
+    item_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    text: str,
+    actor_id: uuid.UUID | None = None,
+) -> PipelineItemActivity:
+    """Add a free-text comment to a pipeline item (J3).
+
+    Verifies the item exists and belongs to ``workspace_id`` before writing.
+    Records an activity entry with ``activity_type = 'comment'`` and
+    ``payload = {'text': text}``.  The caller commits.
+    """
+    # Verify item belongs to this workspace (raises ItemNotFoundError if not).
+    await get_item(session, workspace_id, item_id)
+    return await record_activity(
+        session,
+        item_id=item_id,
+        workspace_id=workspace_id,
+        activity_type=ActivityType.COMMENT,
+        payload={"text": text},
+        actor_id=actor_id,
+    )

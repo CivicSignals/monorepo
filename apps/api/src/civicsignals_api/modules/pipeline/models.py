@@ -1,14 +1,15 @@
-"""pipeline SQLAlchemy models — J1.
+"""pipeline SQLAlchemy models — J1, J3.
 
 Tables are prefixed ``pipeline_`` and are migrated only by this module
 (doc 06 §3, §4; doc 07 §2 pipeline section).
 
-Two tables:
-- ``pipeline_stage``  — workspace-specific Kanban columns (name, order, default flag).
-- ``pipeline_item``   — an opportunity being tracked through the pipeline.
+Three tables:
+- ``pipeline_stage``         — workspace-specific Kanban columns (name, order, default flag).
+- ``pipeline_item``          — an opportunity being tracked through the pipeline.
+- ``pipeline_item_activity`` — append-only activity log for each pipeline item (J3).
 
 Ownership:
-- Both tables carry ``workspace_id`` FK → ``accounts_workspace``.
+- All tables carry ``workspace_id`` FK → ``accounts_workspace``.
 - ``pipeline_item.owner_id`` → ``accounts_member`` (the assignee).
 - ``pipeline_item.signal_id`` is a *nullable loose reference* to the future
   ``signals_signal`` table (doc 07 §2 pipeline item). The signals module is not
@@ -26,6 +27,9 @@ Item status enum mirrors the stage names for clarity but is distinct — an item
 can be in ``Won`` stage while its administrative status is ``active`` until the
 rep archives it. Status is kept simple for J1; J3 (activity log) adds richer
 lifecycle tracking.
+
+Activity types (J3):
+  created | stage_changed | assigned | value_changed | comment | integration_push
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -48,7 +53,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from civicsignals_api.db import Base
@@ -207,4 +212,110 @@ class PipelineItem(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Activity log (J3)
+# ---------------------------------------------------------------------------
+
+
+class ActivityType(StrEnum):
+    """The kind of event recorded in ``pipeline_item_activity`` (J3).
+
+    Values:
+    - ``created``           — item was first created.
+    - ``stage_changed``     — item moved to a different stage (payload: from/to stage ids/names).
+    - ``assigned``          — owner (assignee) changed (payload: old/new owner_id).
+    - ``value_changed``     — value_estimate updated (payload: old/new value).
+    - ``comment``           — free-text note added by a team member.
+    - ``integration_push``  — item pushed to an external integration (K-chain seam).
+                              # TODO K: record_activity called by integration push handler.
+    """
+
+    CREATED = "created"
+    STAGE_CHANGED = "stage_changed"
+    ASSIGNED = "assigned"
+    VALUE_CHANGED = "value_changed"
+    COMMENT = "comment"
+    INTEGRATION_PUSH = "integration_push"
+
+
+class PipelineItemActivity(Base):
+    """Append-only activity log entry for a pipeline item (J3, doc 07 §2).
+
+    Every meaningful mutation on a :class:`PipelineItem` — creation, stage
+    transition, assignment, value edit — produces one row here. Comments from
+    team members are stored as ``activity_type = 'comment'`` with the comment
+    text in ``payload['text']``.
+
+    **Append-only contract:** no UPDATE or DELETE is ever issued against this
+    table.  The service layer enforces this.
+
+    Columns:
+    - ``item_id``       — FK → pipeline_item (CASCADE delete so rows are pruned
+                          when the item is hard-deleted).
+    - ``workspace_id``  — denormalised for workspace-scoped queries without a
+                          JOIN (consistent with the modulith's workspace-scope rule).
+    - ``actor_id``      — nullable UUID; the ``accounts_member.id`` of whoever
+                          triggered the event. NULL for system-generated entries.
+                          Stored as a loose UUID (no DB FK) so the pipeline module
+                          doesn't depend on the accounts module's table layout.
+                          # TODO J3-actor-fk: add FK once B6 members API is stable.
+    - ``activity_type`` — :class:`ActivityType` enum.
+    - ``payload``       — JSONB context bag, schema varies by type:
+                          stage_changed: {from_stage_id, to_stage_id, from_stage_name, to_stage_name}
+                          assigned:      {old_owner_id, new_owner_id}
+                          value_changed: {old_value, new_value}
+                          comment:       {text}
+                          integration_push: {target, result, ...}  # filled by K-chain
+    - ``created_at``    — event timestamp (server default; no updated_at — append-only).
+    """
+
+    __tablename__ = "pipeline_item_activity"
+    __table_args__ = (
+        Index(
+            "ix_pipeline_item_activity_item_time",
+            "item_id",
+            "created_at",
+            postgresql_ops={"created_at": "DESC"},
+        ),
+        Index("ix_pipeline_item_activity_workspace_time", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pipeline_item.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_workspace.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # TODO J3-actor-fk: add REFERENCES accounts_member(id) once B6 members API lands.
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+    activity_type: Mapped[ActivityType] = mapped_column(
+        Enum(
+            ActivityType,
+            name="pipeline_activity_type",
+            native_enum=False,
+            length=20,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+    )
+    payload: Mapped[dict[str, object]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
     )

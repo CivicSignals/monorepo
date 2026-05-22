@@ -1,4 +1,4 @@
-"""HTTP endpoints for the pipeline module (J1), mounted under ``/api/v1/pipeline``.
+"""HTTP endpoints for the pipeline module (J1, J3), mounted under ``/api/v1/pipeline``.
 
 All endpoints require workspace context (``require_workspace`` / B5):
 - ``X-Workspace-Id`` header routes to the correct tenant.
@@ -21,6 +21,10 @@ Item endpoints:
   DELETE /pipeline/items/{id}        — delete
   POST /pipeline/items/{id}/move     — move to stage (J2 Kanban DnD seam)
 
+Activity endpoints (J3):
+  GET  /pipeline/items/{id}/activity  — item activity timeline (cursor-paginated)
+  POST /pipeline/items/{id}/comments  — add a free-text comment
+
 Note: ``api/v1.py`` already imports and mounts ``pipeline_routes.router``; this
 file must NOT be added to ``api/v1.py`` again.
 """
@@ -39,8 +43,11 @@ from civicsignals_api.modules.auth.dependencies import CurrentWorkspace
 from civicsignals_api.problems import ProblemException
 
 from . import services
-from .models import PipelineItem, PipelineStage
+from .models import PipelineItem, PipelineItemActivity, PipelineStage
 from .schemas import (
+    ActivityOut,
+    ActivityPage,
+    CommentCreate,
     ItemCreate,
     ItemMove,
     ItemOut,
@@ -68,6 +75,10 @@ def _stage_out(stage: PipelineStage) -> StageOut:
 
 def _item_out(item: PipelineItem) -> ItemOut:
     return ItemOut.model_validate(item)
+
+
+def _activity_out(entry: PipelineItemActivity) -> ActivityOut:
+    return ActivityOut.model_validate(entry)
 
 
 def _not_found(entity: str) -> ProblemException:
@@ -476,3 +487,88 @@ async def move_item(
         await session.rollback()
         raise _not_found("Stage") from exc
     return _item_out(item)
+
+
+# ---------------------------------------------------------------------------
+# Activity endpoints (J3)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/items/{item_id}/activity",
+    response_model=ActivityPage,
+    summary="Get pipeline item activity timeline",
+    tags=["pipeline"],
+)
+async def list_activity(
+    item_id: uuid.UUID,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = services.DEFAULT_LIMIT,
+) -> ActivityPage:
+    """Chronological activity timeline for a pipeline item (J3).
+
+    Returns stage transitions, comments, assignments, value changes, and
+    integration pushes. Workspace-scoped — only returns activity for items
+    belonging to the authenticated workspace.
+
+    Cursor-paginated (oldest-first): the first page is the oldest activity,
+    subsequent pages go forward in time via ``?cursor=…``.
+
+    RFC 7807 errors:
+    - 404 when the item does not exist in this workspace.
+    - 400 on an invalid cursor.
+    """
+    # Verify the item exists in this workspace first.
+    try:
+        await services.get_item(session, ctx.workspace_id, item_id)
+    except services.ItemNotFoundError as exc:
+        raise _not_found("Item") from exc
+    try:
+        page = await services.list_activity(
+            session,
+            item_id=item_id,
+            workspace_id=ctx.workspace_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise _bad_request("Invalid cursor.") from exc
+    return ActivityPage(items=[_activity_out(e) for e in page.items], next_cursor=page.next_cursor)
+
+
+@router.post(
+    "/items/{item_id}/comments",
+    response_model=ActivityOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a comment to a pipeline item",
+    tags=["pipeline"],
+)
+async def add_comment(
+    item_id: uuid.UUID,
+    body: CommentCreate,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+) -> ActivityOut:
+    """Add a free-text comment to a pipeline item (J3).
+
+    The comment is stored as an activity entry (``activity_type = 'comment'``)
+    and appears in the item's activity timeline. Workspace-scoped.
+
+    RFC 7807 errors:
+    - 404 when the item does not exist in this workspace.
+    """
+    try:
+        entry = await services.add_comment(
+            session,
+            item_id=item_id,
+            workspace_id=ctx.workspace_id,
+            text=body.text,
+            actor_id=body.actor_id,
+        )
+        await session.commit()
+    except services.ItemNotFoundError as exc:
+        await session.rollback()
+        raise _not_found("Item") from exc
+    return _activity_out(entry)

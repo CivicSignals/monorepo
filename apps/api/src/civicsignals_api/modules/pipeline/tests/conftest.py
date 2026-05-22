@@ -31,7 +31,11 @@ from civicsignals_api.modules.accounts.models import (  # noqa: F401
     Workspace,
 )
 from civicsignals_api.modules.auth.models import EmailVerificationToken  # noqa: F401
-from civicsignals_api.modules.pipeline.models import PipelineItem, PipelineStage  # noqa: F401
+from civicsignals_api.modules.pipeline.models import (  # noqa: F401
+    PipelineItem,
+    PipelineItemActivity,
+    PipelineStage,
+)
 
 _DSN = os.environ.get("DATABASE_DIRECT_URL") or os.environ.get("DATABASE_URL")
 
