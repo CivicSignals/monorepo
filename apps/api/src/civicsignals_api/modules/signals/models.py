@@ -72,8 +72,11 @@ class Signal(Base):
       produced it). Not cross-module FKs (doc 06 §3).
     - ``raw_document_ids`` — every ``ingestion_raw_document`` corroborating this
       signal (doc 19 §7.3 merge appends here). Stored as a UUID[]; not a FK array.
-    - ``content_hash`` — the dedupe key (doc 07; the unique index below). E5 sets
-      the real per-type canonical hash; E1's store path passes a placeholder.
+    - ``content_hash`` — the canonical per-type dedupe hash (doc 19 §7.1; the windowed
+      lookup index below). E5 computes it from ``entity_id + signal_type +
+      normalized_key_fields`` (``signals.dedupe.compute_dedupe_hash``); the same key
+      recurring *outside* its type window is a new signal, so the index is **not**
+      unique — the one-per-window guarantee lives in ``signals.dedupe.find_duplicate``.
     - ``occurred_at`` / ``observed_at`` — when the event happened vs when we saw it
       (doc 07). ``observed_at`` is required.
     - ``summary`` / ``title`` — the feed text + keyword-scoring surface (doc 14 §6.2).
@@ -122,7 +125,9 @@ class Signal(Base):
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
 
-    # Dedupe key (doc 07 unique index). E5 computes the real per-type canonical hash.
+    # Canonical per-type dedupe hash (doc 19 §7.1). E5 computes it from
+    # ``entity_id + signal_type + normalized_key_fields``; the windowed lookup index
+    # below (non-unique) backs ``signals.dedupe.find_duplicate``.
     content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
 
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -160,22 +165,19 @@ class Signal(Base):
     )
 
     __table_args__ = (
-        # Dedupe (doc 07 ``signals_dedupe_idx``): the global uniqueness key. E5's
-        # windowed dedupe (doc 19 §7) upserts on this; E1's store path relies on it
-        # to make re-promotion of the same candidate idempotent.
-        #
-        # ``NULLS NOT DISTINCT`` (PG15+) is essential: ``entity_id`` is NULL for a
-        # resolution-pending signal (doc 19 §4.3), and Postgres treats NULLs as
-        # *distinct* in a unique index by default — which would let two identical
-        # pending signals both insert (no dedupe). Treating NULLs as equal makes the
-        # dedupe upsert fire for pending signals too.
+        # Windowed dedupe lookup (doc 19 §7.1-§7.2; E5). Backs
+        # ``signals.dedupe.find_duplicate``: narrow by ``(entity_id, signal_type,
+        # content_hash)`` then range-scan the trailing ``occurred_at`` for the
+        # type-specific window. **Not unique** on purpose: the same canonical key
+        # recurring *outside* its window is a genuinely new signal (doc 19 §7.1 — the
+        # same annual RFP a year later), so the one-signal-per-window guarantee lives
+        # in ``find_duplicate``'s SELECT-then-merge (doc 19 §7.2), not a constraint.
         Index(
-            "signals_dedupe_idx",
+            "signals_dedupe_window_idx",
             "entity_id",
             "signal_type",
             "content_hash",
-            unique=True,
-            postgresql_nulls_not_distinct=True,
+            "occurred_at",
         ),
         # ICP candidate pre-filter + matching reads (doc 07 ``signals_entity_type_idx``,
         # doc 14 §6.1: narrow by entity + signal type).

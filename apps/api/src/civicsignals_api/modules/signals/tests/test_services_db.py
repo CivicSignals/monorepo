@@ -98,15 +98,22 @@ def _candidate(
     fields: dict[str, object] | None = None,
     signal_type: str = "rfp_posted",
 ) -> CandidateInput:
-    return CandidateInput(
-        signal_type=signal_type,
-        fields=fields
-        or {
-            "title": "RFP: Learning Analytics Platform",
+    # E5: the store path recomputes the canonical dedupe hash from the *key fields*
+    # (entity_id + signal_type + normalized title/due_at), so the passed-in
+    # ``content_hash`` no longer drives uniqueness. To keep "distinct signals" callers
+    # producing distinct signals, fold a non-default ``content_hash`` into the title
+    # (a key field) — the default ("hash-1") keeps the clean canonical title.
+    if fields is None:
+        suffix = "" if content_hash == "hash-1" else f" [{content_hash}]"
+        fields = {
+            "title": f"RFP: Learning Analytics Platform{suffix}",
             "summary": "RFP posted for a learning analytics platform.",
             "due_at": "2026-06-01T17:00:00Z",
             "amount_cents": 40000000,
-        },
+        }
+    return CandidateInput(
+        signal_type=signal_type,
+        fields=fields,
         recipe_id="wa_k12_rfps",
         raw_document_id=raw_document_id or uuid.uuid4(),
         content_hash=content_hash,

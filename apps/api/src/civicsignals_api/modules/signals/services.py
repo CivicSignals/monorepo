@@ -28,9 +28,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .dedupe import (
+    DEDUPE_WINDOWS,
+    DEFAULT_DEDUPE_WINDOW,
+    compute_dedupe_hash,
+    compute_dedupe_hash_for_payload,
+    find_duplicate,
+    merge_signal,
+    window_for,
+)
 from .embedding import (
     EmbeddingDimMismatchError,
     backfill_embeddings,
@@ -141,11 +149,13 @@ async def promote_candidate_to_signal(
        :class:`SignalValidationError` — the extraction task turns that into the
        retry → dead-letter path with the surfaced error. **No partial signal is
        written on a validation failure.**
-    2. **Upsert** on the dedupe key ``(entity_id, signal_type, content_hash)``
-       (doc 07 ``signals_dedupe_idx``): a first sighting INSERTs; a re-promotion of
-       the same candidate (idempotent replay, doc 19 §1) appends the new
-       ``raw_document_id`` to the existing row's ``raw_document_ids`` and keeps the
-       higher confidence (the doc 19 §7.3 merge skeleton).
+    2. **Windowed dedupe** (doc 19 §7): compute the canonical per-type dedupe hash
+       from ``entity_id + signal_type + normalized_key_fields`` (``signals.dedupe``),
+       look for an existing signal with that hash within the type-specific window
+       (90d RFP, 365d contracts/budgets, 730d leadership, 60d board agenda — doc 19
+       §7.1); on a hit **merge** the new corroborating document(s) + higher
+       confidence into the surviving signal (doc 19 §7.3, no source doc lost); else
+       INSERT a new signal.
 
     The caller owns the transaction (this flushes, not commits).
 
@@ -155,8 +165,8 @@ async def promote_candidate_to_signal(
     row's ``status``/``is_degraded``/``review_required`` flags. A ``rejected``-band
     candidate must not reach here — the pipeline drops it before store (doc 19 §6.3).
 
-    # TODO E5: real per-type dedup key + windowed lookup + full merge logic (doc 19
-    # §7). E4 upserts on the exact key only — fuzzy/embedding dedupe is E5/I1.
+    # TODO E10/I1: the embedding-based **fuzzy** dedupe fallback (doc 19 §7.4) for
+    # high-stakes types — this is the exact-key half (doc 19 §7.1-§7.3) only.
     """
     payload = parse_signal_payload(candidate.signal_type, candidate.fields)
     return await store_signal(session, payload, candidate)
@@ -167,64 +177,70 @@ async def store_signal(
     payload: SignalPayload,
     candidate: CandidateInput,
 ) -> Signal:
-    """Upsert a validated payload into ``signals_signal`` (doc 07 §2, doc 19 §6.1).
+    """Store a validated payload into ``signals_signal`` with windowed dedupe (doc 19 §7).
 
     Separated from :func:`promote_candidate_to_signal` so a caller that already
     holds a validated :class:`SignalPayload` (e.g. a backfill or a test) can store
-    it directly. Upserts on the dedupe key; the caller commits.
+    it directly. Computes the canonical per-type dedupe hash, runs the type-windowed
+    duplicate lookup (doc 19 §7.2), and either merges into the surviving signal
+    (doc 19 §7.3) or inserts a new one. The caller commits.
     """
     band = _resolve_band(candidate)
     review = band is ConfidenceBand.PENDING_REVIEW or candidate.entity_id is None
     degraded = band is ConfidenceBand.DEGRADED
     details = payload.model_dump(mode="json")
     raw_doc_ids = _ordered_unique([candidate.raw_document_id, *candidate.extra_raw_document_ids])
+    now = datetime.now(UTC)
 
-    values = {
-        "id": uuid.uuid4(),
-        "entity_id": candidate.entity_id,
-        "entity_name_raw": candidate.entity_name,
-        "signal_type": payload.signal_type.value,
-        "recipe_id": candidate.recipe_id,
-        "extraction_job_id": candidate.extraction_job_id,
-        "source_candidate_id": candidate.source_candidate_id,
-        "raw_document_ids": [str(d) for d in raw_doc_ids],
-        "content_hash": candidate.content_hash,
-        "occurred_at": candidate.occurred_at,
-        "observed_at": datetime.now(UTC),
-        "title": payload.title,
-        "summary": payload.summary,
-        "details": details,
-        "confidence": candidate.confidence,
-        "status": SIGNAL_STATUS_PENDING_REVIEW if review else SIGNAL_STATUS_NEW,
-        "is_degraded": degraded,
-        "review_required": review,
-    }
+    # Canonical per-type dedupe hash (doc 19 §7.1): entity_id + signal_type +
+    # normalized key fields. This supersedes the coarse placeholder ``content_hash``
+    # the extract stage carried — the store path is the authority on the dedupe key.
+    dedupe_hash = compute_dedupe_hash_for_payload(payload, candidate.entity_id)
 
-    # Upsert on the dedupe unique index (doc 07 ``signals_dedupe_idx``). A conflict
-    # means we have already seen this exact signal — append the new corroborating
-    # document and keep the higher confidence rather than inserting a duplicate
-    # (the doc 19 §7.3 merge skeleton; full merge is E5).
-    stmt = (
-        pg_insert(Signal)
-        .values(**values)
-        .on_conflict_do_nothing(index_elements=["entity_id", "signal_type", "content_hash"])
-        .returning(Signal.id)
+    # Windowed lookup (doc 19 §7.2): is there an existing signal with this key inside
+    # the type-specific window? If so, merge the new evidence into it (doc 19 §7.3)
+    # rather than inserting a duplicate.
+    existing = await find_duplicate(
+        session,
+        entity_id=candidate.entity_id,
+        signal_type=payload.signal_type,
+        dedupe_hash=dedupe_hash,
+        now=now,
     )
-    inserted_id = (await session.execute(stmt)).scalar_one_or_none()
+    if existing is not None:
+        merge_signal(
+            existing,
+            new_doc_ids=raw_doc_ids,
+            new_confidence=candidate.confidence,
+            now=now,
+        )
+        await session.flush()
+        return existing
 
-    if inserted_id is not None:
-        row = await session.get(Signal, inserted_id)
-        assert row is not None
-        return row
-
-    # Conflict: the signal already exists — merge this evidence into it (doc 19 §7.3).
-    existing = await _find_by_dedupe_key(
-        session, candidate.entity_id, payload.signal_type.value, candidate.content_hash
+    # No duplicate within the window — a new signal (doc 19 §7.2 step 3).
+    row = Signal(
+        id=uuid.uuid4(),
+        entity_id=candidate.entity_id,
+        entity_name_raw=candidate.entity_name,
+        signal_type=payload.signal_type.value,
+        recipe_id=candidate.recipe_id,
+        extraction_job_id=candidate.extraction_job_id,
+        source_candidate_id=candidate.source_candidate_id,
+        raw_document_ids=[str(d) for d in raw_doc_ids],
+        content_hash=dedupe_hash,
+        occurred_at=candidate.occurred_at,
+        observed_at=now,
+        title=payload.title,
+        summary=payload.summary,
+        details=details,
+        confidence=candidate.confidence,
+        status=SIGNAL_STATUS_PENDING_REVIEW if review else SIGNAL_STATUS_NEW,
+        is_degraded=degraded,
+        review_required=review,
     )
-    assert existing is not None  # the conflicting row must exist post-insert
-    _merge_evidence(existing, raw_doc_ids, candidate.confidence)
+    session.add(row)
     await session.flush()
-    return existing
+    return row
 
 
 def _resolve_band(candidate: CandidateInput) -> ConfidenceBand:
@@ -255,38 +271,28 @@ def _ordered_unique(ids: list[uuid.UUID]) -> list[uuid.UUID]:
     return out
 
 
-def _merge_evidence(
-    existing: Signal, new_doc_ids: list[uuid.UUID], new_confidence: float | None
-) -> None:
-    """Append corroborating docs + keep the higher confidence (doc 19 §7.3 skeleton)."""
-    # raw_document_ids is a JSONB array of UUID strings; append the new ones,
-    # preserving order and de-duplicating, then store back as strings.
-    merged: list[str] = []
-    seen: set[str] = set()
-    for sid in [*existing.raw_document_ids, *[str(d) for d in new_doc_ids]]:
-        if sid not in seen:
-            seen.add(sid)
-            merged.append(sid)
-    existing.raw_document_ids = merged
-    if new_confidence is not None and (
-        existing.confidence is None or new_confidence > existing.confidence
-    ):
-        existing.confidence = new_confidence
+def dedupe_key_for_candidate(
+    signal_type: str | None,
+    fields: dict[str, object],
+    entity_id: uuid.UUID | None = None,
+) -> str | None:
+    """Compute the canonical dedupe hash for a pre-validation candidate (doc 19 §7.1).
 
-
-async def _find_by_dedupe_key(
-    session: AsyncSession,
-    entity_id: uuid.UUID | None,
-    signal_type: str,
-    content_hash: str,
-) -> Signal | None:
-    stmt = select(Signal).where(
-        Signal.signal_type == signal_type,
-        Signal.content_hash == content_hash,
-    )
-    # entity_id is part of the key and may be NULL; ``== None`` -> ``IS NULL``.
-    stmt = stmt.where(Signal.entity_id == entity_id)
-    return (await session.execute(stmt)).scalar_one_or_none()
+    The seam the extraction funnel's ``dedupe_candidate`` stage calls (doc 19 §7):
+    it has only the coarse ``signal_type`` + permissive ``fields`` (not yet the
+    strict typed payload), so this resolves the type and hashes the per-type key
+    fields directly. Returns ``None`` for an unknown/absent signal type — the stage
+    leaves the placeholder key and the store path computes the authoritative hash
+    from the validated payload. Cross-module callers reach this through
+    ``signals.services`` (never ``signals.dedupe`` directly — doc 06 §3).
+    """
+    if signal_type is None:
+        return None
+    try:
+        type_enum = SignalType(signal_type)
+    except ValueError:
+        return None
+    return compute_dedupe_hash(type_enum, entity_id, fields)
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +362,9 @@ async def list_signals(
 
 
 __all__ = [
+    "DEDUPE_WINDOWS",
     "DEFAULT_CONFIG",
+    "DEFAULT_DEDUPE_WINDOW",
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
     "PAYLOAD_BY_TYPE",
@@ -374,15 +382,21 @@ __all__ = [
     "SignalValidationError",
     "backfill_embeddings",
     "build_embedding_text",
+    "compute_dedupe_hash",
+    "compute_dedupe_hash_for_payload",
     "config_from_recipe",
     "decode_cursor",
+    "dedupe_key_for_candidate",
     "embed_signals",
     "embedding_text_for_signal",
     "encode_cursor",
+    "find_duplicate",
     "get_signal",
     "list_signals",
+    "merge_signal",
     "parse_signal_payload",
     "promote_candidate_to_signal",
     "score_candidate_confidence",
     "store_signal",
+    "window_for",
 ]

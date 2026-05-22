@@ -156,11 +156,16 @@ def _embed_gateway(*, dim: int = EMBEDDING_DIM, fail_times: int = 0) -> LLMGatew
     )
 
 
-def _candidate(*, content_hash: str, title: str = "ERP RFP") -> CandidateInput:
+def _candidate(*, content_hash: str, title: str | None = None) -> CandidateInput:
+    # E5: the store path recomputes the canonical dedupe hash from the *key fields*
+    # (title + due_at), so the passed-in ``content_hash`` no longer drives uniqueness.
+    # Fold it into the title (a key field) when the caller doesn't pin a title, so
+    # callers that vary ``content_hash`` to mean "distinct signals" still get them.
+    effective_title = title if title is not None else f"ERP RFP {content_hash}"
     return CandidateInput(
         signal_type="rfp_posted",
         fields={
-            "title": title,
+            "title": effective_title,
             "summary": "RFP for ERP modernization.",
             "due_at": "2026-06-01T17:00:00Z",
             "posting_agency": "City IT Department",

@@ -202,7 +202,9 @@ async def test_pipeline_relevant_produces_candidates(
     assert len(candidate_rows) == 1
     assert candidate_rows[0].job_id == job_id
     assert candidate_rows[0].raw_document_id == doc.id
-    assert candidate_rows[0].dedup_key == "rfp_posted:erp rfp"
+    # The dedupe stage stamps the canonical per-type hash (doc 19 §7.1; E5).
+    assert candidate_rows[0].dedup_key is not None
+    assert len(candidate_rows[0].dedup_key) == 64
     # The candidate row was stamped promoted, and the store stage handed exactly one
     # CandidateInput to the signals promotion service (E4).
     assert candidate_rows[0].status == pipeline.CANDIDATE_STATUS_PROMOTED
