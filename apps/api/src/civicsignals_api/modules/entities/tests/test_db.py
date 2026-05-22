@@ -41,9 +41,25 @@ _DSN = (
 pytestmark = pytest.mark.skipif(_DSN is None, reason="no Postgres DSN configured")
 
 # Only the entities tables — never drop another module's tables.
-_TABLES: list[Table] = [
-    Base.metadata.tables[name] for name in ("entities_entity", "entities_kind", "entities_geo")
-]
+_TABLE_NAMES = ("entities_entity", "entities_kind", "entities_geo")
+_TABLES: list[Table] = [Base.metadata.tables[name] for name in _TABLE_NAMES]
+
+
+def _drop_entities_cascade(conn: Connection) -> None:
+    """Drop the entities tables with CASCADE.
+
+    The entity directory is the *global* account universe other modules FK into
+    (doc 07 §3) — e.g. ``ingestion_raw_document.entity_id`` (D3). When a prior
+    test in the same session left such a dependent table around (the auth flow
+    fixture does an unfiltered ``create_all``), a plain metadata ``drop_all`` of
+    the entities trio fails with ``DependentObjectsStillExistError``. CASCADE
+    removes only the *inbound FK constraints*, leaving those other modules' tables
+    intact, so this still never drops another module's table — it just no longer
+    trips over an inbound reference. Mirrors the migration helper below, which
+    already drops with CASCADE for the same reason.
+    """
+    for tbl in _TABLE_NAMES:
+        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {tbl} CASCADE")
 
 
 @pytest_asyncio.fixture
@@ -52,14 +68,14 @@ async def session() -> AsyncIterator[AsyncSession]:
     engine = create_async_engine(_DSN)
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await conn.run_sync(Base.metadata.drop_all, tables=_TABLES)
+        await conn.run_sync(_drop_entities_cascade)
         await conn.run_sync(Base.metadata.create_all, tables=_TABLES)
     try:
         async with AsyncSession(engine) as sess:
             yield sess
     finally:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all, tables=_TABLES)
+            await conn.run_sync(_drop_entities_cascade)
         await engine.dispose()
 
 
