@@ -715,3 +715,41 @@ class SalesforceProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
             provider_response_id=resp.headers.get("x-request-id"),
             created=True,
         )
+
+
+# --- L3: Webhook provider (non-OAuth, secret-based) ---------------------------
+# Webhook subscriptions are managed directly via the /webhooks CRUD endpoints;
+# the provider registration here lets the integrations framework recognise
+# ``provider=webhook`` without raising ``ProviderNotRegisteredError``. Delivery
+# is handled by the dedicated webhook delivery service (services.py), not by this
+# provider's ``push`` method, so ``push`` raises ``NotImplementedError`` to make
+# accidental routing obvious. The OAuth methods are not used; ``is_oauth = False``
+# signals to ``start_oauth`` that the consent flow does not apply.
+
+
+@register_provider
+class WebhookProvider(IntegrationProvider):
+    """K1 provider entry for the generic outbound webhook (L3).
+
+    Registered so the framework's provider-lookup does not raise for
+    ``kind=WEBHOOK``. Delivery is handled by the webhook-specific service layer
+    (``services.deliver_event_to_subscribers`` / ``execute_webhook_delivery``);
+    this class exists only to satisfy the registry contract.
+    """
+
+    kind = IntegrationProviderKind.WEBHOOK
+    is_oauth: bool = False
+
+    def oauth_config(self) -> OAuthConfig:
+        raise NotImplementedError("webhook provider is not OAuth-based (L3)")
+
+    async def exchange_code(self, *, code: str, redirect_uri: str) -> TokenSet:
+        raise NotImplementedError("webhook provider is not OAuth-based (L3)")
+
+    async def refresh(self, *, refresh_token: str) -> TokenSet:
+        raise NotImplementedError("webhook provider is not OAuth-based (L3)")
+
+    async def push(self, *, access_token: str, request: PushRequest) -> PushResult:
+        raise NotImplementedError(
+            "webhook delivery goes through services.execute_webhook_delivery (L3)"
+        )

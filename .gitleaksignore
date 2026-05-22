@@ -12,3 +12,8 @@
 4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/workspace-scoping.md:curl-auth-header:54
 4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/workspace-scoping.md:curl-auth-header:67
 4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/intro.md:curl-auth-header:62
+# L3: test-only fake HMAC secret in initial L3 commit — not a real credential.
+# Both fingerprints cover the same line before # gitleaks:allow was added
+# (original commit hash + rebased commit hash which gets a new hash).
+55452c82a443500f6894c457e425c87b4f2ca6bd:apps/api/src/civicsignals_api/modules/integrations/tests/test_webhooks.py:generic-api-key:143
+0e8027ad2f069158a82b6b5caf6a78801bc02a04:apps/api/src/civicsignals_api/modules/integrations/tests/test_webhooks.py:generic-api-key:143

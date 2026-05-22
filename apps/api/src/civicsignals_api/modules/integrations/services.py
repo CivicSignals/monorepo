@@ -1,13 +1,13 @@
-"""Public service interface for the integrations module (K1).
+"""Public service interface for the integrations module (K1 + L3).
 
 Other modules call integrations only through the functions defined here — never
 by importing integrations's models or routes directly (doc 06 §3). This is the
 generic outbound-integration framework K2/K3/K4/K5/L1/L3 build on:
 
 - **Secrets at rest.** :class:`TokenCipher` Fernet-encrypts OAuth access/refresh
-  tokens (they must be *recoverable* to call the provider, so — unlike B8 API
-  tokens, which are hashed — they are symmetrically encrypted). Tokens are never
-  logged (threat-model §4.2).
+  tokens and webhook HMAC secrets (they must be *recoverable* to call the provider
+  / sign deliveries, so — unlike B8 API tokens, which are hashed — they are
+  symmetrically encrypted). Secrets are never logged (threat-model §4.2).
 - **OAuth flow.** :func:`start_oauth` builds the authorize URL + a signed,
   expiring ``state`` (CSRF/replay guard binding workspace + connection); the
   callback validates the state and exchanges the code via the provider, storing
@@ -21,6 +21,14 @@ generic outbound-integration framework K2/K3/K4/K5/L1/L3 build on:
   describe API; :func:`upsert_field_mapping` (and friends) persist a
   per-connection :class:`~.models.FieldMapping`; :func:`push_source` resolves the
   target, applies the mapping to a signal/pipeline-item, and runs the push.
+- **Webhook subscriber CRUD + delivery (L3).** :func:`create_webhook_subscription`
+  / :func:`list_webhook_subscriptions` / :func:`update_webhook_subscription` /
+  :func:`delete_webhook_subscription` — workspace-scoped CRUD (RequireAdmin).
+  :func:`deliver_event_to_subscribers` fans out one event to all matching active
+  subscriptions (called from the events-bus handler registered at startup).
+  :func:`execute_webhook_delivery` POSTs the HMAC-signed payload to one subscriber
+  URL, recording the attempt in :class:`~.models.WebhookDelivery`.
+  :func:`due_failed_webhook_deliveries` feeds the retry Celery task.
 
 The HTTP layer is injectable (``http_client`` arg / a default factory) so tests
 mock the transport.
@@ -51,6 +59,8 @@ from civicsignals_api.config import Settings, get_settings
 
 from .models import (
     NON_RETRYABLE_ERROR_CODES,
+    WEBHOOK_MAX_ATTEMPTS,
+    WEBHOOK_RETRY_DELAYS,
     Connection,
     ConnectionStatus,
     FieldMapping,
@@ -58,6 +68,9 @@ from .models import (
     PushErrorCode,
     PushLog,
     PushStatus,
+    WebhookDelivery,
+    WebhookDeliveryStatus,
+    WebhookSubscription,
 )
 from .providers import (
     FieldDescriptor,
@@ -381,6 +394,14 @@ async def start_oauth(
     own_http = http_client is None
     try:
         prov = _resolve_provider(provider, settings, http)
+        # Non-OAuth providers (is_oauth=False, e.g. L3 webhook) are not managed
+        # via the OAuth connections flow. They are managed by their own dedicated
+        # endpoints (/webhooks). Raise as if unregistered so the caller gets a
+        # clear 422 (the provider IS registered, but the OAuth flow does not apply).
+        if not prov.is_oauth:
+            raise ProviderNotRegisteredError(
+                f"provider '{provider.value}' does not use OAuth — use its dedicated endpoints"
+            )
         config = prov.oauth_config()
         if not config.configured:
             raise ProviderNotConfiguredError(
@@ -1042,3 +1063,422 @@ async def list_push_log(
     items = rows[:limit]
     next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
     return PushLogPage(items=items, next_cursor=next_cursor)
+
+
+# ---------------------------------------------------------------------------
+# L3: Webhook subscription CRUD
+# ---------------------------------------------------------------------------
+
+# Prefix for the HMAC secret shown to the admin at create time (doc 08 §3.6).
+_WEBHOOK_SECRET_PREFIX = "whsec_"
+# Number of random bytes in the secret (32 bytes ≈ 43 base64 chars).
+_WEBHOOK_SECRET_BYTES = 32
+# Maximum response body to store per delivery attempt (diagnostic only).
+_MAX_RESPONSE_BODY_BYTES = 4096
+
+
+def generate_webhook_secret() -> str:
+    """Generate a fresh HMAC secret for a new webhook subscription (L3).
+
+    Returns a ``whsec_<base64url>`` string (URL-safe base64, no padding).
+    The caller displays it *once* to the admin (like B8 API tokens) and then
+    passes it to :func:`store_webhook_secret` to encrypt at rest.
+    """
+    raw = secrets.token_bytes(_WEBHOOK_SECRET_BYTES)
+    return _WEBHOOK_SECRET_PREFIX + base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def store_webhook_secret(plaintext_secret: str, *, settings: Settings | None = None) -> str:
+    """Fernet-encrypt a plaintext webhook secret for storage at rest (L3)."""
+    return token_cipher(settings).encrypt(plaintext_secret)
+
+
+def recover_webhook_secret(ciphertext: str, *, settings: Settings | None = None) -> str:
+    """Decrypt a stored webhook secret ciphertext (L3).
+
+    Used by the delivery worker to recover the signing key. Never logged.
+    """
+    return token_cipher(settings).decrypt(ciphertext)
+
+
+async def create_webhook_subscription(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    url: str,
+    subscribed_events: list[str],
+    description: str | None,
+    created_by_user_id: UUID | None,
+    settings: Settings | None = None,
+) -> tuple[WebhookSubscription, str]:
+    """Create a webhook subscription, returning (row, plaintext_secret) (L3).
+
+    The plaintext secret is shown **once** (doc 08 §3.6); the caller is
+    responsible for returning it in the response. It is not stored in the clear
+    and cannot be recovered via the API. The caller commits.
+    """
+    plaintext_secret = generate_webhook_secret()
+    encrypted_secret = store_webhook_secret(plaintext_secret, settings=settings)
+    sub = WebhookSubscription(
+        workspace_id=workspace_id,
+        url=url,
+        secret_encrypted=encrypted_secret,
+        subscribed_events=list(subscribed_events),
+        active=True,
+        description=description,
+        created_by_user_id=created_by_user_id,
+    )
+    session.add(sub)
+    await session.flush()
+    return sub, plaintext_secret
+
+
+async def get_webhook_subscription(
+    session: AsyncSession,
+    workspace_id: UUID,
+    subscription_id: UUID,
+) -> WebhookSubscription | None:
+    """Return a subscription by id *scoped to workspace_id*, or None (L3).
+
+    Workspace isolation: a caller in workspace A can never resolve workspace B's
+    subscription.
+    """
+    result = await session.execute(
+        select(WebhookSubscription).where(
+            WebhookSubscription.id == subscription_id,
+            WebhookSubscription.workspace_id == workspace_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_webhook_subscriptions(
+    session: AsyncSession,
+    workspace_id: UUID,
+) -> list[WebhookSubscription]:
+    """List a workspace's webhook subscriptions, newest first (L3)."""
+    result = await session.execute(
+        select(WebhookSubscription)
+        .where(WebhookSubscription.workspace_id == workspace_id)
+        .order_by(WebhookSubscription.id.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def update_webhook_subscription(
+    session: AsyncSession,
+    subscription: WebhookSubscription,
+    *,
+    url: str | None = None,
+    subscribed_events: list[str] | None = None,
+    active: bool | None = None,
+    description: str | None = None,
+) -> WebhookSubscription:
+    """Partial-update a webhook subscription in place (L3). Caller commits."""
+    if url is not None:
+        subscription.url = url
+    if subscribed_events is not None:
+        subscription.subscribed_events = list(subscribed_events)
+    if active is not None:
+        subscription.active = active
+    if description is not None:
+        subscription.description = description
+    await session.flush()
+    return subscription
+
+
+async def delete_webhook_subscription(
+    session: AsyncSession, subscription: WebhookSubscription
+) -> None:
+    """Hard-delete a webhook subscription (admin disconnect). Caller commits.
+
+    Delivery rows cascade-delete with the subscription.
+    """
+    await session.delete(subscription)
+    await session.flush()
+
+
+# ---------------------------------------------------------------------------
+# L3: HMAC signing (doc 08 §1.10 — Stripe webhook signature pattern)
+# ---------------------------------------------------------------------------
+
+
+def build_webhook_signature(
+    *,
+    timestamp: int,
+    raw_body: bytes,
+    secret: str,
+) -> str:
+    """Build the ``X-CivicSignals-Signature`` header value (L3).
+
+    Format: ``t=<unix>,v1=<hmac-sha256-hex>``. The HMAC covers the string
+    ``<t>.<raw_body>`` (timestamp dot body) with the plaintext webhook secret.
+    This follows the Stripe webhook signature pattern (doc 08 §1.10) so
+    subscribers can reuse Stripe-compatible verification libraries.
+    """
+    signed_payload = f"{timestamp}.".encode("ascii") + raw_body
+    # Use the plaintext secret bytes (stripping the "whsec_" prefix if present)
+    # as the HMAC key. The prefix is display-only metadata.
+    key_part = secret.removeprefix(_WEBHOOK_SECRET_PREFIX)
+    # Pad base64url if needed before decoding.
+    padding_needed = (4 - len(key_part) % 4) % 4
+    key_bytes = base64.urlsafe_b64decode(key_part + "=" * padding_needed)
+    digest = hmac.new(key_bytes, signed_payload, hashlib.sha256).hexdigest()
+    return f"t={timestamp},v1={digest}"
+
+
+def verify_webhook_signature(
+    *,
+    header_value: str,
+    raw_body: bytes,
+    secret: str,
+    max_age_seconds: int = 300,
+) -> bool:
+    """Verify the ``X-CivicSignals-Signature`` header (L3, subscriber-side helper).
+
+    Returns True iff the HMAC is valid and the timestamp is within
+    ``max_age_seconds`` of now (replay protection). This function is provided
+    for the SDK + tests; the delivery worker does not verify outbound signatures
+    (it produces them).
+    """
+    try:
+        parts = dict(p.split("=", 1) for p in header_value.split(",") if "=" in p)
+        t = int(parts["t"])
+        v1 = parts["v1"]
+    except (KeyError, ValueError):
+        return False
+    if abs(int(time.time()) - t) > max_age_seconds:
+        return False
+    expected = build_webhook_signature(timestamp=t, raw_body=raw_body, secret=secret)
+    expected_v1 = expected.split("v1=", 1)[1]
+    return hmac.compare_digest(expected_v1, v1)
+
+
+# ---------------------------------------------------------------------------
+# L3: Webhook delivery (HTTP POST + delivery log)
+# ---------------------------------------------------------------------------
+
+
+async def _deliver_one(
+    session: AsyncSession,
+    *,
+    subscription: WebhookSubscription,
+    delivery: WebhookDelivery,
+    http: httpx.AsyncClient,
+    settings: Settings | None = None,
+) -> WebhookDelivery:
+    """Attempt one HTTP delivery and record the outcome on the delivery row.
+
+    Builds the HMAC signature, POSTs to the subscriber URL, and updates the
+    delivery status/retry schedule. The caller commits.
+
+    A 2xx response is success; anything else is failure. Network errors are
+    recorded as failure (no response status). Secrets are never logged or stored
+    in the response body.
+    """
+    # Recover the plaintext secret (never logged).
+    secret = recover_webhook_secret(subscription.secret_encrypted, settings=settings)
+
+    # Serialize the payload — the stored request_body is the canonical form.
+    raw_body = json.dumps(delivery.request_body, separators=(",", ":")).encode("utf-8")
+    ts = int(time.time())
+    sig = build_webhook_signature(timestamp=ts, raw_body=raw_body, secret=secret)
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "X-CivicSignals-Event": delivery.event_type,
+        "X-CivicSignals-Delivery": str(delivery.event_id),
+        "X-CivicSignals-Signature": sig,
+    }
+
+    delivery.attempt_count += 1
+    delivery.attempted_at = datetime.now(UTC)
+    # Store the headers we sent (signature is re-computed on retry; this is the
+    # non-signature headers for the log — redact the signature itself).
+    delivery.request_headers = {k: v for k, v in headers.items() if k != "X-CivicSignals-Signature"}
+
+    try:
+        resp = await http.post(subscription.url, content=raw_body, headers=headers, timeout=30.0)
+        delivery.response_status = resp.status_code
+        # Truncate the response body (best-effort diagnostic, not signed data).
+        body_text = resp.text[:_MAX_RESPONSE_BODY_BYTES] if resp.text else None
+        delivery.response_body = body_text
+        success = 200 <= resp.status_code < 300
+    except httpx.HTTPError:
+        delivery.response_status = None
+        delivery.response_body = None
+        success = False
+
+    if success:
+        delivery.status = WebhookDeliveryStatus.SUCCESS
+        delivery.retry_at = None
+    else:
+        exhausted = delivery.attempt_count >= WEBHOOK_MAX_ATTEMPTS
+        if exhausted:
+            delivery.status = WebhookDeliveryStatus.DEAD_LETTER
+            delivery.retry_at = None
+        else:
+            delivery.status = WebhookDeliveryStatus.FAILED
+            delay = WEBHOOK_RETRY_DELAYS[delivery.attempt_count - 1]
+            delivery.retry_at = datetime.now(UTC) + timedelta(seconds=delay)
+
+    await session.flush()
+    return delivery
+
+
+async def execute_webhook_delivery(
+    session: AsyncSession,
+    *,
+    subscription: WebhookSubscription,
+    delivery: WebhookDelivery,
+    http_client: httpx.AsyncClient | None = None,
+    settings: Settings | None = None,
+) -> WebhookDelivery:
+    """Execute one webhook delivery attempt and record it (L3).
+
+    Injectable HTTP client so tests can mock the transport. The caller commits.
+    """
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        return await _deliver_one(
+            session,
+            subscription=subscription,
+            delivery=delivery,
+            http=http,
+            settings=settings,
+        )
+    finally:
+        if own_http:
+            await http.aclose()
+
+
+async def deliver_event_to_subscribers(
+    session: AsyncSession,
+    *,
+    event_type: str,
+    payload: dict[str, object],
+    workspace_id: UUID,
+    http_client: httpx.AsyncClient | None = None,
+    settings: Settings | None = None,
+) -> list[WebhookDelivery]:
+    """Fan out one event to all matching active subscriptions in a workspace (L3).
+
+    Creates one :class:`WebhookDelivery` row per matching subscription and
+    immediately attempts delivery. Used by the events-bus handler registered at
+    app startup. The caller commits.
+
+    ``event_id`` is generated once per subscription delivery (not shared across
+    subscriptions) so each subscriber gets its own idempotency token.
+    """
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    deliveries: list[WebhookDelivery] = []
+    try:
+        # Find all active subscriptions for this workspace that subscribe to this event.
+        result = await session.execute(
+            select(WebhookSubscription).where(
+                WebhookSubscription.workspace_id == workspace_id,
+                WebhookSubscription.active.is_(True),
+            )
+        )
+        subscriptions = list(result.scalars().all())
+        matching = [s for s in subscriptions if event_type in s.subscribed_events]
+
+        for sub in matching:
+            delivery = WebhookDelivery(
+                workspace_id=workspace_id,
+                subscription_id=sub.id,
+                event_type=event_type,
+                request_body=dict(payload),
+                status=WebhookDeliveryStatus.PENDING,
+                attempt_count=0,
+            )
+            session.add(delivery)
+            await session.flush()
+            await _deliver_one(
+                session, subscription=sub, delivery=delivery, http=http, settings=settings
+            )
+            deliveries.append(delivery)
+    finally:
+        if own_http:
+            await http.aclose()
+    return deliveries
+
+
+# ---------------------------------------------------------------------------
+# L3: Retry sweeper surface (driven by the retry_failed_webhook_deliveries task)
+# ---------------------------------------------------------------------------
+
+
+async def due_failed_webhook_deliveries(
+    session: AsyncSession, *, now: datetime | None = None, limit: int = 100
+) -> list[WebhookDelivery]:
+    """Return failed delivery rows whose ``retry_at`` is due (oldest first) (L3)."""
+    now = now or datetime.now(UTC)
+    result = await session.execute(
+        select(WebhookDelivery)
+        .where(
+            WebhookDelivery.status == WebhookDeliveryStatus.FAILED,
+            WebhookDelivery.retry_at.is_not(None),
+            WebhookDelivery.retry_at <= now,
+        )
+        .order_by(WebhookDelivery.retry_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_webhook_subscription_unscoped(
+    session: AsyncSession, subscription_id: UUID
+) -> WebhookSubscription | None:
+    """Return a subscription by id alone (for the retry task). No workspace gate (L3)."""
+    result = await session.execute(
+        select(WebhookSubscription).where(WebhookSubscription.id == subscription_id)
+    )
+    return result.scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# L3: Delivery log read surface (cursor pagination)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class WebhookDeliveryPage:
+    """A cursor-paginated page of webhook delivery rows (L3)."""
+
+    items: list[WebhookDelivery]
+    next_cursor: str | None
+
+
+async def list_webhook_deliveries(
+    session: AsyncSession,
+    workspace_id: UUID,
+    *,
+    subscription_id: UUID | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> WebhookDeliveryPage:
+    """Return a cursor-paginated, newest-first page of delivery rows (L3).
+
+    Scoped to ``workspace_id`` (isolation). Optional ``subscription_id`` narrows
+    to one subscription's deliveries.
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    stmt = (
+        select(WebhookDelivery)
+        .where(WebhookDelivery.workspace_id == workspace_id)
+        .order_by(WebhookDelivery.id.desc())
+    )
+    if subscription_id is not None:
+        stmt = stmt.where(WebhookDelivery.subscription_id == subscription_id)
+    if cursor is not None:
+        stmt = stmt.where(WebhookDelivery.id < _decode_cursor(cursor))
+    stmt = stmt.limit(limit + 1)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
+    return WebhookDeliveryPage(items=items, next_cursor=next_cursor)
