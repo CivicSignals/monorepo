@@ -78,6 +78,21 @@ class RecipeValidationError(RecipeError):
         super().__init__(f"recipe {recipe_ref!r} is invalid: {joined}")
 
 
+class RecipeNotFoundError(RecipeError):
+    """No recipe exists for the requested id/path (distinct so callers can map
+    it to a 404 without parsing message text)."""
+
+
+class FetchFailedError(RecipeError):
+    """A fetch could not be completed (network/transport error). Distinct so
+    callers can map it to a 502 without parsing message text."""
+
+    def __init__(self, url: str, detail: str) -> None:
+        self.url = url
+        self.detail = detail
+        super().__init__(f"failed to fetch {url!r}: {detail}")
+
+
 class RobotsDisallowedError(RecipeError):
     """The fetch target is disallowed by the host's robots.txt (doc 18 §2.2)."""
 
@@ -173,6 +188,21 @@ def parse_recipe(data: object, *, recipe_ref: str = "<inline>") -> Recipe:
     return Recipe.model_validate(data)
 
 
+def parse_recipe_yaml(text: str, *, recipe_ref: str = "<inline>") -> Recipe:
+    """Validate + parse a recipe from a raw YAML string (doc 18 §3).
+
+    The authoring tooling (TODO D5) accepts an inline recipe (pasted into the
+    staff UI, or piped to the CLI) without it living on disk yet. A YAML parse
+    error is surfaced as a :class:`RecipeError` (not a bare ``yaml`` exception)
+    so callers handle one recipe-domain error type.
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RecipeError(f"recipe {recipe_ref!r} is not valid YAML: {exc}") from exc
+    return parse_recipe(data, recipe_ref=recipe_ref)
+
+
 def load_recipe_file(path: str | Path) -> Recipe:
     """Load + validate + parse a recipe YAML file."""
     path = Path(path)
@@ -180,15 +210,14 @@ def load_recipe_file(path: str | Path) -> Recipe:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:  # pragma: no cover - filesystem error
         raise RecipeError(f"cannot read recipe {path}: {exc}") from exc
-    data = yaml.safe_load(raw)
-    return parse_recipe(data, recipe_ref=str(path))
+    return parse_recipe_yaml(raw, recipe_ref=str(path))
 
 
 def load_recipe(recipe_id: str) -> Recipe:
     """Load the recipe ``recipes/<recipe_id>/recipe.yml`` by id."""
     path = recipes_dir() / recipe_id / "recipe.yml"
     if not path.exists():
-        raise RecipeError(f"no recipe {recipe_id!r} at {path}")
+        raise RecipeNotFoundError(f"no recipe {recipe_id!r} at {path}")
     return load_recipe_file(path)
 
 
@@ -787,15 +816,35 @@ class RecipeRunner:
         )
         return self.extract(raw)
 
+    def field_values(self, html: str) -> dict[str, str | None]:
+        """Per-field extracted values for ``html`` — public, never raises.
+
+        A *non-raising* sibling of :meth:`extract`: it returns every declared
+        field's value (``None`` for a miss, including a missing required field)
+        rather than rejecting at the boundary. The authoring preview (D5) needs
+        the full field-level picture even when a required field is absent, so
+        this gives it a supported surface instead of reaching into the
+        extraction internals. Uses the same parse + extraction path as
+        :meth:`extract`; selecting the matching selector / fallback handling is
+        the runner's concern (D11), not the caller's.
+        """
+        doc = ParsedDocument(_parse_html(html), html)
+        return {
+            name: _extract_field(doc, name, spec).value
+            for name, spec in self.recipe.fields.items()
+        }
+
 
 __all__ = [
     "Clock",
+    "FetchFailedError",
     "Fetcher",
     "GatewayFieldExtractor",
     "LLMFieldExtractor",
     "RealClock",
     "Recipe",
     "RecipeError",
+    "RecipeNotFoundError",
     "RecipeRunner",
     "RecipeValidationError",
     "RequiredFieldMissingError",
@@ -803,6 +852,7 @@ __all__ = [
     "load_recipe",
     "load_recipe_file",
     "parse_recipe",
+    "parse_recipe_yaml",
     "recipe_schema_dir",
     "recipes_dir",
     "validate_recipe_data",

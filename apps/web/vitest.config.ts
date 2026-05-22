@@ -17,6 +17,8 @@ export default defineConfig({
     jsxImportSource: "react",
   },
   test: {
+    // Default to node for data/logic tests; component tests opt into jsdom via a
+    // per-file `// @vitest-environment jsdom` directive.
     environment: "node",
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
