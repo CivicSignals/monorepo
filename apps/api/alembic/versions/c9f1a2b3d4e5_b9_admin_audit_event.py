@@ -40,18 +40,15 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
+    # Composite index covering workspace-scoped time-ordered queries (most common access pattern).
     op.create_index(
-        "ix_admin_audit_event_workspace_id",
+        "ix_admin_audit_event_workspace_time",
         "admin_audit_event",
-        ["workspace_id"],
+        ["workspace_id", "occurred_at"],
         unique=False,
+        postgresql_ops={"occurred_at": "DESC"},
     )
-    op.create_index(
-        "ix_admin_audit_event_occurred_at",
-        "admin_audit_event",
-        ["occurred_at"],
-        unique=False,
-    )
+    # Individual filter indexes.
     op.create_index(
         "ix_admin_audit_event_action",
         "admin_audit_event",
@@ -64,22 +61,13 @@ def upgrade() -> None:
         ["actor_user_id"],
         unique=False,
     )
-    op.create_index(
-        "ix_admin_audit_event_workspace_time",
-        "admin_audit_event",
-        ["workspace_id", "occurred_at"],
-        unique=False,
-        postgresql_ops={"occurred_at": "DESC"},
-    )
     # ### end Alembic commands ###
 
 
 def downgrade() -> None:
     # ### B9: drop audit log ###
-    op.drop_index("ix_admin_audit_event_workspace_time", table_name="admin_audit_event")
     op.drop_index("ix_admin_audit_event_actor_user_id", table_name="admin_audit_event")
     op.drop_index("ix_admin_audit_event_action", table_name="admin_audit_event")
-    op.drop_index("ix_admin_audit_event_occurred_at", table_name="admin_audit_event")
-    op.drop_index("ix_admin_audit_event_workspace_id", table_name="admin_audit_event")
+    op.drop_index("ix_admin_audit_event_workspace_time", table_name="admin_audit_event")
     op.drop_table("admin_audit_event")
     # ### end Alembic commands ###

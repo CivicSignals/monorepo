@@ -59,7 +59,6 @@ class AuditEvent(Base):
         # Intentionally *no* FK: the audit log must survive workspace deletion
         # (audit entries are evidence; they must not cascade-delete).
         nullable=True,
-        index=True,
     )
 
     # Who did it.
@@ -74,7 +73,7 @@ class AuditEvent(Base):
     )
 
     # What happened.
-    action: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
 
     # What it happened to.
     target_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -95,5 +94,4 @@ class AuditEvent(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
-        index=True,
     )
