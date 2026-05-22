@@ -18,7 +18,8 @@ import {
 // Zustand UI slice surfaced via useActiveWorkspace.
 export function WorkspaceSwitcher() {
   const { data, isLoading } = useWorkspaces();
-  const active = useActiveWorkspace();
+  // Pass the fetched list in so we don't open a second query observer.
+  const active = useActiveWorkspace(data);
   const switchWorkspace = useSwitchWorkspace();
   const createWorkspace = useCreateWorkspace();
   const [creating, setCreating] = useState(false);

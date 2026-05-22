@@ -6,7 +6,8 @@ Alembic migrations first then calls this script.
 The admin user (B1) and workspace (B5) models are implemented, so this script
 verifies the DB connection, ensures the pgvector extension, creates the admin
 user, and gives them a default organization + workspace + owner membership
-(set as their ``last_active`` so first-run requests scope to it).
+(recorded in ``accounts_user.last_active_workspace_id`` so first-run requests
+scope to it).
 
 Environment variables read:
   CIVICSIGNALS_ADMIN_EMAIL    — admin account email  (required for user creation)
@@ -111,10 +112,19 @@ async def _async_main() -> None:
         # B5 — DONE: give the admin an organization + workspace + owner membership
         # via accounts.services (never their internals, doc 06 §3). Idempotent:
         # only create one if the admin is not already a member of any workspace,
-        # then set it as their last_active so first-run requests scope to it.
+        # then set it as their last_active_workspace_id so header-less scoped
+        # requests resolve to it (doc 08 §1.4).
         existing_workspaces = await accounts_services.list_workspaces_for_user(session, admin.id)
         if existing_workspaces.items:
-            print("seed_admin: admin already has a workspace — skipping.", flush=True)
+            # Ensure last_active_workspace_id is populated even on the skip path:
+            # a pre-B5 admin (or one with manually-created memberships) may have
+            # NULL here, which would 400 header-less requests. Backfill it.
+            if admin.last_active_workspace_id is None:
+                await accounts_services.set_last_active_workspace(
+                    session, user=admin, workspace_id=existing_workspaces.items[0].id
+                )
+                await session.commit()
+            print("seed_admin: admin already has a workspace — skipping creation.", flush=True)
         else:
             workspace = await accounts_services.create_workspace(
                 session, owner=admin, name=workspace_name

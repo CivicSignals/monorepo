@@ -41,14 +41,18 @@ export function useWorkspaces() {
  * Returns the currently-active workspace (UI selection joined to server data),
  * and keeps a sensible default selected: when nothing is selected yet (fresh
  * login / refresh), it picks the first workspace the user belongs to.
+ *
+ * Takes the already-fetched list so callers that also render `useWorkspaces()`
+ * don't open a second React Query observer for the same key.
  */
-export function useActiveWorkspace(): Workspace | null {
-  const { data } = useWorkspaces();
+export function useActiveWorkspace(
+  workspaces: Workspace[] | undefined,
+): Workspace | null {
   const activeId = useUiStore((s) => s.activeWorkspaceId);
   const setActiveId = useUiStore((s) => s.setActiveWorkspaceId);
   // Memoize so the array identity is stable across renders (the useEffect below
   // depends on it; an inline `?? []` would re-run the effect every render).
-  const items = useMemo(() => data ?? [], [data]);
+  const items = useMemo(() => workspaces ?? [], [workspaces]);
 
   useEffect(() => {
     if (items.length === 0) return;
