@@ -13,6 +13,14 @@ K1 — the generic outbound-integration framework (doc 08 §3.6):
   callback to the connection + workspace it started.
 - ``GET /integrations/push-log`` — cursor-paginated push-log (admin).
 
+K2 adds the Salesforce field-mapping surface (admin, same workspace scoping):
+
+- ``GET .../connections/{id}/discover/objects`` — pushable provider objects.
+- ``GET .../connections/{id}/discover/fields?object=`` — an object's writable fields.
+- ``GET|PUT .../connections/{id}/field-mappings`` — list / upsert a mapping.
+- ``DELETE .../connections/{id}/field-mappings/{target_object}`` — delete a mapping.
+- ``POST .../connections/{id}/push`` — push a signal/pipeline-item to the provider.
+
 Errors are RFC 7807 ``application/problem+json``. Connections are workspace-
 scoped (``RequireAdmin`` resolves + role-gates the active workspace). Token
 material is never returned and never logged.
@@ -36,14 +44,23 @@ from civicsignals_api.modules.auth.dependencies import RequireAdmin
 from civicsignals_api.problems import ProblemException
 
 from . import services
-from .models import PushStatus
+from .models import Connection, PushErrorCode, PushStatus
 from .schemas import (
     ConnectionCreate,
     ConnectionCreated,
     ConnectionList,
     ConnectionOut,
+    DiscoveredField,
+    DiscoveredObject,
+    FieldDiscoveryOut,
+    FieldMappingList,
+    FieldMappingOut,
+    FieldMappingUpsert,
+    ObjectDiscoveryOut,
     PushLogOut,
     PushLogPageOut,
+    PushOut,
+    PushRequestIn,
 )
 
 logger = structlog.get_logger(__name__)
@@ -261,6 +278,265 @@ async def oauth_callback(
         url=f"{web_settings_url}?integration=connected&connection_id={connection.id}",
         status_code=status.HTTP_302_FOUND,
     )
+
+
+# --- Object / field discovery (K2 field-mapping UI) -------------------------
+
+
+async def _require_connection(
+    ctx: RequireAdmin, session: AsyncSession, connection_id: uuid.UUID
+) -> Connection:
+    connection = await services.get_connection(session, ctx.workspace_id, connection_id)
+    if connection is None:
+        raise _not_found()
+    return connection
+
+
+def _discovery_problem(exc: services.DiscoveryFailedError) -> ProblemException:
+    """Map a discovery failure to RFC 7807, branching on the scope-aware code."""
+    if exc.code is PushErrorCode.AUTH:
+        return ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="reauth_required",
+            title="Reconnect required",
+            detail="The connection's credentials are invalid; reconnect the integration.",
+        )
+    if exc.code is PushErrorCode.PERMISSION:
+        return ProblemException(
+            status=status.HTTP_403_FORBIDDEN,
+            code="provider_permission",
+            title="Insufficient provider permission",
+            detail=exc.message,
+        )
+    return ProblemException(
+        status=status.HTTP_502_BAD_GATEWAY,
+        code="provider_error",
+        title="Provider request failed",
+        detail=exc.message,
+    )
+
+
+@router.get(
+    "/connections/{connection_id}/discover/objects",
+    response_model=ObjectDiscoveryOut,
+    summary="List the provider objects this connection can push to (admin only)",
+)
+async def discover_objects(
+    connection_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> ObjectDiscoveryOut:
+    """List pushable provider objects (e.g. Salesforce Opportunity + custom) (K2).
+
+    Populates the field-mapping UI's object dropdown. ``422`` if the provider
+    has no discovery; ``409`` reauth / ``403`` permission / ``502`` on a provider
+    error.
+    """
+    connection = await _require_connection(ctx, session, connection_id)
+    try:
+        objects = await services.discover_objects(session, connection, settings=settings)
+        await session.commit()
+    except services.DiscoveryNotSupportedError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="discovery_unsupported",
+            title="Discovery not supported",
+            detail="This provider does not support object discovery.",
+        ) from exc
+    except services.ConnectionNotConnectedError as exc:
+        await session.commit()  # persist the needs_reauth transition
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="reauth_required",
+            title="Reconnect required",
+            detail="The connection has no usable credentials; reconnect the integration.",
+        ) from exc
+    except services.DiscoveryFailedError as exc:
+        await session.rollback()
+        raise _discovery_problem(exc) from exc
+    return ObjectDiscoveryOut(
+        data=[DiscoveredObject(name=o.name, label=o.label, custom=o.custom) for o in objects]
+    )
+
+
+@router.get(
+    "/connections/{connection_id}/discover/fields",
+    response_model=FieldDiscoveryOut,
+    summary="List the writable fields on a provider object (admin only)",
+)
+async def discover_fields(
+    connection_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    settings: SettingsDep,
+    object_name: Annotated[str, Query(alias="object", description="Provider object name.")],
+) -> FieldDiscoveryOut:
+    """List the writable fields on ``object`` for the field-mapping rows (K2)."""
+    connection = await _require_connection(ctx, session, connection_id)
+    try:
+        fields = await services.describe_object(
+            session, connection, object_name=object_name, settings=settings
+        )
+        await session.commit()
+    except services.DiscoveryNotSupportedError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="discovery_unsupported",
+            title="Discovery not supported",
+            detail="This provider does not support field discovery.",
+        ) from exc
+    except services.ConnectionNotConnectedError as exc:
+        await session.commit()
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="reauth_required",
+            title="Reconnect required",
+            detail="The connection has no usable credentials; reconnect the integration.",
+        ) from exc
+    except services.DiscoveryFailedError as exc:
+        await session.rollback()
+        raise _discovery_problem(exc) from exc
+    return FieldDiscoveryOut(
+        object=object_name,
+        data=[
+            DiscoveredField(
+                name=f.name,
+                label=f.label,
+                type=f.type,
+                required=f.required,
+                createable=f.createable,
+                updateable=f.updateable,
+            )
+            for f in fields
+        ],
+    )
+
+
+# --- Field mapping CRUD (K2) ------------------------------------------------
+
+
+@router.get(
+    "/connections/{connection_id}/field-mappings",
+    response_model=FieldMappingList,
+    summary="List a connection's field mappings (admin only)",
+)
+async def list_field_mappings(
+    connection_id: uuid.UUID, ctx: RequireAdmin, session: SessionDep
+) -> FieldMappingList:
+    """List the connection's saved field mappings (one per target object) (K2)."""
+    await _require_connection(ctx, session, connection_id)
+    mappings = await services.list_field_mappings(
+        session, workspace_id=ctx.workspace_id, connection_id=connection_id
+    )
+    return FieldMappingList(data=[FieldMappingOut.from_orm_mapping(m) for m in mappings])
+
+
+@router.put(
+    "/connections/{connection_id}/field-mappings",
+    response_model=FieldMappingOut,
+    summary="Create or update a connection's field mapping (admin only)",
+)
+async def upsert_field_mapping(
+    connection_id: uuid.UUID,
+    body: FieldMappingUpsert,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> FieldMappingOut:
+    """Save the field mapping for one target object (upsert by object) (K2)."""
+    await _require_connection(ctx, session, connection_id)
+    mapping = await services.upsert_field_mapping(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        target_object=body.target_object,
+        field_map=dict(body.field_map),
+        constants=dict(body.constants),
+    )
+    await session.commit()
+    await session.refresh(mapping)
+    return FieldMappingOut.from_orm_mapping(mapping)
+
+
+@router.delete(
+    "/connections/{connection_id}/field-mappings/{target_object}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a connection's field mapping for a target object (admin only)",
+)
+async def delete_field_mapping(
+    connection_id: uuid.UUID,
+    target_object: str,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> Response:
+    """Delete the saved field mapping for ``target_object`` (K2)."""
+    await _require_connection(ctx, session, connection_id)
+    mapping = await services.get_field_mapping(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        target_object=target_object,
+    )
+    if mapping is None:
+        raise _not_found()
+    await services.delete_field_mapping(session, mapping)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- Push a signal / pipeline-item to the provider (K2) ---------------------
+
+
+@router.post(
+    "/connections/{connection_id}/push",
+    response_model=PushOut,
+    summary="Push a signal/pipeline-item to the connection's provider (admin only)",
+)
+async def push(
+    connection_id: uuid.UUID,
+    body: PushRequestIn,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> PushOut:
+    """Push a mapped signal/pipeline-item to the provider (doc 08 §3.2, doc 04 J3).
+
+    Applies the connection's saved field mapping (or an inline
+    ``field_map_override``) to the supplied ``source`` and records the attempt to
+    the push-log. The push never raises on a provider failure — the typed error
+    lives in the returned push-log row so the K5 recovery UI can branch on it.
+    """
+    connection = await _require_connection(ctx, session, connection_id)
+    log = await services.push_source(
+        session,
+        connection=connection,
+        source=dict(body.source),
+        target=body.target,
+        field_map_override=dict(body.field_map_override) if body.field_map_override else None,
+        signal_id=body.signal_id,
+        pipeline_item_id=body.pipeline_item_id,
+        idempotency_key=body.idempotency_key,
+        settings=settings,
+    )
+    await session.commit()
+    await session.refresh(log)
+
+    try:
+        await events.publish(
+            events.INTEGRATION_PUSH_RECORDED,
+            {
+                "workspace_id": str(ctx.workspace_id),
+                "connection_id": str(connection_id),
+                "push_log_id": str(log.id),
+                "status": log.status.value,
+            },
+        )
+    except Exception:
+        logger.warning("integration_push_recorded_event_failed")
+
+    return PushOut(push_log=PushLogOut.from_orm_log(log))
 
 
 # --- Push log ---------------------------------------------------------------

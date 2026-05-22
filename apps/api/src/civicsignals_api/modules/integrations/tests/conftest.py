@@ -34,6 +34,7 @@ from civicsignals_api.modules.admin.models import AuditEvent  # noqa: F401
 from civicsignals_api.modules.auth.models import EmailVerificationToken  # noqa: F401
 from civicsignals_api.modules.integrations.models import (  # noqa: F401
     Connection,
+    FieldMapping,
     PushLog,
 )
 

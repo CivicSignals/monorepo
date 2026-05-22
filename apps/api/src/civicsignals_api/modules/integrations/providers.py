@@ -24,8 +24,9 @@ K1 ships:
 The HTTP layer is injectable: every provider takes an ``httpx.AsyncClient`` so
 tests mock the transport (``httpx.MockTransport``) without monkeypatching.
 
-Real Salesforce/HubSpot/Slack clients land in K2/K3/L1; K1 registers only a
-``# TODO`` stub (:class:`_StubOAuthProvider`) so the framework + tests run.
+K2 lands the real :class:`SalesforceProvider` (object/field discovery + Opportunity
+and custom-object push) in this slot; HubSpot (K3) and Slack (L1) register their
+own providers analogously.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import httpx
 
@@ -150,11 +152,60 @@ class PushResult:
 
     ``external_id`` is the provider-side object id (drives K4 idempotency).
     ``response`` is the redacted provider response stored in the push-log.
+    ``created`` is True when the push created a new record (vs updated an
+    existing one for an idempotent re-push; the K4 upsert seam uses this).
     """
 
     external_id: str | None
     response: dict[str, object] = field(default_factory=dict)
     provider_response_id: str | None = None
+    created: bool = True
+
+
+# --- Object/field discovery (K2 field-mapping UI) ---------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FieldDescriptor:
+    """One writable field on a provider object (K2 describe → mapping UI).
+
+    Surfaced to the field-mapping UI so an admin can pick which provider field a
+    signal/pipeline-item value maps onto. ``createable``/``updateable`` come from
+    the provider describe; the UI only offers fields it can actually write.
+    """
+
+    name: str
+    label: str
+    type: str
+    required: bool = False
+    createable: bool = True
+    updateable: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "label": self.label,
+            "type": self.type,
+            "required": self.required,
+            "createable": self.createable,
+            "updateable": self.updateable,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectDescriptor:
+    """One pushable provider object (e.g. Salesforce ``Opportunity``) (K2).
+
+    ``custom`` flags a tenant-defined custom object (``__c`` suffix in
+    Salesforce), which the connector supports as a configurable push target.
+    """
+
+    name: str
+    label: str
+    custom: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {"name": self.name, "label": self.label, "custom": self.custom}
 
 
 class IntegrationProvider(abc.ABC):
@@ -204,6 +255,30 @@ class IntegrationProvider(abc.ABC):
         Raises :class:`ProviderError` with a scope-aware code on failure so the
         runner can map it to the push-log and decide retry vs dead-letter.
         """
+
+    #: Whether this provider supports object/field discovery (the field-mapping
+    #: UI populates from :meth:`discover_objects` / :meth:`describe_object`).
+    supports_discovery: bool = False
+
+    async def discover_objects(
+        self, *, access_token: str, provider_account: dict[str, object]
+    ) -> list[ObjectDescriptor]:
+        """List the provider objects this connection can push to (K2).
+
+        Default: not supported (``supports_discovery = False``). Salesforce (K2)
+        overrides this by querying the describe API; the field-mapping UI uses it
+        to populate the object dropdown.
+        """
+        raise NotImplementedError("provider does not support object discovery")
+
+    async def describe_object(
+        self, *, access_token: str, provider_account: dict[str, object], object_name: str
+    ) -> list[FieldDescriptor]:
+        """List the writable fields on ``object_name`` (K2 field-mapping UI).
+
+        Default: not supported. Salesforce overrides via the sobject describe API.
+        """
+        raise NotImplementedError("provider does not support field discovery")
 
 
 # --- Generic OAuth2 building block ------------------------------------------
@@ -326,35 +401,317 @@ def is_registered(kind: IntegrationProviderKind) -> bool:
     return kind in REGISTRY
 
 
-# --- TODO K2/K3/L1: real provider clients ------------------------------------
-# K1 registers a generic OAuth2 stub so the framework + tests run end-to-end
-# without vendor-specific code. K2 (Salesforce), K3 (HubSpot) and L1 (Slack)
-# replace this with real authorize/token URLs and ``push`` mappings.
+# --- Salesforce provider (K2) ------------------------------------------------
+# K2 replaces K1's stub with the real Salesforce connector: object/field
+# discovery (sobjects describe), Opportunity + configurable custom-object push
+# (create-or-update by external id for K4 idempotency), and scope-aware error
+# mapping. The HTTP layer is the injected ``httpx.AsyncClient`` so tests mock the
+# Salesforce REST transport (no live org).
+# TODO K3 (HubSpot) / L1 (Slack): register their own providers analogously.
+
+# Salesforce REST API version we pin requests to (path segment, e.g. /v60.0/).
+SALESFORCE_API_VERSION = "v60.0"
+# The default push target when a connection has no explicit target configured.
+SALESFORCE_DEFAULT_OBJECT = "Opportunity"
+# Salesforce field/object metadata used for describe → mapping UI is fetched
+# from the org's instance_url; login.salesforce.com is only the OAuth host.
+SALESFORCE_LOGIN_HOST = "https://login.salesforce.com"
+
+
+def _salesforce_instance_url(provider_account: dict[str, object]) -> str:
+    """The org's API base URL from the connection's stored ``instance_url``.
+
+    Salesforce returns a per-org ``instance_url`` at token exchange; every REST
+    call must target it (not the login host). Raises a ``not_found`` provider
+    error when it is missing so the failure is actionable in the recovery UI.
+    """
+    instance = provider_account.get("instance_url")
+    if not isinstance(instance, str) or not instance:
+        raise ProviderError(
+            PushErrorCode.NOT_FOUND,
+            "connection has no Salesforce instance_url (reconnect required)",
+        )
+    return instance.rstrip("/")
 
 
 @register_provider
-class _StubOAuthProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
-    """A registered placeholder OAuth2 provider for the Salesforce slot (K1).
+class SalesforceProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
+    """The Salesforce CRM connector (K2; doc 03 F11.1, doc 04 J3/F-2).
 
-    Wired to the Salesforce ``kind`` so the framework has at least one OAuth
-    provider to exercise. ``push`` raises ``NotImplementedError`` — the real
-    object mapping is K2's job. The OAuth exchange/refresh come from the mixin
-    and are fully testable with a mocked transport.
-
-    # TODO K2: replace with the real Salesforce provider (instance_url discovery,
-    #   Account/Lead upsert, custom-field mapping; doc 03 F11.1).
+    OAuth2 authorization-code (the mixin handles exchange/refresh); ``push``
+    creates or updates a Salesforce **Opportunity** — or a configurable **custom
+    object** (``*__c``) — over the REST API, using the prior ``external_id`` to
+    upsert idempotently (the K4 seam). Discovery lists the org's pushable objects
+    and their writable fields so the field-mapping UI can populate. Vendor errors
+    map onto the scope-aware :class:`PushErrorCode` taxonomy. Token material is
+    never logged (threat-model §4.2).
     """
 
     kind = IntegrationProviderKind.SALESFORCE
+    supports_discovery = True
 
     def oauth_config(self) -> OAuthConfig:
         return OAuthConfig(
-            authorize_url="https://login.salesforce.com/services/oauth2/authorize",
-            token_url="https://login.salesforce.com/services/oauth2/token",
+            authorize_url=f"{SALESFORCE_LOGIN_HOST}/services/oauth2/authorize",
+            token_url=f"{SALESFORCE_LOGIN_HOST}/services/oauth2/token",
+            # ``api`` for the REST API, ``refresh_token`` for offline refresh.
             scopes=("api", "refresh_token"),
             client_id=self.settings.salesforce_client_id,
             client_secret=self.settings.salesforce_client_secret,
         )
 
+    def parse_token_response(self, body: dict[str, object]) -> TokenSet:
+        """Map the Salesforce token body, capturing the org ``instance_url``.
+
+        Salesforce returns ``instance_url`` (the org's API host) and ``id`` (the
+        identity URL) alongside the tokens; both are non-secret and persisted in
+        ``provider_account`` so every REST call can target the right org. The
+        token endpoint omits ``expires_in``, so we leave expiry unset and rely on
+        a 401 → refresh on the next call.
+        """
+        tokens = super().parse_token_response(body)
+        account: dict[str, object] = {}
+        instance_url = body.get("instance_url")
+        if isinstance(instance_url, str):
+            account["instance_url"] = instance_url
+        identity = body.get("id")
+        if isinstance(identity, str):
+            account["identity_url"] = identity
+        if not account:
+            return tokens
+        return TokenSet(
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            expires_at=tokens.expires_at,
+            scopes=tokens.scopes,
+            provider_account=account,
+        )
+
+    # -- HTTP helpers --------------------------------------------------------
+
+    def _auth_headers(self, access_token: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    async def _request(
+        self,
+        *,
+        method: str,
+        url: str,
+        access_token: str,
+        json_body: dict[str, object] | None = None,
+    ) -> httpx.Response:
+        """Issue a Salesforce REST call, mapping transport/HTTP errors to typed.
+
+        Network failures become ``transient``; an HTTP error status is mapped via
+        :func:`map_http_status_to_error_code` (refined for Salesforce's field
+        validation responses by :meth:`_raise_for_status`). Token material lives
+        only in the request header, never in raised messages.
+        """
+        try:
+            resp = await self.http.request(
+                method,
+                url,
+                headers=self._auth_headers(access_token),
+                json=json_body,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(PushErrorCode.TRANSIENT, "Salesforce request failed") from exc
+        return resp
+
+    def _raise_for_status(self, resp: httpx.Response, *, context: str) -> None:
+        """Raise a scope-aware :class:`ProviderError` for a non-2xx response.
+
+        Salesforce returns an array of ``{errorCode, message, fields}`` objects;
+        we surface the first message and the org request id (``Sforce-Limit-Info``
+        / response id header) so the recovery UI can show the field error
+        (doc 04 F-2: "Required field missing: Industry__c").
+        """
+        if resp.is_success:
+            return
+        code = map_http_status_to_error_code(resp.status_code)
+        message = f"Salesforce {context} returned {resp.status_code}"
+        detail: dict[str, object] | None = None
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, list) and body:
+            first = body[0]
+            if isinstance(first, dict):
+                detail = {k: first[k] for k in ("errorCode", "message", "fields") if k in first}
+                msg = first.get("message")
+                if isinstance(msg, str) and msg:
+                    message = msg
+        elif isinstance(body, dict):
+            detail = body
+            msg = body.get("message")
+            if isinstance(msg, str) and msg:
+                message = msg
+        request_id = resp.headers.get("x-request-id") or resp.headers.get("apex-info")
+        raise ProviderError(
+            code,
+            message,
+            provider_response_id=request_id,
+            response={"status_code": resp.status_code, "detail": detail},
+        )
+
+    # -- Discovery -----------------------------------------------------------
+
+    async def discover_objects(
+        self, *, access_token: str, provider_account: dict[str, object]
+    ) -> list[ObjectDescriptor]:
+        """List createable Salesforce objects (sobjects describe-global) (K2).
+
+        Returns standard + custom objects the field-mapping UI offers as push
+        targets; non-createable/system objects are filtered out.
+        """
+        base = _salesforce_instance_url(provider_account)
+        url = f"{base}/services/data/{SALESFORCE_API_VERSION}/sobjects"
+        resp = await self._request(method="GET", url=url, access_token=access_token)
+        self._raise_for_status(resp, context="describe-global")
+        body = resp.json()
+        sobjects = body.get("sobjects") if isinstance(body, dict) else None
+        objects: list[ObjectDescriptor] = []
+        if isinstance(sobjects, list):
+            for entry in sobjects:
+                if not isinstance(entry, dict):
+                    continue
+                if not entry.get("createable"):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str):
+                    continue
+                label = entry.get("label")
+                objects.append(
+                    ObjectDescriptor(
+                        name=name,
+                        label=label if isinstance(label, str) else name,
+                        custom=bool(entry.get("custom")),
+                    )
+                )
+        return objects
+
+    async def describe_object(
+        self, *, access_token: str, provider_account: dict[str, object], object_name: str
+    ) -> list[FieldDescriptor]:
+        """List writable fields on ``object_name`` (sobject describe) (K2).
+
+        Returns the createable/updateable fields so the mapping UI only offers
+        fields it can actually write; ``required`` (nillable=false + no default)
+        is surfaced so the UI can warn before a push fails validation.
+        """
+        base = _salesforce_instance_url(provider_account)
+        safe_name = object_name.replace("/", "")
+        url = f"{base}/services/data/{SALESFORCE_API_VERSION}/sobjects/{safe_name}/describe"
+        resp = await self._request(method="GET", url=url, access_token=access_token)
+        self._raise_for_status(resp, context=f"describe {object_name}")
+        body = resp.json()
+        raw_fields = body.get("fields") if isinstance(body, dict) else None
+        fields: list[FieldDescriptor] = []
+        if isinstance(raw_fields, list):
+            for entry in raw_fields:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str):
+                    continue
+                createable = bool(entry.get("createable"))
+                updateable = bool(entry.get("updateable"))
+                if not createable and not updateable:
+                    continue
+                label = entry.get("label")
+                required = (
+                    not entry.get("nillable", True)
+                    and not entry.get("defaultedOnCreate", False)
+                    and createable
+                )
+                fields.append(
+                    FieldDescriptor(
+                        name=name,
+                        label=label if isinstance(label, str) else name,
+                        type=str(entry.get("type", "string")),
+                        required=required,
+                        createable=createable,
+                        updateable=updateable,
+                    )
+                )
+        return fields
+
+    # -- Push (create-or-update Opportunity / custom object) -----------------
+
+    def _object_name(self, target: str) -> str:
+        """Resolve the Salesforce sobject name from a push target.
+
+        ``target`` is the provider-qualified target (e.g. ``salesforce.opportunity``
+        or ``salesforce.Custom_Deal__c``). The bare object name maps to the
+        Salesforce sobject (Opportunity by default; custom objects keep their
+        ``__c`` casing).
+        """
+        _, _, obj = target.partition(".")
+        obj = obj.strip()
+        if not obj:
+            return SALESFORCE_DEFAULT_OBJECT
+        # Canonicalise the well-known standard object regardless of case.
+        if obj.lower() == "opportunity":
+            return SALESFORCE_DEFAULT_OBJECT
+        return obj
+
     async def push(self, *, access_token: str, request: PushRequest) -> PushResult:
-        raise NotImplementedError("Salesforce push lands in K2")
+        """Create or update a Salesforce object from the mapped payload (K2).
+
+        ``request.payload`` is the already-mapped, secret-free body of Salesforce
+        field → value pairs (the field-mapping service shapes it). When
+        ``request.external_id`` is present the push is an idempotent PATCH update
+        (the K4 seam); otherwise it is a POST create. The new/updated record id is
+        returned as ``external_id``. Vendor errors map to scope-aware codes.
+        """
+        provider_account = cast(
+            "dict[str, object]", request.payload.pop("__provider_account__", {})
+        )
+        base = _salesforce_instance_url(
+            provider_account if isinstance(provider_account, dict) else {}
+        )
+        object_name = self._object_name(request.target)
+        sobject_base = f"{base}/services/data/{SALESFORCE_API_VERSION}/sobjects/{object_name}"
+
+        # Strip control keys; only field/value pairs go to Salesforce.
+        body = {k: v for k, v in request.payload.items() if not k.startswith("__")}
+
+        if request.external_id:
+            # Idempotent update of the previously-created record (K4 upsert seam).
+            url = f"{sobject_base}/{request.external_id}"
+            resp = await self._request(
+                method="PATCH", url=url, access_token=access_token, json_body=body
+            )
+            self._raise_for_status(resp, context=f"update {object_name}")
+            request_id = resp.headers.get("x-request-id")
+            return PushResult(
+                external_id=request.external_id,
+                response={"id": request.external_id, "updated": True},
+                provider_response_id=request_id,
+                created=False,
+            )
+
+        # Create a new record.
+        resp = await self._request(
+            method="POST", url=sobject_base, access_token=access_token, json_body=body
+        )
+        self._raise_for_status(resp, context=f"create {object_name}")
+        result_body = resp.json() if resp.content else {}
+        new_id = result_body.get("id") if isinstance(result_body, dict) else None
+        if not isinstance(new_id, str):
+            raise ProviderError(
+                PushErrorCode.UNKNOWN,
+                "Salesforce create returned no record id",
+                response={"keys": sorted(result_body) if isinstance(result_body, dict) else []},
+            )
+        return PushResult(
+            external_id=new_id,
+            response={"id": new_id, "success": bool(result_body.get("success", True))},
+            provider_response_id=resp.headers.get("x-request-id"),
+            created=True,
+        )

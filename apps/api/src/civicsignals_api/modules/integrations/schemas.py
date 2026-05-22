@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .models import (
     Connection,
     ConnectionStatus,
+    FieldMapping,
     IntegrationProviderKind,
     PushErrorCode,
     PushLog,
@@ -17,6 +18,7 @@ from .models import (
 )
 
 CONNECTION_NAME_MAX_LEN = 160
+TARGET_OBJECT_MAX_LEN = 255
 
 
 class ConnectionCreate(BaseModel):
@@ -122,3 +124,105 @@ class PushLogPageOut(BaseModel):
 
     data: list[PushLogOut]
     next_cursor: str | None = None
+
+
+# --- Object/field discovery (K2 field-mapping UI) ---------------------------
+
+
+class DiscoveredObject(BaseModel):
+    """One pushable provider object (K2 discovery → object dropdown)."""
+
+    name: str
+    label: str
+    custom: bool = False
+
+
+class ObjectDiscoveryOut(BaseModel):
+    """GET .../discover/objects response — the connection's pushable objects (K2)."""
+
+    data: list[DiscoveredObject]
+
+
+class DiscoveredField(BaseModel):
+    """One writable provider field (K2 discovery → field-mapping rows)."""
+
+    name: str
+    label: str
+    type: str
+    required: bool = False
+    createable: bool = True
+    updateable: bool = True
+
+
+class FieldDiscoveryOut(BaseModel):
+    """GET .../discover/fields response — an object's writable fields (K2)."""
+
+    object: str
+    data: list[DiscoveredField]
+
+
+# --- Field mapping CRUD (K2) ------------------------------------------------
+
+
+class FieldMappingUpsert(BaseModel):
+    """Body for saving a connection's field mapping for one target object (K2).
+
+    ``field_map`` maps provider-field-name → source-field-path (e.g.
+    ``{"Name": "signal.title"}``); ``constants`` are static literals written on
+    every push (e.g. ``{"StageName": "Prospecting"}``).
+    """
+
+    target_object: str = Field(min_length=1, max_length=TARGET_OBJECT_MAX_LEN)
+    field_map: dict[str, str] = Field(default_factory=dict)
+    constants: dict[str, object] = Field(default_factory=dict)
+
+
+class FieldMappingOut(BaseModel):
+    """A saved field mapping (K2)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    connection_id: UUID
+    target_object: str
+    field_map: dict[str, object]
+    constants: dict[str, object]
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm_mapping(cls, mapping: FieldMapping) -> FieldMappingOut:
+        return cls.model_validate(mapping)
+
+
+class FieldMappingList(BaseModel):
+    """GET .../field-mappings response — a connection's mappings (K2)."""
+
+    data: list[FieldMappingOut]
+
+
+# --- Push a signal / pipeline-item (K2) -------------------------------------
+
+
+class PushRequestIn(BaseModel):
+    """Body for POST .../connections/{id}/push (doc 08 §3.2 `POST /signals/{id}/push`).
+
+    ``source`` is the signal/pipeline-item field values to map (integrations
+    never reads other modules' tables, so the caller serializes them).
+    ``target`` is the object to push to (defaults to the connection's first
+    default target / Opportunity); ``field_map_override`` is an inline mapping
+    that wins over the saved one (doc 08 §3.2 ``field_map_override``).
+    """
+
+    source: dict[str, object] = Field(default_factory=dict)
+    target: str | None = None
+    field_map_override: dict[str, str] | None = None
+    signal_id: str | None = None
+    pipeline_item_id: str | None = None
+    idempotency_key: str | None = Field(default=None, max_length=255)
+
+
+class PushOut(BaseModel):
+    """POST .../push response — the resulting push-log row (K2)."""
+
+    push_log: PushLogOut

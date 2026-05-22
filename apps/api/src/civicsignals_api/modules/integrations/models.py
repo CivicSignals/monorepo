@@ -15,8 +15,10 @@ L3 (webhooks) build on:
   (signal/pipeline-item → provider object). Carries the typed error code for
   scope-aware error mapping (K5 recovery UI) and the retry/dead-letter state the
   ``retry_failed_pushes`` task drives.
+- :class:`FieldMapping` — a per-connection signal→provider-object field mapping
+  (K2). Drives how a push shapes the vendor body; the field-mapping UI edits it.
 
-Both tables are workspace-scoped (B5) via ``accounts_workspace.id``.
+All tables are workspace-scoped (B5) via ``accounts_workspace.id``.
 """
 
 from __future__ import annotations
@@ -217,6 +219,68 @@ class Connection(Base):
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=UTC)
         return expires_at <= datetime.now(UTC)
+
+
+class FieldMapping(Base):
+    """A per-connection signal→provider-object field mapping (K2).
+
+    Maps source fields (signal / pipeline-item paths, e.g.
+    ``signal.title`` → Salesforce ``Name``) onto a provider object's fields so a
+    push can shape the vendor body declaratively. One row per (connection,
+    target object); the field-mapping UI (K2) edits ``field_map`` and the push
+    service applies it. ``constants`` carries static values written on every push
+    (e.g. a fixed ``StageName``). Workspace-scoped (B5) for isolation.
+
+    # TODO K6: save a mapping as a reusable template (per-connection default ↔ a
+    #   workspace/library template); this row is the per-connection instance K6
+    #   seeds from / saves to.
+    """
+
+    __tablename__ = "integrations_field_mapping"
+    __table_args__ = (
+        Index("ix_integrations_field_mapping_workspace", "workspace_id"),
+        Index("ix_integrations_field_mapping_connection", "connection_id"),
+        # One mapping per (connection, target object) — the UI upserts on save.
+        Index(
+            "uq_integrations_field_mapping_connection_target",
+            "connection_id",
+            "target_object",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_workspace.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("integrations_connection.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # The provider object this mapping targets (e.g. "Opportunity", "Deal__c").
+    target_object: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # provider-field-name → source-field-path (e.g. {"Name": "signal.title"}).
+    # The source path is resolved against the push source by the push service.
+    field_map: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    # provider-field-name → static literal written on every push (e.g. StageName).
+    constants: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class PushLog(Base):
