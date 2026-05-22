@@ -53,6 +53,7 @@ from uuid import UUID
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.config import Settings, get_settings
@@ -726,6 +727,47 @@ def apply_field_mapping(
 
 
 # ---------------------------------------------------------------------------
+# Idempotency key derivation (K4)
+# ---------------------------------------------------------------------------
+
+
+def make_idempotency_key(
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    target: str,
+    signal_id: str | None = None,
+    pipeline_item_id: str | None = None,
+    extra: str | None = None,
+) -> str:
+    """Derive a stable, deterministic idempotency key for an outbound push (K4).
+
+    The key is a URL-safe SHA-256 hex digest over the 4-tuple
+    ``(workspace_id, connection_id, source_record_id, target)`` — the same
+    logical push always produces the same key regardless of payload content.
+
+    ``signal_id`` is used when available; fall back to ``pipeline_item_id``;
+    ``extra`` is an escape hatch for callers that supply their own source
+    record identifier. At least one source record identifier must be given.
+
+    The hex digest is truncated to 64 characters (256 bits of input entropy
+    → 32 hex bytes → well within the 255-char column limit). The key is
+    workspace-scoped and connection-scoped so two workspaces' pushes of the
+    same signal never collide even if they share a CRM.
+    """
+    source_record_id = signal_id or pipeline_item_id or extra
+    if not source_record_id:
+        raise ValueError(
+            "make_idempotency_key requires at least one of: signal_id, pipeline_item_id, or extra"
+        )
+    raw = json.dumps(
+        [str(workspace_id), str(connection_id), source_record_id, target],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Push framework + push-log
 # ---------------------------------------------------------------------------
 
@@ -759,6 +801,7 @@ async def create_push_log(
         pipeline_item_id=pipeline_item_id,
         idempotency_key=idempotency_key,
         status=PushStatus.PENDING,
+        attempt_count=0,
     )
     session.add(log)
     await session.flush()
@@ -898,14 +941,29 @@ async def push_source(
     settings: Settings | None = None,
     http_client: httpx.AsyncClient | None = None,
 ) -> PushLog:
-    """Push one signal/pipeline-item to the connection's provider (K2).
+    """Push one signal/pipeline-item to the connection's provider (K4 idempotent).
 
     Resolves the target object, loads the connection's saved :class:`FieldMapping`
     for that object (an inline ``field_map_override`` from the request wins), maps
     the ``source`` field values to the provider body, records a push-log row, and
-    runs :func:`execute_push`. ``idempotency_key`` reuses a prior successful
-    push's ``external_id`` so a re-push updates instead of duplicating (the K4
-    upsert seam). Never raises on a provider failure — the outcome is in the log.
+    runs :func:`execute_push`.
+
+    **Idempotency (K4):** If no ``idempotency_key`` is supplied but a
+    ``signal_id`` or ``pipeline_item_id`` is, one is derived deterministically
+    via :func:`make_idempotency_key` so re-pushing the same logical record always
+    resolves to the same key. Before pushing we look up any prior *successful*
+    push for that key; if found, its ``external_id`` is passed to the provider so
+    the push is a CRM update, not a duplicate create.
+
+    **Race guard:** two concurrent pushes of the same key may both see no prior
+    success and both call the provider's create. The unique partial index on
+    ``(connection_id, idempotency_key)`` WHERE ``status = 'success'`` prevents
+    both rows from being committed as successes. When the second push encounters
+    the ``IntegrityError`` it rolls back its success update, looks up the
+    ``external_id`` persisted by the first push, and re-runs against the provider
+    as an update — recording its own success with the same external id.
+
+    Never raises on a provider failure — the outcome lives in the returned log.
     The caller commits.
     """
     settings = settings or get_settings()
@@ -931,12 +989,24 @@ async def push_source(
     else:
         payload = apply_field_mapping(mapping, source)
 
+    # K4: auto-derive a stable idempotency key from the source record identity
+    # when the caller did not supply one explicitly.
+    resolved_key: str | None = idempotency_key
+    if resolved_key is None and (signal_id or pipeline_item_id):
+        resolved_key = make_idempotency_key(
+            workspace_id=connection.workspace_id,
+            connection_id=connection.id,
+            target=qualified_target,
+            signal_id=signal_id,
+            pipeline_item_id=pipeline_item_id,
+        )
+
     # K4 seam: a prior successful push of the same source object (same
     # idempotency key) re-pushes as an update against its external id.
     prior_external_id: str | None = None
-    if idempotency_key:
+    if resolved_key:
         prior = await _last_successful_push(
-            session, connection_id=connection.id, idempotency_key=idempotency_key
+            session, connection_id=connection.id, idempotency_key=resolved_key
         )
         if prior is not None:
             prior_external_id = prior.external_id
@@ -949,22 +1019,61 @@ async def push_source(
         request=payload,
         signal_id=signal_id,
         pipeline_item_id=pipeline_item_id,
-        idempotency_key=idempotency_key,
+        idempotency_key=resolved_key,
     )
     request = PushRequest(
         target=qualified_target,
         payload=payload,
-        idempotency_key=idempotency_key,
+        idempotency_key=resolved_key,
         external_id=prior_external_id,
     )
-    return await execute_push(
-        session,
-        connection=connection,
-        log=log,
-        request=request,
-        settings=settings,
-        http_client=http_client,
-    )
+    try:
+        return await execute_push(
+            session,
+            connection=connection,
+            log=log,
+            request=request,
+            settings=settings,
+            http_client=http_client,
+        )
+    except IntegrityError:
+        # K4 race guard: the unique partial index on (connection_id,
+        # idempotency_key) WHERE status='success' fired — a concurrent push of
+        # the same key already committed a success with an external_id. Roll
+        # back the session to a clean state, fetch the winner's external_id, and
+        # re-run the push as an update so this attempt also records a success
+        # without creating a duplicate CRM object.
+        await session.rollback()
+        winner = await _last_successful_push(
+            session,
+            connection_id=connection.id,
+            idempotency_key=resolved_key or "",
+        )
+        winner_external_id = winner.external_id if winner is not None else None
+        log2 = await create_push_log(
+            session,
+            workspace_id=connection.workspace_id,
+            connection_id=connection.id,
+            target=qualified_target,
+            request=payload,
+            signal_id=signal_id,
+            pipeline_item_id=pipeline_item_id,
+            idempotency_key=resolved_key,
+        )
+        retry_request = PushRequest(
+            target=qualified_target,
+            payload=payload,
+            idempotency_key=resolved_key,
+            external_id=winner_external_id,
+        )
+        return await execute_push(
+            session,
+            connection=connection,
+            log=log2,
+            request=retry_request,
+            settings=settings,
+            http_client=http_client,
+        )
 
 
 async def _last_successful_push(

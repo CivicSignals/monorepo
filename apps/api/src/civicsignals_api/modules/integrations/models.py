@@ -35,7 +35,7 @@ import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -312,6 +312,18 @@ class PushLog(Base):
         Index("ix_integrations_push_log_retry", "status", "retry_at"),
         # K4: dedupe a re-push of the same source object per connection.
         Index("ix_integrations_push_log_idempotency", "connection_id", "idempotency_key"),
+        # K4: partial unique constraint — only one *successful* push per
+        # (connection, idempotency_key) can exist.  The WHERE clause is a
+        # PostgreSQL-specific partial index: Alembic renders it via
+        # ``postgresql_where``.  This is the race guard: a concurrent second
+        # create attempt raises IntegrityError and is retried as an update.
+        Index(
+            "uq_integrations_push_log_idempotency_success",
+            "connection_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("status = 'success' AND idempotency_key IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
