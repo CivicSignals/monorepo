@@ -23,10 +23,15 @@ perfect global accounting, doc 13 §4.6).
 
 Client identity: behind the nginx reverse proxy (``infra/nginx/nginx.conf`` sets
 ``X-Forwarded-For``/``X-Real-IP``), ``request.client.host`` is the proxy, not the
-caller. We therefore key on the **left-most** ``X-Forwarded-For`` hop (the original
-client), falling back to ``X-Real-IP`` then the socket peer. Only applied to public
-routes; authenticated routes are never wrapped (they are quota'd elsewhere, e.g.
-I5 smart-search budget) so this never throttles a logged-in user.
+caller. The left-most ``X-Forwarded-For`` hop is **client-controlled** — nginx
+*appends* via ``$proxy_add_x_forwarded_for``, so a scraper can prepend a fake hop
+and mint a fresh bucket per request, defeating the limiter. We therefore key on
+the value our *trusted* proxy sets: **``X-Real-IP``** (nginx sets it to
+``$remote_addr``, the real socket peer) first; then, if absent, the **right-most**
+``X-Forwarded-For`` hop (the entry nginx itself appended — the peer it saw);
+finally the socket peer (local dev with no proxy). Only applied to public routes;
+authenticated routes are never wrapped (they are quota'd elsewhere, e.g. I5
+smart-search budget) so this never throttles a logged-in user.
 
 On limit exceeded the dependency raises :class:`~civicsignals_api.problems.ProblemException`
 with status ``429`` so the app-level handler renders RFC 7807 ``application/problem+json``
@@ -54,23 +59,36 @@ _KEY_PREFIX = "civicsignals:ratelimit:public:"
 
 
 def client_ip(request: Request) -> str:
-    """Resolve the originating client IP, honouring the nginx proxy headers (P4).
+    """Resolve a *trustworthy* client IP for keying the limiter (P4).
 
-    nginx forwards ``X-Forwarded-For`` (``$proxy_add_x_forwarded_for`` — appends the
-    immediate peer to any inbound chain) and ``X-Real-IP``. The original client is
-    the **left-most** ``X-Forwarded-For`` entry; ``X-Real-IP`` is the next fallback;
-    the raw socket peer (``request.client.host``) is the last resort (e.g. local dev
-    with no proxy). Returns ``"unknown"`` only if even the socket peer is absent
-    (it shouldn't be over real transport) — all such callers then share one bucket.
+    The left-most ``X-Forwarded-For`` hop is **not** trustworthy: it is
+    client-supplied and nginx only *appends* (``$proxy_add_x_forwarded_for``), so a
+    scraper that sets ``X-Forwarded-For: <random>`` gets a brand-new bucket on every
+    request. We instead trust only what our reverse proxy stamps:
+
+    1. ``X-Real-IP`` — nginx sets this to ``$remote_addr`` (the real socket peer it
+       saw). This is the authoritative client identity behind the proxy.
+    2. the **right-most** ``X-Forwarded-For`` hop — the entry nginx itself appended
+       (again ``$remote_addr``); used only if ``X-Real-IP`` is somehow absent.
+    3. the raw socket peer (``request.client.host``) — local dev with no proxy.
+
+    Returns ``"unknown"`` only if even the socket peer is absent (it shouldn't be
+    over real transport) — all such callers then share one bucket.
+
+    NOTE: this assumes the app is reached only via the trusted nginx (the self-host
+    deployment, doc 06 §10). If ever exposed directly without a proxy stripping
+    inbound XFF/X-Real-IP, both header sources become client-spoofable and only the
+    socket peer can be trusted; the deployment must front the API with the proxy.
     """
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        first = forwarded.split(",", 1)[0].strip()
-        if first:
-            return first
     real_ip = request.headers.get("x-real-ip")
     if real_ip and real_ip.strip():
         return real_ip.strip()
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # Right-most hop = the peer the trusted proxy actually saw (it appends).
+        last = forwarded.rsplit(",", 1)[-1].strip()
+        if last:
+            return last
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
@@ -90,6 +108,10 @@ class _InProcessWindow:
         self._lock = threading.Lock()
 
     def incr(self, key: str, *, window_seconds: int, now: float) -> int:
+        # TODO (NIT, follow-up): idle keys whose deques fully drain are pruned to
+        # empty deques but the dict entry lingers until the key is hit again; a
+        # periodic sweep of empty-deque entries would bound the dict by *active*
+        # clients rather than all-clients-ever-seen-this-process.
         with self._lock:
             dq = self._hits.get(key)
             if dq is None:
@@ -177,6 +199,10 @@ class RateLimiter:
                     f"Limit is {self._limit} requests per {self._window}s; "
                     "retry after the window resets."
                 ),
+                # TODO (NIT, follow-up): Retry-After is the full window length, not
+                # the time remaining until *this* fixed window resets, so it can
+                # over-state the wait near the window boundary. Tightening it would
+                # need the key's TTL (Redis ``TTL``) on the hot path.
                 headers={**headers, "Retry-After": str(self._window)},
             )
         # Stash the headers so a success path could echo them too (the routes do

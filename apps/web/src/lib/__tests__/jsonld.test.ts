@@ -3,7 +3,12 @@
 // — critically — that no internal-only field ever leaks into the output.
 
 import { describe, expect, it } from "vitest";
-import { entityJsonLd, directoryJsonLd, signalJsonLd } from "@/lib/jsonld";
+import {
+  entityJsonLd,
+  directoryJsonLd,
+  signalJsonLd,
+  serializeJsonLd,
+} from "@/lib/jsonld";
 import type { EntityRead } from "@/lib/entities-api";
 import type {
   PublicSignalRead,
@@ -253,5 +258,39 @@ describe("signalJsonLd", () => {
     // The signal id appears only inside the canonical /s/<id> URL — never as a
     // bare identifier value.
     assertIdOnlyInUrl(text, SIGNAL.id, "/s");
+  });
+});
+
+// ---- serializeJsonLd (XSS-safe injection) ----
+
+describe("serializeJsonLd", () => {
+  it("escapes a </script> breakout in a public field so the output is inert", () => {
+    // Titles/summaries/entity names are crawled third-party content — treat as hostile.
+    const malicious: PublicSignalRead = {
+      ...SIGNAL,
+      title: "</script><img src=x onerror=alert(1)>",
+    };
+    const html = serializeJsonLd(signalJsonLd(malicious, [], SITE_URL, malicious.id));
+
+    // No literal closing-script tag (case-insensitive) can appear in the rendered
+    // body, so the <script type="application/ld+json"> element cannot be terminated.
+    expect(html.toLowerCase()).not.toContain("</script>");
+    // No raw angle brackets survive at all — they are escaped to unicode sequences.
+    expect(html).not.toContain("<");
+    expect(html).not.toContain(">");
+    expect(html).toContain("\\u003c");
+    expect(html).toContain("\\u003e");
+
+    // ...and the payload still round-trips back to the exact original string once
+    // the JSON is parsed (the escaping is transparent to JSON consumers).
+    const parsed = JSON.parse(html) as Record<string, unknown>;
+    expect(parsed.headline).toBe("</script><img src=x onerror=alert(1)>");
+  });
+
+  it("escapes ampersands defensively and stays valid JSON", () => {
+    const html = serializeJsonLd({ name: "Parks & Rec <dept>" });
+    expect(html).toContain("\\u0026");
+    expect(html).not.toContain("<");
+    expect(JSON.parse(html)).toEqual({ name: "Parks & Rec <dept>" });
   });
 });

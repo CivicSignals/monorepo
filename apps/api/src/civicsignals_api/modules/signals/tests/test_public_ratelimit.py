@@ -8,8 +8,9 @@ and the entity directory — keyed per client IP, fixed-window. These tests cove
 - the window allows up to the cap, then 429s, with ``Retry-After`` + ``X-RateLimit-*``
   headers (RFC 7807 ``application/problem+json``);
 - it keys per client (two IPs have independent budgets);
-- ``X-Forwarded-For`` (the nginx proxy header) is honoured — the left-most hop is
-  the client, not the proxy socket peer;
+- the client IP is resolved from a *trustworthy* source — ``X-Real-IP`` (stamped by
+  the trusted nginx), then the right-most ``X-Forwarded-For`` hop — and a spoofed
+  left-most ``X-Forwarded-For`` does NOT mint a fresh bucket;
 - a non-positive limit disables it entirely;
 - Redis-unavailable falls back to the in-process counter (still throttles a single
   replica) rather than failing the public read;
@@ -50,19 +51,43 @@ def _request(
 
 
 # ---------------------------------------------------------------------------
-# client_ip — proxy header resolution (P4: honour nginx X-Forwarded-For)
+# client_ip — trustworthy proxy header resolution (P4)
+#
+# The left-most X-Forwarded-For hop is client-controlled (nginx APPENDS via
+# $proxy_add_x_forwarded_for), so we must NOT trust it. Precedence is:
+#   X-Real-IP (stamped by trusted nginx = $remote_addr)
+#     -> right-most X-Forwarded-For hop (what the proxy actually saw)
+#       -> socket peer
 # ---------------------------------------------------------------------------
 
 
-def test_client_ip_prefers_leftmost_forwarded_for() -> None:
-    """X-Forwarded-For's left-most hop is the original client, not the proxy."""
-    req = _request(headers={"x-forwarded-for": "203.0.113.7, 10.0.0.1, 10.0.0.2"})
-    assert client_ip(req) == "203.0.113.7"
-
-
-def test_client_ip_falls_back_to_x_real_ip() -> None:
-    req = _request(headers={"x-real-ip": "198.51.100.4"})
+def test_client_ip_prefers_x_real_ip() -> None:
+    """X-Real-IP (stamped by the trusted nginx) wins over any X-Forwarded-For."""
+    req = _request(
+        headers={
+            "x-real-ip": "198.51.100.4",
+            # A spoofed inbound chain must be ignored entirely.
+            "x-forwarded-for": "1.2.3.4, 198.51.100.4",
+        }
+    )
     assert client_ip(req) == "198.51.100.4"
+
+
+def test_client_ip_uses_rightmost_forwarded_for_when_no_real_ip() -> None:
+    """Without X-Real-IP, trust only the right-most XFF hop (appended by the proxy)."""
+    req = _request(headers={"x-forwarded-for": "203.0.113.7, 10.0.0.1, 10.0.0.2"})
+    assert client_ip(req) == "10.0.0.2"
+
+
+def test_client_ip_ignores_spoofed_leftmost_forwarded_for() -> None:
+    """A scraper varying the LEFT-most XFF hop must NOT mint a fresh bucket.
+
+    Two requests from the same real peer (right-most hop / socket peer) that carry
+    different spoofed left-most hops must resolve to the SAME client identity.
+    """
+    spoof_a = _request(headers={"x-forwarded-for": "9.9.9.9, 10.0.0.2"})
+    spoof_b = _request(headers={"x-forwarded-for": "8.8.8.8, 10.0.0.2"})
+    assert client_ip(spoof_a) == client_ip(spoof_b) == "10.0.0.2"
 
 
 def test_client_ip_falls_back_to_socket_peer() -> None:

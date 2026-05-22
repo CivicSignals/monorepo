@@ -210,9 +210,18 @@ async def get_workspace_feed(
 # ---------------------------------------------------------------------------
 
 
+# NOTE: this bare list (and ``GET /{signal_id}`` below) is unauthenticated and
+# returns the full internal ``SignalRead`` projection. That full-field public
+# exposure predates this epic, and the public directory (C5) relies on these reads
+# being public — so we deliberately do NOT change the auth or response shape here.
+# The conservative hardening this epic adds is to apply the SAME public rate limiter
+# used on ``/public`` + ``/sources`` so a scraper cannot hammer the corpus.
+# TODO (pre-existing follow-up): narrow the unauthenticated projection to public-safe
+# fields (mirror PublicSignalRead) instead of leaking the full internal SignalRead.
 @router.get("", response_model=SignalPage, summary="List global signals")
 async def list_signals(
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
     entity_id: Annotated[uuid.UUID | None, Query(description="Filter by entity id.")] = None,
     signal_type: Annotated[str | None, Query(description="Filter by signal type slug.")] = None,
     occurred_after: Annotated[
@@ -485,10 +494,16 @@ async def get_signal_sources(
 # ---------------------------------------------------------------------------
 
 
+# NOTE: like the list above, this is unauthenticated and returns the full internal
+# ``SignalRead``; C5 relies on it being public, so we hold auth/shape constant and
+# only add the public rate limiter as conservative hardening.
+# TODO (pre-existing follow-up): narrow the unauthenticated projection to public-safe
+# fields (mirror PublicSignalRead) rather than exposing the full internal SignalRead.
 @router.get("/{signal_id}", response_model=SignalRead, summary="Get one signal")
 async def get_signal(
     signal_id: uuid.UUID,
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
 ) -> SignalRead | JSONResponse:
     """Fetch one global signal by id."""
     signal = await services.get_signal(session, signal_id)

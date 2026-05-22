@@ -41,6 +41,26 @@ export type JsonLd = Record<string, unknown>;
 
 const SCHEMA_CONTEXT = "https://schema.org" as const;
 
+/**
+ * Serialise a JSON-LD object for safe injection into a
+ * `<script type="application/ld+json">` block via `dangerouslySetInnerHTML`.
+ *
+ * `JSON.stringify` alone is NOT safe here: it does not escape `<` or `/`, so a
+ * public field (titles/summaries/entity names come from crawled third-party
+ * content) containing `</script>` would close the script element and let the rest
+ * parse as HTML — an XSS sink. We HTML-escape the angle brackets (and `&`,
+ * defensively, so a literal `&lt;` in the data can't be ambiguous) into their
+ * unicode escapes, which are valid inside a JSON string and render identically
+ * once parsed but cannot terminate the tag. This is the same approach used by
+ * mature React JSON-LD helpers.
+ */
+export function serializeJsonLd(data: JsonLd): string {
+  return JSON.stringify(data)
+    .replace(/&/g, "\\u0026")
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e");
+}
+
 /** Human label for a signal type slug (falls back to title-casing the slug). */
 function signalTypeLabel(slug: string): string {
   return (
