@@ -84,15 +84,42 @@ All observability settings are optional. The app runs without any of them.
 | `OTEL_TRACES_SAMPLE_RATIO` | `1.0` | Head-based sampling ratio for OTel traces (1.0 = all). |
 | `GRAFANA_PORT` | `3100` | Host port for Grafana (default avoids conflict with Next.js :3000). |
 
-## Grafana data sources
+## Grafana data sources (provisioned)
 
-When Grafana starts for the first time it has no pre-configured data sources.
-Add them manually (or use Grafana provisioning):
+Data sources are **provisioned automatically** at startup from
+`infra/observability/grafana/provisioning/datasources/datasources.yml`
+(bind-mounted into the container at `/etc/grafana/provisioning`). No manual
+setup is needed — open Grafana and they are already connected:
 
-1. **Prometheus** -- URL: `http://prometheus:9090`
-2. **Loki** -- URL: `http://loki:3100`
-3. **Tempo** -- URL: `http://tempo:3200`; enable "Use Tempo search" and set
-   TraceQL; link Loki logs via `traceId` label.
+1. **Prometheus** (default) -- `http://prometheus:9090`
+2. **Loki** -- `http://loki:3100`; its `trace_id` log field is turned into a
+   clickable link to the Tempo data source.
+3. **Tempo** -- `http://tempo:3200`; configured with traces-to-logs so a span
+   pivots to the matching Loki logs.
+
+## Provisioned dashboards
+
+A starter dashboard is provisioned from
+`infra/observability/grafana/dashboards/` via the file-provider config in
+`infra/observability/grafana/provisioning/dashboards/dashboards.yml`. It lands
+in the **CivicSignals** folder in Grafana.
+
+**CivicSignals — API overview** (`uid: civicsignals-api`) panels, all built on
+the real metrics `starlette-prometheus` exposes at `/metrics`:
+
+| Panel | Source metric |
+|---|---|
+| Request rate by path | `starlette_requests_total` |
+| Request latency p50/p95/p99 | `starlette_requests_processing_time_seconds_bucket` |
+| Requests in progress | `starlette_requests_in_progress` |
+| Responses by status code | `starlette_responses_total` |
+| 4xx / 5xx error rate + exceptions | `starlette_responses_total`, `starlette_exceptions_total` |
+| API logs | Loki (`{project="civicsignals", service="api"}`) |
+
+To add your own dashboards, drop additional `*.json` files into
+`infra/observability/grafana/dashboards/` — Grafana picks them up within 30s
+(no restart needed). Editing a provisioned dashboard in the UI is allowed, but
+note that a redeploy re-applies the file version.
 
 ## Sending traces to a cloud provider (Honeycomb, Grafana Cloud, etc.)
 
