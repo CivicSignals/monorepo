@@ -18,18 +18,55 @@ files in the ``templates/`` sibling directory. Malformed files raise
 :exc:`TemplateLoadError` immediately (fail-fast) so startup surfaces config
 problems rather than hiding them until a request arrives.
 
-M2 note: FOIA request CRUD will use :func:`get_template` to resolve the
-template for a new request and :func:`render_template` to pre-fill the body.
+FOIA request CRUD (M2)
+-----------------------
+:func:`create_request` — create a new FOIA request (optionally from a
+template via :func:`render_template`). The target entity is validated against
+the global entity directory (:func:`entities.services.get_entity`).
+:func:`get_request` — fetch one request by id, workspace-scoped.
+:func:`list_requests` — cursor-paginated list, workspace-scoped.
+:func:`update_request` — patch a ``draft`` request; raises
+:exc:`FoiaDraftOnlyError` for non-draft requests.
+:func:`transition_request` — advance the state machine (draft→sent→ack→response);
+raises :exc:`FoiaIllegalTransitionError` for disallowed moves.
+:func:`list_request_events` — full transition history for a request.
+
+State machine
+~~~~~~~~~~~~~
+Allowed transitions (enforced here; see :data:`.models.ALLOWED_TRANSITIONS`):
+
+    draft → sent → ack → response    (all terminal after response)
+
+Manual send = marking the request as ``sent`` (no automated email/portal send
+at MVP).
+
+# TODO M-assisted-send: v2 will add an ``assisted_send`` function here that
+#   calls the integration layer to send the rendered body via email / portal.
+#   At that point ``submission_method`` drives routing. This function is the
+#   seam — callers today call transition(req, SENT); v2 replaces or wraps this.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 import string
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .models import (
+    ALLOWED_TRANSITIONS,
+    FoiaRequest,
+    FoiaRequestEvent,
+    FoiaRequestStatus,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -69,9 +106,13 @@ OPTIONAL_PLACEHOLDERS: frozenset[str] = frozenset(
     {"requester_phone", "requester_organization", "records_officer_name"}
 )
 
+# Cursor pagination defaults (doc 06 §5).
+DEFAULT_LIMIT = 25
+MAX_LIMIT = 100
+
 
 # ---------------------------------------------------------------------------
-# Exceptions
+# Exceptions — template layer (M1)
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +137,58 @@ class MissingPlaceholderError(ValueError):
 
 
 # ---------------------------------------------------------------------------
-# Data class (kept light — no SQLAlchemy, no Pydantic, just a dict-backed view)
+# Exceptions — request CRUD (M2)
+# ---------------------------------------------------------------------------
+
+
+class FoiaRequestNotFoundError(LookupError):
+    """Raised when a FOIA request does not exist or is not in the caller's workspace."""
+
+
+class FoiaDraftOnlyError(ValueError):
+    """Raised when an edit is attempted on a non-draft FOIA request.
+
+    ``current_status`` carries the actual status for the error message.
+    """
+
+    def __init__(self, request_id: uuid.UUID, current_status: str) -> None:
+        self.request_id = request_id
+        self.current_status = current_status
+        super().__init__(
+            f"FOIA request {request_id} is in status {current_status!r}; "
+            "only 'draft' requests can be edited."
+        )
+
+
+class FoiaIllegalTransitionError(ValueError):
+    """Raised when a state-machine transition is not allowed.
+
+    ``from_status`` and ``to_status`` carry the attempted transition for the
+    RFC 7807 error payload.
+    """
+
+    def __init__(self, request_id: uuid.UUID, from_status: str, to_status: str) -> None:
+        self.request_id = request_id
+        self.from_status = from_status
+        self.to_status = to_status
+        super().__init__(
+            f"FOIA request {request_id}: transition from {from_status!r} to "
+            f"{to_status!r} is not allowed. "
+            f"Allowed next statuses: "
+            f"{[s.value for s in ALLOWED_TRANSITIONS.get(FoiaRequestStatus(from_status), set())]!r}"
+        )
+
+
+class FoiaEntityNotFoundError(LookupError):
+    """Raised when the target entity_id does not exist in the global directory."""
+
+    def __init__(self, entity_id: uuid.UUID) -> None:
+        self.entity_id = entity_id
+        super().__init__(f"Entity {entity_id} not found in the entity directory.")
+
+
+# ---------------------------------------------------------------------------
+# Data class (template library — kept light, no SQLAlchemy, no Pydantic)
 # ---------------------------------------------------------------------------
 
 
@@ -316,7 +408,7 @@ _REGISTRY: dict[str, FoiaTemplate] = _build_registry()
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — template library (M1)
 # ---------------------------------------------------------------------------
 
 
@@ -390,3 +482,275 @@ def render_template(jurisdiction: str, context: dict[str, str]) -> str:
 
     rendered = tmpl.body.format_map(_SafeMap(full_context))
     return rendered
+
+
+# ---------------------------------------------------------------------------
+# Cursor helpers (M2) — same keyset-on-UUID pattern as entities.services
+# ---------------------------------------------------------------------------
+
+
+def _encode_cursor(request_id: uuid.UUID) -> str:
+    return base64.urlsafe_b64encode(request_id.bytes).decode("ascii")
+
+
+def _decode_cursor(cursor: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(bytes=base64.urlsafe_b64decode(cursor.encode("ascii")))
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("invalid cursor") from exc
+
+
+# ---------------------------------------------------------------------------
+# Public API — FOIA request CRUD + state machine (M2)
+# ---------------------------------------------------------------------------
+
+
+async def create_request(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    created_by: uuid.UUID,
+    entity_id: uuid.UUID,
+    subject: str,
+    body: str | None = None,
+    jurisdiction: str | None = None,
+    template_context: dict[str, str] | None = None,
+    submission_method: str = "manual",
+    submission_target: str | None = None,
+) -> FoiaRequest:
+    """Create and persist a new FOIA request.
+
+    Body resolution order:
+    1. If ``body`` is explicitly supplied, use it as-is.
+    2. If ``jurisdiction`` + ``template_context`` are supplied, call
+       :func:`render_template` and use the result.
+    3. Raise ``ValueError`` if neither produces a body.
+
+    The target ``entity_id`` is validated against the global entity directory
+    via :func:`entities.services.get_entity`; raises
+    :exc:`FoiaEntityNotFoundError` if not found.
+
+    Raises:
+        FoiaEntityNotFoundError: if ``entity_id`` is not in the entity directory.
+        TemplateNotFoundError: if ``jurisdiction`` is provided but unknown.
+        MissingPlaceholderError: if template rendering fails due to missing
+            required placeholder values.
+        ValueError: if neither ``body`` nor ``jurisdiction``+``template_context``
+            are supplied.
+    """
+    from civicsignals_api.modules.entities import services as entity_services
+
+    # Validate entity exists in the global directory (C1 requirement).
+    entity = await entity_services.get_entity(session, entity_id)
+    if entity is None:
+        raise FoiaEntityNotFoundError(entity_id)
+
+    # Resolve the body.
+    resolved_body: str
+    if body is not None:
+        resolved_body = body
+    elif jurisdiction is not None and template_context is not None:
+        resolved_body = render_template(jurisdiction, template_context)
+    else:
+        raise ValueError(
+            "Either 'body' or both 'jurisdiction' and 'template_context' must be supplied."
+        )
+
+    req = FoiaRequest(
+        workspace_id=workspace_id,
+        created_by=created_by,
+        entity_id=entity_id,
+        jurisdiction=jurisdiction,
+        subject=subject,
+        body=resolved_body,
+        submission_method=submission_method,
+        submission_target=submission_target,
+        status=FoiaRequestStatus.DRAFT.value,
+    )
+    session.add(req)
+    await session.flush()
+    return req
+
+
+async def get_request(
+    session: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> FoiaRequest:
+    """Return a FOIA request by id, workspace-scoped.
+
+    Raises :exc:`FoiaRequestNotFoundError` if the request does not exist or
+    belongs to a different workspace (404-style: workspace existence not leaked
+    to non-members).
+    """
+    stmt = select(FoiaRequest).where(
+        FoiaRequest.id == request_id,
+        FoiaRequest.workspace_id == workspace_id,
+    )
+    req = (await session.execute(stmt)).scalar_one_or_none()
+    if req is None:
+        raise FoiaRequestNotFoundError(
+            f"FOIA request {request_id} not found in workspace {workspace_id}."
+        )
+    return req
+
+
+async def list_requests(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    status: str | None = None,
+    entity_id: uuid.UUID | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> tuple[list[FoiaRequest], str | None]:
+    """Cursor-paginated list of FOIA requests for a workspace.
+
+    Returns ``(items, next_cursor)`` where ``next_cursor`` is ``None`` on the
+    last page. Ordered by id (UUID v7, time-ordered).
+
+    Optional filters:
+    - ``status`` — filter to a single status value.
+    - ``entity_id`` — filter to a specific target entity.
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+
+    stmt = select(FoiaRequest).where(FoiaRequest.workspace_id == workspace_id)
+
+    if status is not None:
+        stmt = stmt.where(FoiaRequest.status == status)
+    if entity_id is not None:
+        stmt = stmt.where(FoiaRequest.entity_id == entity_id)
+
+    if cursor is not None:
+        after_id = _decode_cursor(cursor)
+        stmt = stmt.where(FoiaRequest.id > after_id)
+
+    stmt = stmt.order_by(FoiaRequest.id).limit(limit + 1)
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
+    return items, next_cursor
+
+
+async def update_request(
+    session: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    subject: str | None = None,
+    body: str | None = None,
+    submission_method: str | None = None,
+    submission_target: str | None = None,
+) -> FoiaRequest:
+    """Patch a FOIA request — only allowed on ``draft`` status.
+
+    Raises :exc:`FoiaRequestNotFoundError` if the request is not found.
+    Raises :exc:`FoiaDraftOnlyError` if the request is not in ``draft`` status.
+    Only fields with non-``None`` values are updated.
+    """
+    req = await get_request(session, request_id=request_id, workspace_id=workspace_id)
+
+    if req.status != FoiaRequestStatus.DRAFT.value:
+        raise FoiaDraftOnlyError(request_id, req.status)
+
+    if subject is not None:
+        req.subject = subject
+    if body is not None:
+        req.body = body
+    if submission_method is not None:
+        req.submission_method = submission_method
+    if submission_target is not None:
+        req.submission_target = submission_target
+
+    await session.flush()
+    return req
+
+
+async def transition_request(
+    session: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    new_status: FoiaRequestStatus,
+    response_notes: str | None = None,
+) -> FoiaRequest:
+    """Advance the FOIA request state machine to ``new_status``.
+
+    Validates the transition against :data:`.models.ALLOWED_TRANSITIONS`.
+    Records a :class:`.models.FoiaRequestEvent` row for the history. Sets the
+    appropriate timestamp field (``sent_at`` / ``ack_at`` / ``response_at``).
+
+    ``response_notes`` is stored only on the ``ack → response`` transition;
+    it is ignored on other transitions.
+
+    Raises:
+        FoiaRequestNotFoundError: if the request is not found.
+        FoiaIllegalTransitionError: if the transition is not in the allowed set.
+
+    # TODO M-assisted-send: when the ``sent`` transition is triggered via the
+    #   v2 assisted-send path, this function will dispatch to the integration
+    #   layer *before* persisting the status change, so a delivery failure rolls
+    #   back cleanly.
+    """
+    req = await get_request(session, request_id=request_id, workspace_id=workspace_id)
+
+    current = FoiaRequestStatus(req.status)
+    allowed = ALLOWED_TRANSITIONS.get(current, set())
+    if new_status not in allowed:
+        raise FoiaIllegalTransitionError(request_id, req.status, new_status.value)
+
+    now = datetime.now(UTC)
+
+    # Update the transition timestamp.
+    if new_status == FoiaRequestStatus.SENT:
+        req.sent_at = now
+    elif new_status == FoiaRequestStatus.ACK:
+        req.ack_at = now
+    elif new_status == FoiaRequestStatus.RESPONSE:
+        req.response_at = now
+        if response_notes is not None:
+            req.response_notes = response_notes
+
+    from_status = req.status
+    req.status = new_status.value
+
+    # Append the transition event.
+    event = FoiaRequestEvent(
+        request_id=req.id,
+        actor_id=actor_id,
+        from_status=from_status,
+        to_status=new_status.value,
+        occurred_at=now,
+    )
+    session.add(event)
+
+    await session.flush()
+    return req
+
+
+async def list_request_events(
+    session: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> list[FoiaRequestEvent]:
+    """Return the full status-transition history for a FOIA request.
+
+    First verifies the request exists and belongs to the workspace (raises
+    :exc:`FoiaRequestNotFoundError` otherwise), then returns all events ordered
+    by ``occurred_at`` ascending.
+    """
+    # Ownership check (raises FoiaRequestNotFoundError if not found).
+    await get_request(session, request_id=request_id, workspace_id=workspace_id)
+
+    stmt = (
+        select(FoiaRequestEvent)
+        .where(FoiaRequestEvent.request_id == request_id)
+        .order_by(FoiaRequestEvent.occurred_at)
+    )
+    return list((await session.execute(stmt)).scalars().all())
