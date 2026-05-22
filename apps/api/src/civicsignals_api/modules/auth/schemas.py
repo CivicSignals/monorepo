@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, EmailStr, Field
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from civicsignals_api.modules.accounts.schemas import UserOut
+
+from .models import ApiTokenType
 
 # bcrypt operates on the first 72 bytes; cap length to keep behaviour predictable
 # and avoid wasting work on absurd inputs. Consistent with B1 signup policy.
@@ -82,3 +87,78 @@ class PasswordResetConfirmBody(BaseModel):
 
     token: str = Field(min_length=1)
     new_password: str = Field(min_length=PASSWORD_MIN_LEN, max_length=PASSWORD_MAX_LEN)
+
+
+# --- B8: API tokens ----------------------------------------------------------
+
+TOKEN_NAME_MAX_LEN = 120
+
+
+class ApiTokenCreate(BaseModel):
+    """Body for creating a workspace or personal API token (doc 08 §1.3).
+
+    ``scopes`` is validated against the catalog in ``auth.services`` server-side;
+    an empty list yields a token that can authenticate but pass no scope gate
+    (useful for an identity-only token). ``expires_at`` is optional (doc 08
+    §1.3). ``name`` is a human label like ``"Salesforce push"``.
+    """
+
+    name: str = Field(min_length=1, max_length=TOKEN_NAME_MAX_LEN)
+    scopes: list[str] = Field(default_factory=list)
+    expires_at: datetime | None = None
+
+    @field_validator("scopes")
+    @classmethod
+    def _strip_scopes(cls, scopes: list[str]) -> list[str]:
+        return [scope.strip() for scope in scopes if scope.strip()]
+
+
+class ApiTokenOut(BaseModel):
+    """Public metadata for an API token — never includes the secret (doc 08 §1.3).
+
+    Returned by list endpoints and the non-secret part of create. ``token_prefix``
+    is a non-secret display fragment (``cs_pat_a1b2``). ``revoked`` /
+    ``last_used_at`` / ``expires_at`` support the hygiene UI.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    token_type: ApiTokenType
+    name: str
+    token_prefix: str
+    scopes: list[str]
+    workspace_id: UUID | None = None
+    user_id: UUID
+    created_by_user_id: UUID | None = None
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+    created_at: datetime
+
+    @property
+    def revoked(self) -> bool:
+        return self.revoked_at is not None
+
+
+class ApiTokenCreated(ApiTokenOut):
+    """Create response — :class:`ApiTokenOut` plus the cleartext secret.
+
+    The ``token`` field is the **only** time the plaintext secret is returned
+    ("revealed once", doc 08 §3.6 webhook-secret pattern / §1.3); it is never
+    retrievable again and is omitted from every list/get response.
+    """
+
+    token: str
+
+
+class ApiTokenList(BaseModel):
+    """A list of API token metadata (no secrets)."""
+
+    items: list[ApiTokenOut]
+
+
+class ApiTokenScopesOut(BaseModel):
+    """The catalog of grantable scopes (for the management UI to render)."""
+
+    scopes: list[str]

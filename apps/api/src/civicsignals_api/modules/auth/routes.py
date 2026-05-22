@@ -37,7 +37,13 @@ from civicsignals_api.problems import ProblemException
 
 from . import services as auth_services
 from .dependencies import CurrentUser
+from .models import ApiToken, ApiTokenType
 from .schemas import (
+    ApiTokenCreate,
+    ApiTokenCreated,
+    ApiTokenList,
+    ApiTokenOut,
+    ApiTokenScopesOut,
     AuthResponse,
     LoginRequest,
     MessageResponse,
@@ -317,3 +323,114 @@ async def password_reset_confirm(
     except Exception:
         logger.warning("password_reset_completed_event_failed", user_id=str(user.id))
     return MessageResponse(message="password reset")
+
+
+# --- B8: Personal access tokens (PATs) --------------------------------------
+# Managed by the owning user (no admin gate — a PAT acts *as* that user across
+# their workspaces, doc 08 §1.3). The secret is revealed once on create and never
+# again (threat-model §4.2). Workspace API tokens live under
+# ``/workspaces/{id}/api-tokens`` (admin-gated, in the accounts module).
+
+# Nested under the module's ``/auth`` prefix → ``/api/v1/auth/tokens`` (the
+# ``router`` below already carries ``/auth``, so this adds only ``/tokens``).
+tokens_router = APIRouter(prefix="/tokens", tags=["api-tokens"])
+
+
+def _bad_scopes(invalid: list[str]) -> ProblemException:
+    return ProblemException(
+        status=422,
+        code="invalid_scope",
+        title="Unknown token scope",
+        detail=f"Unknown scope(s): {', '.join(invalid)}.",
+        errors=[{"field": "scopes", "code": "unknown_scope", "message": s} for s in invalid],
+    )
+
+
+@tokens_router.get(
+    "/scopes",
+    response_model=ApiTokenScopesOut,
+    summary="List the grantable API-token scopes",
+)
+async def list_token_scopes() -> ApiTokenScopesOut:
+    """Return the catalog of scopes a token may be granted (doc 08 §1.3)."""
+    return ApiTokenScopesOut(scopes=list(auth_services.API_TOKEN_SCOPES))
+
+
+@tokens_router.post(
+    "",
+    response_model=ApiTokenCreated,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a personal access token (revealed once)",
+)
+async def create_personal_token(
+    body: ApiTokenCreate,
+    current_user: CurrentUser,
+    session: SessionDep,
+    response: Response,
+) -> ApiTokenCreated:
+    """Mint a PAT for the current user; the plaintext is returned **once**.
+
+    A PAT acts as the owning user across all their workspaces (doc 08 §1.3), so
+    any authenticated user may create one for themselves. The secret in the
+    ``token`` field is never retrievable again.
+    """
+    try:
+        issued = await auth_services.create_api_token(
+            session,
+            token_type=ApiTokenType.PERSONAL,
+            name=body.name,
+            scopes=body.scopes,
+            user_id=current_user.id,
+            created_by_user_id=current_user.id,
+        )
+        await session.commit()
+    except auth_services.InvalidScopeError as exc:
+        await session.rollback()
+        raise _bad_scopes(exc.invalid) from exc
+
+    response.headers["Location"] = f"/api/v1/auth/tokens/{issued.token.id}"
+    out = ApiTokenOut.model_validate(issued.token)
+    return ApiTokenCreated(**out.model_dump(), token=issued.plaintext)
+
+
+@tokens_router.get(
+    "",
+    response_model=ApiTokenList,
+    summary="List my personal access tokens (no secrets)",
+)
+async def list_personal_tokens(current_user: CurrentUser, session: SessionDep) -> ApiTokenList:
+    """List the caller's PATs as metadata only — the secret is never returned."""
+    tokens = await auth_services.list_personal_api_tokens(session, current_user.id)
+    return ApiTokenList(items=[ApiTokenOut.model_validate(t) for t in tokens])
+
+
+def _ensure_personal_token_owner(token: ApiToken | None, user_id: UUID) -> ApiToken:
+    """Resolve a PAT owned by ``user_id`` or raise ``404`` (existence not leaked)."""
+    if token is None or token.token_type is not ApiTokenType.PERSONAL or token.user_id != user_id:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Token not found",
+            detail="No such personal access token.",
+        )
+    return token
+
+
+@tokens_router.delete(
+    "/{token_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a personal access token",
+)
+async def revoke_personal_token(
+    token_id: UUID, current_user: CurrentUser, session: SessionDep
+) -> Response:
+    """Revoke one of the caller's PATs. Idempotent; immediate (doc 08 §1.3)."""
+    token = _ensure_personal_token_owner(
+        await auth_services.get_api_token(session, token_id), current_user.id
+    )
+    await auth_services.revoke_api_token(session, token)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+router.include_router(tokens_router)

@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -37,7 +39,7 @@ from civicsignals_api.config import Settings, get_settings
 from civicsignals_api.modules.accounts import services as accounts_services
 from civicsignals_api.modules.accounts.models import User
 
-from .models import EmailVerificationToken, PasswordResetToken
+from .models import ApiToken, ApiTokenType, EmailVerificationToken, PasswordResetToken
 
 # bcrypt at cost 12 (NFR §4.2). passlib transparently truncates >72 bytes; we
 # additionally reject overly long passwords at the schema layer.
@@ -68,6 +70,18 @@ class VerificationTokenError(AuthError):
 
 class PasswordResetTokenError(AuthError):
     """A password-reset token was missing, expired, or already consumed."""
+
+
+class ApiTokenError(AuthError):
+    """An API token was missing, malformed, revoked, or expired."""
+
+
+class InvalidScopeError(AuthError):
+    """A token was requested with one or more unknown scope strings (B8)."""
+
+    def __init__(self, invalid: Sequence[str]) -> None:
+        self.invalid = list(invalid)
+        super().__init__(f"unknown scope(s): {', '.join(self.invalid)}")
 
 
 @dataclass(frozen=True)
@@ -392,3 +406,237 @@ async def authenticate(
         raise EmailNotVerifiedError("email not verified")
     await accounts_services.touch_last_seen(session, user)
     return user
+
+
+# --- API tokens (B8; long-lived bearer credentials, hashed at rest) ---------
+# Workspace + personal access tokens per doc 08 §1.3. The opaque secret is shown
+# once at creation; only its SHA-256 digest is stored (threat-model §4.2). Scopes
+# are validated against the catalog below and enforced per-request by the auth
+# dependency.
+
+# The granted-permission vocabulary (doc 08 §1.3). Resource scopes come in
+# read/write pairs; ``admin:read`` exposes admin-only reads (members, audit).
+# Keep this the single source of truth — both token issuance (validation) and the
+# management UI consume it. Additive: new scopes can be appended (non-breaking,
+# doc 08 §1.2).
+API_TOKEN_SCOPES: tuple[str, ...] = (
+    "signals:read",
+    "signals:write",
+    "contacts:read",
+    "contacts:write",
+    "entities:read",
+    "pipeline:read",
+    "pipeline:write",
+    "foia:read",
+    "foia:write",
+    "searches:read",
+    "searches:write",
+    "webhooks:manage",
+    "admin:read",
+)
+
+# A short non-secret prefix per token type so the UI can label rows (doc 08 §1.3).
+# ``cs_test_`` is reserved for a future test-mode toggle; issuance defaults to live.
+_TOKEN_PREFIX: dict[ApiTokenType, str] = {
+    ApiTokenType.WORKSPACE: "cs_live_",
+    ApiTokenType.PERSONAL: "cs_pat_",
+}
+# Bytes of entropy in the random component (>= the documented 32-char body).
+_API_TOKEN_ENTROPY_BYTES = 32
+# How much of the plaintext to retain (non-secret) for the management UI label.
+_DISPLAY_PREFIX_LEN = 12
+
+
+@dataclass(frozen=True)
+class ApiTokenIssue:
+    """Outcome of :func:`create_api_token` — the record plus the cleartext secret.
+
+    ``plaintext`` is the only time the secret is available; the route returns it
+    once and it is never retrievable again (threat-model §4.2).
+    """
+
+    token: ApiToken
+    plaintext: str
+
+
+def validate_scopes(scopes: Sequence[str]) -> list[str]:
+    """Normalize + validate requested scopes against :data:`API_TOKEN_SCOPES`.
+
+    De-duplicates while preserving order. Raises :class:`InvalidScopeError`
+    (mapped to ``422`` by the route) listing any unknown scope strings.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    invalid: list[str] = []
+    for scope in scopes:
+        if scope not in API_TOKEN_SCOPES:
+            invalid.append(scope)
+            continue
+        if scope not in seen:
+            seen.add(scope)
+            ordered.append(scope)
+    if invalid:
+        raise InvalidScopeError(invalid)
+    return ordered
+
+
+def _generate_api_token(token_type: ApiTokenType) -> tuple[str, str]:
+    """Return ``(plaintext, display_prefix)`` for a fresh token of ``token_type``.
+
+    ``plaintext`` is ``<prefix><random>``; ``display_prefix`` is the leading,
+    non-secret fragment stored for UI labelling.
+    """
+    prefix = _TOKEN_PREFIX[token_type]
+    plaintext = f"{prefix}{secrets.token_urlsafe(_API_TOKEN_ENTROPY_BYTES)}"
+    return plaintext, plaintext[:_DISPLAY_PREFIX_LEN]
+
+
+async def create_api_token(
+    session: AsyncSession,
+    *,
+    token_type: ApiTokenType,
+    name: str,
+    scopes: Sequence[str],
+    user_id: UUID,
+    created_by_user_id: UUID,
+    workspace_id: UUID | None = None,
+    expires_at: datetime | None = None,
+) -> ApiTokenIssue:
+    """Mint, hash, persist, and return a new API token plus its cleartext secret.
+
+    ``token_type`` decides the prefix and scoping: a ``workspace`` token requires
+    a ``workspace_id`` and is scoped to it; a ``personal`` token must have
+    ``workspace_id`` left ``None`` and acts as ``user_id`` across their
+    workspaces. Scopes are validated here (raises :class:`InvalidScopeError`).
+    The caller commits.
+    """
+    if token_type is ApiTokenType.WORKSPACE and workspace_id is None:
+        raise ApiTokenError("workspace tokens require a workspace_id")
+    if token_type is ApiTokenType.PERSONAL and workspace_id is not None:
+        raise ApiTokenError("personal tokens must not be bound to a workspace")
+
+    validated = validate_scopes(scopes)
+    plaintext, display_prefix = _generate_api_token(token_type)
+    record = ApiToken(
+        token_type=token_type,
+        name=name,
+        token_hash=_hash_token(plaintext),
+        token_prefix=display_prefix,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        created_by_user_id=created_by_user_id,
+        scopes=validated,
+        expires_at=expires_at,
+    )
+    session.add(record)
+    await session.flush()
+    return ApiTokenIssue(token=record, plaintext=plaintext)
+
+
+async def get_api_token(session: AsyncSession, token_id: UUID) -> ApiToken | None:
+    """Return the API token row with this id, or ``None``."""
+    result = await session.execute(select(ApiToken).where(ApiToken.id == token_id))
+    return result.scalar_one_or_none()
+
+
+async def list_workspace_api_tokens(session: AsyncSession, workspace_id: UUID) -> list[ApiToken]:
+    """List all (live + revoked) workspace tokens for ``workspace_id`` (newest first)."""
+    result = await session.execute(
+        select(ApiToken)
+        .where(
+            ApiToken.token_type == ApiTokenType.WORKSPACE,
+            ApiToken.workspace_id == workspace_id,
+        )
+        .order_by(ApiToken.id.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def list_personal_api_tokens(session: AsyncSession, user_id: UUID) -> list[ApiToken]:
+    """List all (live + revoked) personal access tokens owned by ``user_id``."""
+    result = await session.execute(
+        select(ApiToken)
+        .where(
+            ApiToken.token_type == ApiTokenType.PERSONAL,
+            ApiToken.user_id == user_id,
+        )
+        .order_by(ApiToken.id.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def revoke_api_token(session: AsyncSession, token: ApiToken) -> ApiToken:
+    """Mark a token revoked (idempotent). The caller commits.
+
+    Revocation is immediate: :pymeth:`ApiToken.is_active` returns ``False`` and
+    :func:`authenticate_api_token` rejects it on the next request.
+    """
+    if token.revoked_at is None:
+        token.revoked_at = datetime.now(UTC)
+        await session.flush()
+    return token
+
+
+def looks_like_api_token(credential: str) -> bool:
+    """Return True if ``credential`` carries an API-token prefix (not a JWT).
+
+    The auth dependency uses this to decide whether to route a bearer credential
+    to the API-token path or the JWT path (doc 08 §1.3 — both arrive as
+    ``Authorization: Bearer``).
+    """
+    return any(credential.startswith(p) for p in _TOKEN_PREFIX.values())
+
+
+@dataclass(frozen=True)
+class AuthenticatedToken:
+    """A successfully-authenticated API token, resolved to its identity (B8).
+
+    Carries the loaded :class:`ApiToken` (for ``scopes`` / ``workspace_id``) and
+    the owning :class:`User` so the auth dependency can resolve the request
+    identity without a second lookup.
+    """
+
+    token: ApiToken
+    user: User
+
+
+async def authenticate_api_token(session: AsyncSession, credential: str) -> AuthenticatedToken:
+    """Resolve + validate an API token credential, returning its identity.
+
+    Looks up the token by hash, rejecting (with :class:`ApiTokenError`) a token
+    that is unknown, revoked, expired, or whose owning user is gone.
+    ``last_used_at`` is bumped opportunistically with a narrow UPDATE so the hot
+    path stays cheap and concurrency-safe (no row read-modify-write).
+    """
+    result = await session.execute(
+        select(ApiToken).where(ApiToken.token_hash == _hash_token(credential))
+    )
+    token = result.scalar_one_or_none()
+    if token is None:
+        raise ApiTokenError("unknown token")
+    if not token.is_active:
+        raise ApiTokenError("token revoked or expired")
+
+    user = await accounts_services.get_user_by_id(session, token.user_id)
+    if user is None:
+        raise ApiTokenError("token owner no longer exists")
+
+    await touch_api_token(session, token.id)
+    return AuthenticatedToken(token=token, user=user)
+
+
+async def touch_api_token(session: AsyncSession, token_id: uuid.UUID) -> None:
+    """Update a token's ``last_used_at`` to now and commit it (cheap UPDATE).
+
+    Done as a targeted UPDATE rather than mutating the loaded row so concurrent
+    requests using the same token don't contend on the ORM identity map. It is
+    committed here (rather than left for the route to flush) because it runs in
+    the auth *dependency* — before the route does its work — so most read
+    handlers never commit; without this the hygiene timestamp (doc 08 §1.3)
+    would be rolled back. At this point the session holds only the auth lookup,
+    so committing the touch does not leak any unrelated partial write.
+    """
+    await session.execute(
+        update(ApiToken).where(ApiToken.id == token_id).values(last_used_at=datetime.now(UTC))
+    )
+    await session.commit()
