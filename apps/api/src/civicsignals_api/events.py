@@ -16,6 +16,7 @@ SIGNAL_CREATED = "signal.created"
 SIGNAL_SCORED = "signal.scored"
 SIGNAL_PUSHED = "signal.pushed"
 MEMBER_INVITED = "member.invited"
+MEMBER_JOINED = "member.joined"
 # B3: password reset audit events; B9 persists these via the admin listener.
 AUTH_PASSWORD_RESET_REQUESTED = "auth.password_reset.requested"
 AUTH_PASSWORD_RESET_COMPLETED = "auth.password_reset.completed"

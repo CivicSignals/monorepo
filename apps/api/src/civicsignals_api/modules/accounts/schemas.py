@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-from .models import MembershipRole
+from .models import InvitationStatus, MembershipRole
 
 
 class UserOut(BaseModel):
@@ -104,3 +104,49 @@ class MemberRoleUpdate(BaseModel):
     """
 
     role: Literal[MembershipRole.ADMIN, MembershipRole.MEMBER, MembershipRole.VIEWER]
+
+
+# --- Invitations (B6) --------------------------------------------------------
+
+
+class InvitationCreate(BaseModel):
+    """Request body for ``POST /workspaces/{id}/invitations`` (admin only).
+
+    ``role`` defaults to ``member`` per doc 04 J7. ``owner`` is not assignable
+    here (ownership transfer is a separate future flow).
+    """
+
+    invited_email: EmailStr
+    role: Literal[MembershipRole.ADMIN, MembershipRole.MEMBER, MembershipRole.VIEWER] = (
+        MembershipRole.MEMBER
+    )
+
+
+class InvitationOut(BaseModel):
+    """Public representation of an invitation (doc 08 §2 ``/workspaces/{id}/invitations``)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    workspace_id: UUID
+    invited_email: str
+    role: MembershipRole
+    status: InvitationStatus
+    invited_by: UUID | None = None
+    accepted_at: datetime | None = None
+    expires_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvitationPage(BaseModel):
+    """A cursor-paginated page of invitations (doc 06 §5, doc 08 §1.5)."""
+
+    items: list[InvitationOut]
+    next_cursor: str | None = None
+
+
+class InvitationAccept(BaseModel):
+    """Request body for ``POST /invitations/accept`` (unauthenticated token accept)."""
+
+    token: str = Field(min_length=1)

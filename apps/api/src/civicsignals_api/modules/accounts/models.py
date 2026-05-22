@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import CITEXT, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -205,6 +205,108 @@ class Membership(Base):
     )
     invited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     joined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class InvitationStatus(StrEnum):
+    """Lifecycle state of a workspace invitation (B6).
+
+    ``pending``  — created, email sent, awaiting acceptance.
+    ``accepted`` — the invitee joined the workspace.
+    ``revoked``  — an admin cancelled the invite before acceptance.
+    ``expired``  — the token TTL elapsed before acceptance (checked on read).
+    """
+
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class Invitation(Base):
+    """A pending workspace invitation (B6, doc 08 §2 ``/workspaces/{id}/invitations``).
+
+    An admin creates an :class:`Invitation`; an email is sent with an opaque
+    accept link whose token is hashed here (threat-model §4.2 — never stored in
+    cleartext). Accepting the invite materialises a :class:`Membership` via
+    ``accounts.services.add_member``.
+
+    Design choices:
+    - ``token_hash`` is the SHA-256 hex digest of the URL-safe random token
+      mailed to the invitee. The raw token is never stored.
+    - ``expires_at`` defaults to 7 days (doc 04 J7). Expiry is checked on the
+      accept path; a background job can bulk-update status to ``expired`` later
+      but is not required for correctness.
+    - Uniqueness on ``(workspace_id, invited_email)`` where status is
+      ``pending`` — enforced by a partial unique index. The service also does an
+      explicit pre-check so callers get a useful error rather than a DB
+      IntegrityError.
+    - ``role`` is the :class:`MembershipRole` the invitee receives on acceptance
+      (default ``member``, doc 04 J7).
+    - ``invited_by`` is the admin who sent the invite.
+    """
+
+    __tablename__ = "accounts_invitation"
+    __table_args__ = (
+        # One active invitation per (workspace, email) — a pending invite for the
+        # same address blocks re-inviting until the first is accepted or revoked.
+        Index(
+            "uq_accounts_invitation_pending",
+            "workspace_id",
+            "invited_email",
+            unique=True,
+            postgresql_where="status = 'pending'",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_workspace.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    invited_email: Mapped[str] = mapped_column(CITEXT(), nullable=False, index=True)
+    role: Mapped[MembershipRole] = mapped_column(
+        Enum(
+            MembershipRole,
+            name="accounts_membership_role",
+            native_enum=False,
+            length=16,
+            values_callable=lambda enum: [member.value for member in enum],
+            create_constraint=False,
+        ),
+        nullable=False,
+        server_default=MembershipRole.MEMBER.value,
+    )
+    # SHA-256 hex digest of the opaque URL token (threat-model §4.2).
+    token_hash: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[InvitationStatus] = mapped_column(
+        Enum(
+            InvitationStatus,
+            name="accounts_invitation_status",
+            native_enum=False,
+            length=16,
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
+        nullable=False,
+        server_default=InvitationStatus.PENDING.value,
+        index=True,
+    )
+    invited_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_user.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
