@@ -13,6 +13,9 @@ N2 implements:
 N3 implements:
   - ``GET /billing/usage``      — current-period usage vs plan limits for the workspace.
 
+N4 implements:
+  - ``GET /billing/limits``     — per-dimension limit states (ok|warning|exceeded) for the workspace.
+
 The webhook endpoint is unauthenticated (verified by Stripe signature). All
 other endpoints use ``require_workspace`` (B5).
 
@@ -32,14 +35,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import CurrentWorkspace
 from civicsignals_api.modules.billing import services
-from civicsignals_api.modules.billing.dependencies import require_feature
+from civicsignals_api.modules.billing.dependencies import require_feature, require_within_limit
 from civicsignals_api.modules.billing.models import BillingCustomer, BillingSubscription
 from civicsignals_api.modules.billing.plans import Dimension, Feature, get_plan
 from civicsignals_api.modules.billing.schemas import (
     BillingCustomerOut,
     BillingSubscriptionOut,
+    DimensionLimitOut,
     DimensionUsageOut,
+    LimitState,
     PlanOut,
+    WorkspaceLimitsOut,
     WorkspacePlanOut,
     WorkspaceUsageOut,
 )
@@ -258,23 +264,26 @@ async def get_workspace_plan(
 @router.get(
     "/plan/demo-smart-search",
     response_model=dict[str, str],
-    summary="[Demo] Feature-gated endpoint requiring SMART_SEARCH (N2)",
+    summary="[Demo] Feature + quota-gated endpoint requiring SMART_SEARCH (N2/N4)",
     description=(
-        "Demonstration of the ``require_feature`` dependency pattern (N2). "
-        "Returns 402 when the workspace plan does not include ``smart_search``. "
-        "Production smart-search routes live in the ``smart_search`` module; "
-        "this endpoint exists only to validate the gate in the billing module's "
-        "test suite. "
-        "# TODO N4: actual quota enforcement (runs/month cap) goes here once metering lands."
+        "Demonstration of the ``require_feature`` + ``require_within_limit`` "
+        "dependency pattern (N2 + N4). Returns 402 when the plan lacks "
+        "``smart_search``; returns 429 when the monthly smart-search quota is "
+        "exhausted. Production smart-search routes live in the ``smart_search`` "
+        "module; this endpoint exists only to validate the gates in the billing "
+        "module's test suite."
     ),
 )
 async def demo_smart_search_gate(
     ctx: CurrentWorkspace,
     session: Annotated[AsyncSession, Depends(get_session)],
     _gate: Annotated[None, Depends(require_feature(Feature.SMART_SEARCH))],
+    _quota: Annotated[
+        None,
+        Depends(require_within_limit(Dimension.SMART_SEARCHES_PER_MONTH)),
+    ],
 ) -> dict[str, str]:
-    """Return a stub response; the real value is the 402 gate on plans lacking SMART_SEARCH."""
-    # TODO N4: enforce smart-search monthly quota before reaching here.
+    """Return a stub response; the real value is the 402/429 gates."""
     return {"status": "ok", "plan": (await services.get_workspace_plan(session, ctx.workspace_id))}
 
 
@@ -293,9 +302,9 @@ async def demo_smart_search_gate(
         "cap for each dimension (``null`` = unlimited). The ``seats`` dimension "
         "is refreshed on every call (live count from ``accounts_member``). All "
         "other dimensions reflect the accumulated counters in ``billing_usage``.\n\n"
-        "Clients use this to render usage meters and upgrade CTAs. N4 will add "
-        "enforcement (soft 80 % banner + hard 429 at 100 %) on top of these numbers."
-        "# TODO N4: enforcement layer reads the same numbers returned here."
+        "Clients use this to render usage meters and upgrade CTAs. For the "
+        "enforcement state (ok|warning|exceeded) used to drive the soft-limit "
+        "banner, see ``GET /billing/limits`` (N4)."
     ),
 )
 async def get_workspace_usage(
@@ -339,6 +348,61 @@ async def get_workspace_usage(
         )
 
     return WorkspaceUsageOut(
+        workspace_id=ctx.workspace_id,
+        period=period,
+        dimensions=dimensions,
+    )
+
+
+# ---------------------------------------------------------------------------
+# N4: Limits endpoint (per-dimension states: ok | warning | exceeded)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/limits",
+    response_model=WorkspaceLimitsOut,
+    summary="Get per-dimension limit states for the workspace (N4)",
+    description=(
+        "Returns the workspace's per-dimension usage states for the current "
+        "billing period. Each dimension carries a ``state`` of ``ok`` (< 80%), "
+        "``warning`` (≥ 80%, soft banner), or ``exceeded`` (≥ 100%, hard 429 "
+        "enforcement + paywall CTA). The ``seats`` dimension is refreshed live "
+        "on every call. Clients drive the soft-limit banner and paywall prompt "
+        "from this endpoint (N4)."
+    ),
+)
+async def get_workspace_limits(
+    ctx: CurrentWorkspace,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> WorkspaceLimitsOut:
+    """Return per-dimension limit states for the current workspace (N4).
+
+    Steps:
+    1. Refresh the seats snapshot (live count from accounts_member).
+    2. Compute per-dimension (used, limit, pct, state) via get_limit_states.
+    3. Return WorkspaceLimitsOut with LimitState per dimension.
+    """
+    period = services.current_period()
+
+    # Refresh seats (snapshot, not accumulated).
+    async with session.begin_nested():
+        await services.refresh_seats_usage(session, ctx.workspace_id, period=period)
+
+    # Get limit states for all dimensions.
+    limit_map = await services.get_limit_states(session, ctx.workspace_id, period=period)
+
+    dimensions: dict[str, DimensionLimitOut] = {}
+    for dim_key, (used, limit, pct, state_str) in limit_map.items():
+        dimensions[dim_key] = DimensionLimitOut(
+            dimension=dim_key,
+            used=used,
+            limit=limit,
+            pct=pct,
+            state=LimitState(state_str),
+        )
+
+    return WorkspaceLimitsOut(
         workspace_id=ctx.workspace_id,
         period=period,
         dimensions=dimensions,

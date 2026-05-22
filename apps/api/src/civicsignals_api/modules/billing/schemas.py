@@ -3,12 +3,14 @@
 N1: Stripe customer + subscription wiring output schemas.
 N2: Plan definition + workspace plan summary output schemas.
 N3: Usage metering output schemas (current-period usage vs plan limits).
+N4: Limit-state output schemas (soft/hard enforcement states per dimension).
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from enum import StrEnum
 
 from pydantic import BaseModel
 
@@ -123,9 +125,6 @@ class DimensionUsageOut(BaseModel):
     ``limit`` is the plan cap (``None`` = unlimited).
     ``pct_used`` is ``used / limit * 100`` rounded to one decimal, or
     ``None`` when the limit is unlimited.
-
-    # TODO N4: ``pct_used >= 80`` triggers the soft-limit banner;
-    #   ``pct_used >= 100`` triggers the 429 hard-limit enforcement.
     """
 
     dimension: str
@@ -141,11 +140,52 @@ class WorkspaceUsageOut(BaseModel):
     in ``YYYY-MM`` format (calendar month, UTC).  ``dimensions`` is a mapping
     of :class:`Dimension` value → :class:`DimensionUsageOut` so clients can
     look up any dimension by name without position-coupling.
-
-    # TODO N4: N4 reads the same ``record_usage`` / ``get_usage`` calls and
-    #   raises 429 when ``pct_used >= 100`` for metered dimensions.
     """
 
     workspace_id: uuid.UUID
     period: date  # first day of the billing month (YYYY-MM-01)
     dimensions: dict[str, DimensionUsageOut]
+
+
+# ---------------------------------------------------------------------------
+# N4: Limit-state schemas (soft banner / hard 429 enforcement)
+# ---------------------------------------------------------------------------
+
+
+class LimitState(StrEnum):
+    """Per-dimension usage state for N4 enforcement.
+
+    ok        — usage < 80% of the plan cap (or the dimension is unlimited).
+    warning   — usage is >= 80% but < 100% (soft banner should be shown).
+    exceeded  — usage is >= 100% (hard 429 enforcement; paywall CTA).
+    """
+
+    OK = "ok"
+    WARNING = "warning"
+    EXCEEDED = "exceeded"
+
+
+class DimensionLimitOut(BaseModel):
+    """Limit-state for a single metering dimension (N4).
+
+    Extends N3's usage info with an explicit ``state`` field that the web
+    banner and enforcement dependency both read.
+    """
+
+    dimension: str
+    used: int
+    limit: int | None  # None = unlimited
+    pct: float | None  # None when limit is unlimited
+    state: LimitState  # ok | warning | exceeded
+
+
+class WorkspaceLimitsOut(BaseModel):
+    """Per-dimension limit states for the workspace (N4).
+
+    Returned by ``GET /billing/limits``.  Clients drive the soft-limit
+    banner (warning ≥ 80%) and paywall CTA (exceeded ≥ 100%) from this.
+    """
+
+    workspace_id: uuid.UUID
+    period: date
+    dimensions: dict[str, DimensionLimitOut]
