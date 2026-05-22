@@ -154,6 +154,8 @@ jobs:
   e2e-smoke:
     name: E2E smoke (placeholder)
     runs-on: ubuntu-latest
+    # Non-blocking until QA-1 adds real Playwright specs; flip this off then.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Placeholder
@@ -264,7 +266,7 @@ jobs:
             echo "no recipes to validate"
             exit 0
           fi
-          uvx --from check-jsonschema check-jsonschema \
+          uvx --from "check-jsonschema==0.37.2" check-jsonschema \
             --schemafile packages/recipe-schema/schema/recipe.schema.json \
             "${recipes[@]}"
 

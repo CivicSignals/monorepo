@@ -66,7 +66,7 @@ check-notice: ## Fail if NOTICE.md is stale or a disallowed license appears (TOD
 
 .PHONY: check-recipes
 check-recipes: ## Validate recipes against the JSON Schema + replay golden fixtures (TODO A3)
-	uvx --from check-jsonschema check-jsonschema \
+	uvx --from "check-jsonschema==0.37.2" check-jsonschema \
 		--schemafile packages/recipe-schema/schema/recipe.schema.json \
 		recipes/*/recipe.yml
 	python3 scripts/replay_fixtures.py recipes
