@@ -16,6 +16,13 @@ RBAC), so the public surface is intentionally small and stable:
   flow. Token is single-use, hashed at rest, and expires after a configurable TTL.
 - ``google_oauth_start`` / ``google_oauth_callback`` — B2 Google OAuth2
   authorization-code flow with signed-state (HMAC-SHA256 nonce).
+- ``begin_mfa_enrollment`` / ``activate_mfa`` / ``verify_mfa_code`` — B4 TOTP
+  MFA enrollment, activation (with backup-code generation), and login enforcement.
+- ``issue_mfa_challenge_token`` / ``verify_mfa_challenge_token`` — B4 short-lived
+  MFA-challenge JWT that bridges the first factor to the second-factor verify step.
+- ``disable_mfa`` — B4 clears the TOTP secret + backup codes after re-auth.
+- ``regenerate_backup_codes`` — B4 replaces the backup-code set; returns the new
+  plaintext codes once (hashes only stored).
 
 Cross-module rules: user identity is owned by ``accounts`` and reached only via
 ``accounts.services``; verification mail goes out via ``notifications.services``.
@@ -23,6 +30,8 @@ Cross-module rules: user identity is owned by ``accounts`` and reached only via
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import secrets
@@ -36,8 +45,11 @@ from uuid import UUID
 
 import httpx
 import jwt
+import pyotp
+from cryptography.fernet import Fernet
+from cryptography.fernet import InvalidToken as FernetInvalidToken
 from passlib.context import CryptContext
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.config import Settings, get_settings
@@ -48,6 +60,8 @@ from .models import (
     ApiToken,
     ApiTokenType,
     EmailVerificationToken,
+    MfaBackupCode,
+    MfaCredential,
     OAuthIdentity,
     PasswordResetToken,
 )
@@ -93,6 +107,34 @@ class InvalidScopeError(AuthError):
     def __init__(self, invalid: Sequence[str]) -> None:
         self.invalid = list(invalid)
         super().__init__(f"unknown scope(s): {', '.join(self.invalid)}")
+
+
+class MfaError(AuthError):
+    """Base for MFA-layer failures the routes translate into RFC 7807 problems (B4)."""
+
+
+class MfaRequiredError(MfaError):
+    """Login succeeded but MFA is enabled; a second-factor challenge is required (B4)."""
+
+    def __init__(self, challenge_token: str) -> None:
+        self.challenge_token = challenge_token
+        super().__init__("MFA verification required")
+
+
+class MfaInvalidCodeError(MfaError):
+    """The TOTP code or backup code submitted was wrong or already used (B4)."""
+
+
+class MfaAlreadyActiveError(MfaError):
+    """Enrollment attempted when MFA is already activated (B4)."""
+
+
+class MfaNotActiveError(MfaError):
+    """An MFA operation was requested but MFA is not active for this user (B4)."""
+
+
+class MfaChallengeTokenError(MfaError):
+    """The MFA-challenge JWT is missing, expired, or invalid (B4)."""
 
 
 @dataclass(frozen=True)
@@ -1026,3 +1068,408 @@ async def google_oauth_callback(
     await accounts_services.touch_last_seen(session, new_user)
     await session.flush()
     return GoogleOAuthCallbackResult(user=new_user, created=True)
+
+
+# ---------------------------------------------------------------------------
+# B4: MFA / TOTP — enrollment, activation, login enforcement, disable
+# ---------------------------------------------------------------------------
+# Design:
+# - The TOTP secret is Fernet-encrypted at rest. The same key-derivation
+#   approach as integrations (K1) is used (raw 32-byte Fernet key verbatim;
+#   otherwise SHA-256-derive from the passphrase). Falls back to ``secret_key``
+#   in dev. Production MUST set MFA_TOTP_ENCRYPTION_KEY separately.
+# - Backup codes are SHA-256 hashed (same as email-verification tokens) — they
+#   are one-way; the plaintext is returned once at activation.
+# - The MFA-challenge JWT is a short-lived "mfa_challenge" typed token issued
+#   when login succeeds but MFA is enabled. The client presents it at
+#   ``/auth/mfa/verify`` with the TOTP/backup code to complete auth.
+# - TODO B2/OAuth: Google OAuth logins bypass MFA for now. Enforcing MFA on
+#   OAuth logins requires a different UX (the callback is a redirect, not a
+#   JSON exchange). A full solution is a follow-up; leave the comment at the
+#   OAuth callback route.
+
+
+def _mfa_cipher(settings: Settings) -> Fernet:
+    """Return a Fernet instance keyed from MFA_TOTP_ENCRYPTION_KEY (or secret_key)."""
+    key_material = settings.mfa_totp_encryption_key or settings.secret_key
+    raw = key_material.encode("utf-8")
+    try:
+        decoded = base64.urlsafe_b64decode(raw)
+        if len(decoded) == 32:
+            fernet_key = raw
+        else:
+            import hashlib as _hashlib
+
+            fernet_key = base64.urlsafe_b64encode(_hashlib.sha256(raw).digest())
+    except (binascii.Error, ValueError):
+        import hashlib as _hashlib
+
+        fernet_key = base64.urlsafe_b64encode(_hashlib.sha256(raw).digest())
+    return Fernet(fernet_key)
+
+
+def _encrypt_totp_secret(secret: str, settings: Settings) -> str:
+    """Return the Fernet-encrypted TOTP secret (ASCII ciphertext)."""
+    return _mfa_cipher(settings).encrypt(secret.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_totp_secret(ciphertext: str, settings: Settings) -> str:
+    """Decrypt a stored TOTP secret ciphertext; raises :class:`MfaError` on key mismatch."""
+    try:
+        return _mfa_cipher(settings).decrypt(ciphertext.encode("ascii")).decode("utf-8")
+    except FernetInvalidToken as exc:
+        raise MfaError("TOTP secret decryption failed (wrong key?)") from exc
+
+
+def _hash_backup_code(raw: str) -> str:
+    """SHA-256 hex digest of a plaintext backup code."""
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _generate_backup_codes(count: int) -> list[str]:
+    """Generate ``count`` random backup codes (8 uppercase hex characters each)."""
+    return [secrets.token_hex(4).upper() for _ in range(count)]
+
+
+# --- MFA-challenge JWT --------------------------------------------------------
+# A short-lived typed JWT (type="mfa_challenge") issued when email+password
+# succeeds and MFA is active. It carries the user_id (sub) and is verified at
+# /auth/mfa/verify before the full access+refresh pair is issued.
+
+
+def issue_mfa_challenge_token(user_id: UUID, *, settings: Settings | None = None) -> str:
+    """Mint a short-lived MFA-challenge JWT for ``user_id``."""
+    settings = settings or get_settings()
+    return _issue_token(
+        user_id,
+        token_type="mfa_challenge",  # type: ignore[arg-type]
+        ttl_seconds=settings.mfa_challenge_ttl_seconds,
+        settings=settings,
+    )
+
+
+def verify_mfa_challenge_token(token: str, *, settings: Settings | None = None) -> UUID:
+    """Decode an MFA-challenge JWT and return the user_id.
+
+    Raises :class:`MfaChallengeTokenError` on bad signature, expiry, or wrong type.
+    """
+    settings = settings or get_settings()
+    try:
+        claims = jwt.decode(
+            token,
+            _secret(settings),
+            algorithms=[settings.jwt_algorithm],
+            issuer=settings.jwt_issuer,
+            options={"require": ["exp", "sub", "iss"]},
+        )
+    except jwt.PyJWTError as exc:
+        raise MfaChallengeTokenError(str(exc)) from exc
+    if claims.get("type") != "mfa_challenge":
+        raise MfaChallengeTokenError("unexpected token type")
+    try:
+        return UUID(str(claims["sub"]))
+    except (KeyError, ValueError) as exc:
+        raise MfaChallengeTokenError("invalid subject") from exc
+
+
+# --- MFA queries -------------------------------------------------------------
+
+
+async def get_mfa_credential(session: AsyncSession, user_id: UUID) -> MfaCredential | None:
+    """Return the MFA credential row for ``user_id``, or ``None``."""
+    result = await session.execute(select(MfaCredential).where(MfaCredential.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
+async def get_active_mfa_credential(session: AsyncSession, user_id: UUID) -> MfaCredential | None:
+    """Return the **activated** MFA credential for ``user_id``, or ``None``."""
+    result = await session.execute(
+        select(MfaCredential).where(
+            MfaCredential.user_id == user_id,
+            MfaCredential.activated.is_(True),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+# --- Enrollment --------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MfaEnrollResult:
+    """Outcome of :func:`begin_mfa_enrollment`.
+
+    ``totp_uri`` is the ``otpauth://`` provisioning URI (for QR rendering).
+    ``secret`` is the raw base32 secret shown once to allow manual entry.
+    Neither is ever stored in plaintext; the caller must not log them.
+    """
+
+    totp_uri: str
+    secret: str  # base32; shown once, never stored
+
+
+async def begin_mfa_enrollment(
+    session: AsyncSession,
+    user: User,
+    *,
+    settings: Settings | None = None,
+) -> MfaEnrollResult:
+    """Begin TOTP enrollment: generate a secret, persist it encrypted, and return the URI.
+
+    If a **non-activated** credential already exists (e.g. the user started
+    enrollment twice), it is replaced. Raises :class:`MfaAlreadyActiveError` if
+    MFA is already activated.
+
+    The secret is never returned after this call completes; the client must
+    immediately display the QR / URI so the user can scan it.
+    """
+    settings = settings or get_settings()
+
+    existing = await get_mfa_credential(session, user.id)
+    if existing is not None and existing.activated:
+        raise MfaAlreadyActiveError("MFA is already activated for this account")
+
+    if existing is not None:
+        # Replace the pending (non-activated) credential.
+        await session.execute(delete(MfaCredential).where(MfaCredential.id == existing.id))
+        await session.flush()
+
+    secret = pyotp.random_base32()
+    encrypted = _encrypt_totp_secret(secret, settings)
+    credential = MfaCredential(
+        user_id=user.id,
+        totp_secret_encrypted=encrypted,
+        activated=False,
+    )
+    session.add(credential)
+    await session.flush()
+
+    totp = pyotp.TOTP(secret)
+    totp_uri = totp.provisioning_uri(name=user.email, issuer_name=settings.mfa_totp_issuer)
+    # The secret is returned here ONLY so the client can render the QR / allow
+    # manual entry. It is never logged and never stored in plaintext.
+    return MfaEnrollResult(totp_uri=totp_uri, secret=secret)
+
+
+# --- Activation (verify + generate backup codes) ----------------------------
+
+
+@dataclass(frozen=True)
+class MfaActivateResult:
+    """Outcome of :func:`activate_mfa` — the plaintext backup codes (shown once)."""
+
+    backup_codes: list[str]  # plaintext; return to client ONCE, then hashes only
+
+
+async def activate_mfa(
+    session: AsyncSession,
+    user: User,
+    *,
+    totp_code: str,
+    settings: Settings | None = None,
+) -> MfaActivateResult:
+    """Verify ``totp_code`` against the pending secret and activate MFA.
+
+    On success:
+    1. Marks the credential ``activated = True`` (with ``activated_at``).
+    2. Generates ``mfa_backup_code_count`` backup codes and stores only their
+       SHA-256 hashes; returns the plaintext codes once.
+
+    Raises :class:`MfaNotActiveError` if no enrollment is pending.
+    Raises :class:`MfaAlreadyActiveError` if already activated.
+    Raises :class:`MfaInvalidCodeError` if the code is wrong.
+    """
+    settings = settings or get_settings()
+
+    credential = await get_mfa_credential(session, user.id)
+    if credential is None:
+        raise MfaNotActiveError("No pending MFA enrollment found")
+    if credential.activated:
+        raise MfaAlreadyActiveError("MFA is already activated")
+
+    secret = _decrypt_totp_secret(credential.totp_secret_encrypted, settings)
+    totp = pyotp.TOTP(secret)
+    # valid_window=1 allows ±30s drift (one adjacent window) which is typical for
+    # authenticator apps with slight clock skew (NIST SP 800-63B §5.1.4.2).
+    if not totp.verify(totp_code, valid_window=1):
+        raise MfaInvalidCodeError("Invalid or expired TOTP code")
+
+    now = datetime.now(UTC)
+    credential.activated = True
+    credential.activated_at = now
+
+    # Generate backup codes; store only hashes.
+    plaintext_codes = _generate_backup_codes(settings.mfa_backup_code_count)
+    for code in plaintext_codes:
+        backup = MfaBackupCode(
+            mfa_credential_id=credential.id,
+            user_id=user.id,
+            code_hash=_hash_backup_code(code),
+        )
+        session.add(backup)
+
+    await session.flush()
+    return MfaActivateResult(backup_codes=plaintext_codes)
+
+
+# --- Second-factor verification (login enforcement) --------------------------
+
+
+async def verify_mfa_code(
+    session: AsyncSession,
+    user: User,
+    *,
+    code: str,
+    settings: Settings | None = None,
+) -> None:
+    """Verify a TOTP code or backup code for an MFA-enabled user.
+
+    Accepts either a 6-digit TOTP code (``code`` is all digits, len 6) or an
+    uppercase hex backup code (consumed and marked used). Raises
+    :class:`MfaNotActiveError` if MFA is not active for this user, and
+    :class:`MfaInvalidCodeError` if the code is wrong or already used.
+    """
+    settings = settings or get_settings()
+
+    credential = await get_active_mfa_credential(session, user.id)
+    if credential is None:
+        raise MfaNotActiveError("MFA is not active for this account")
+
+    # Backup code path: non-digit or 8-char hex-style codes.
+    if not code.isdigit() or len(code) != 6:
+        return await _verify_backup_code(session, credential, code)
+
+    # TOTP path.
+    secret = _decrypt_totp_secret(credential.totp_secret_encrypted, settings)
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code, valid_window=1):
+        # Also try backup code path in case the code happens to be numeric (8-char numeric backup).
+        try:
+            return await _verify_backup_code(session, credential, code)
+        except MfaInvalidCodeError:
+            pass
+        raise MfaInvalidCodeError("Invalid or expired TOTP code")
+
+
+async def _verify_backup_code(
+    session: AsyncSession,
+    credential: MfaCredential,
+    code: str,
+) -> None:
+    """Consume a backup code (marks it used). Raises :class:`MfaInvalidCodeError` if invalid."""
+    code_hash = _hash_backup_code(code)
+    result = await session.execute(
+        select(MfaBackupCode).where(
+            MfaBackupCode.mfa_credential_id == credential.id,
+            MfaBackupCode.code_hash == code_hash,
+            MfaBackupCode.used_at.is_(None),
+        )
+    )
+    backup = result.scalar_one_or_none()
+    if backup is None:
+        raise MfaInvalidCodeError("Invalid or already-used backup code")
+    backup.used_at = datetime.now(UTC)
+    await session.flush()
+
+
+# --- Disable MFA -------------------------------------------------------------
+
+
+async def disable_mfa(
+    session: AsyncSession,
+    user: User,
+    *,
+    code: str,
+    settings: Settings | None = None,
+) -> None:
+    """Disable MFA after re-authentication with a TOTP/backup code.
+
+    Clears the ``auth_mfa_credential`` row (cascade-deletes backup codes).
+    Raises :class:`MfaNotActiveError` if MFA is not active.
+    Raises :class:`MfaInvalidCodeError` if the code is wrong.
+    """
+    settings = settings or get_settings()
+    # verify_mfa_code will raise MfaNotActiveError or MfaInvalidCodeError as needed.
+    await verify_mfa_code(session, user, code=code, settings=settings)
+
+    # Delete the credential (cascade deletes auth_mfa_backup_code rows).
+    await session.execute(delete(MfaCredential).where(MfaCredential.user_id == user.id))
+    await session.flush()
+
+
+# --- Regenerate backup codes -------------------------------------------------
+
+
+async def regenerate_backup_codes(
+    session: AsyncSession,
+    user: User,
+    *,
+    code: str,
+    settings: Settings | None = None,
+) -> list[str]:
+    """Replace all backup codes after re-auth with a TOTP/backup code.
+
+    Returns the new plaintext backup codes (shown once). Raises
+    :class:`MfaNotActiveError` / :class:`MfaInvalidCodeError` as appropriate.
+    """
+    settings = settings or get_settings()
+
+    credential = await get_active_mfa_credential(session, user.id)
+    if credential is None:
+        raise MfaNotActiveError("MFA is not active for this account")
+
+    # Re-auth: verify the TOTP or backup code first.
+    await verify_mfa_code(session, user, code=code, settings=settings)
+
+    # Delete all existing backup codes for this credential.
+    await session.execute(
+        delete(MfaBackupCode).where(MfaBackupCode.mfa_credential_id == credential.id)
+    )
+
+    plaintext_codes = _generate_backup_codes(settings.mfa_backup_code_count)
+    for c in plaintext_codes:
+        session.add(
+            MfaBackupCode(
+                mfa_credential_id=credential.id,
+                user_id=user.id,
+                code_hash=_hash_backup_code(c),
+            )
+        )
+    await session.flush()
+    return plaintext_codes
+
+
+# --- Login enforcement -------------------------------------------------------
+# ``authenticate`` already verifies email+password and returns the user.
+# When MFA is active, the route must NOT issue the full token pair — instead
+# it issues a short-lived mfa_challenge JWT and returns an MfaRequiredError.
+# The client presents the challenge token + TOTP at /auth/mfa/verify to obtain
+# the real token pair. This function wraps ``authenticate`` for MFA-aware routes.
+
+
+async def authenticate_with_mfa_check(
+    session: AsyncSession,
+    *,
+    email: str,
+    password: str,
+    settings: Settings | None = None,
+) -> User:
+    """Authenticate email+password and enforce MFA if active.
+
+    Wraps :func:`authenticate`. If the user has MFA activated, raises
+    :class:`MfaRequiredError` (with a short-lived challenge token) instead of
+    returning the user directly. The caller MUST catch this and return the
+    challenge token to the client rather than a full token pair.
+
+    All other errors (:class:`InvalidCredentialsError`, :class:`EmailNotVerifiedError`)
+    propagate unchanged.
+    """
+    settings = settings or get_settings()
+    user = await authenticate(session, email=email, password=password, settings=settings)
+
+    credential = await get_active_mfa_credential(session, user.id)
+    if credential is not None:
+        challenge = issue_mfa_challenge_token(user.id, settings=settings)
+        raise MfaRequiredError(challenge)
+
+    return user

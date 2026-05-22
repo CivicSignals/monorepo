@@ -38,9 +38,12 @@ from civicsignals_api.modules.accounts.models import (  # noqa: F401  registers 
     User,
     Workspace,
 )
-from civicsignals_api.modules.auth.models import (  # noqa: F401  registers the table
+from civicsignals_api.modules.auth.models import (  # noqa: F401  registers the tables
     ApiToken,
     EmailVerificationToken,
+    MfaBackupCode,
+    MfaCredential,
+    OAuthIdentity,
     PasswordResetToken,
 )
 from civicsignals_api.modules.notifications import services as notifications_services

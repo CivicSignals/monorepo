@@ -162,3 +162,86 @@ class ApiTokenScopesOut(BaseModel):
     """The catalog of grantable scopes (for the management UI to render)."""
 
     scopes: list[str]
+
+
+# --- B4: MFA / TOTP ----------------------------------------------------------
+
+
+class MfaEnrollBeginResponse(BaseModel):
+    """Response to POST /auth/mfa/enroll — provisioning URI + base32 secret.
+
+    ``totp_uri`` is the ``otpauth://totp/...`` URI for QR code rendering.
+    ``secret`` is the raw base32 secret for manual entry in an authenticator app.
+    Neither field is stored in the DB after this response — they are shown once.
+    """
+
+    totp_uri: str
+    secret: str
+
+
+class MfaVerifyBody(BaseModel):
+    """Body for POST /auth/mfa/enroll/verify (activate) and POST /auth/mfa/verify (login).
+
+    ``code`` is either a 6-digit TOTP code or an 8-char uppercase backup code.
+    """
+
+    code: str = Field(min_length=1, max_length=64)
+
+
+class MfaLoginVerifyBody(BaseModel):
+    """Body for POST /auth/mfa/verify (second-factor login step).
+
+    ``challenge_token`` is the short-lived token returned in the ``mfa_required``
+    login response. ``code`` is a TOTP or backup code.
+    """
+
+    challenge_token: str = Field(min_length=1)
+    code: str = Field(min_length=1, max_length=64)
+
+
+class MfaRequiredResponse(BaseModel):
+    """Response when MFA is required during login.
+
+    ``mfa_required`` is always True; ``challenge_token`` is a short-lived JWT
+    (TTL = ``mfa_challenge_ttl_seconds``) that the client presents to
+    ``POST /auth/mfa/verify`` along with the TOTP/backup code to receive the
+    full token pair.
+    """
+
+    mfa_required: bool = True
+    challenge_token: str
+
+
+class MfaActivateResponse(BaseModel):
+    """Response to POST /auth/mfa/enroll/verify — the one-time backup codes.
+
+    ``backup_codes`` is returned **once only**; the server stores only their
+    SHA-256 hashes. The client must display them for the user to save.
+    """
+
+    backup_codes: list[str]
+
+
+class MfaDisableBody(BaseModel):
+    """Body for POST /auth/mfa/disable — requires a fresh TOTP or backup code."""
+
+    code: str = Field(min_length=1, max_length=64)
+
+
+class MfaRegenerateCodesBody(BaseModel):
+    """Body for POST /auth/mfa/backup-codes/regenerate — requires re-auth."""
+
+    code: str = Field(min_length=1, max_length=64)
+
+
+class MfaRegenerateCodesResponse(BaseModel):
+    """Response to the regenerate endpoint — new backup codes shown once."""
+
+    backup_codes: list[str]
+
+
+class MfaStatusResponse(BaseModel):
+    """Response to GET /auth/mfa/status — whether MFA is active for the current user."""
+
+    mfa_enabled: bool
+    activated_at: datetime | None = None
