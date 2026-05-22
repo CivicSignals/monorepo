@@ -242,8 +242,19 @@ services:
       retries: 5
       start_period: 30s
 
+  # worker_ingest renders JS-heavy pages with Playwright (D2), so it builds the
+  # `worker` Dockerfile stage (final + Chromium + the `ingestion` extra) rather
+  # than the lean api image the other process types share. Tagged distinctly so
+  # the two images don't clobber each other in the local cache.
   worker_ingest:
     <<: *api-defaults
+    image: ghcr.io/civicsignals/api-worker:${CIVIC_VERSION:-latest}
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+      target: worker
+      args:
+        EXTRAS: ingestion
     command: ["worker_ingest"]
 
   worker_extract:

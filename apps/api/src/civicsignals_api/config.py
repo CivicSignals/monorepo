@@ -82,6 +82,35 @@ class Settings(BaseSettings):
     recipe_schema_dir: str | None = None
     recipes_dir: str | None = None
 
+    # --- Headless browser fetcher (D2; doc 18 §1 cat. D, §4 "Headless browser") -
+    # The Playwright-backed fetcher (``http_browser`` connector) renders JS-heavy
+    # pages the static fetcher can't. It runs only on ``worker_ingest`` (the lean
+    # ``api`` image carries neither the ``playwright`` extra nor the browser
+    # binary), so these settings tune the per-worker browser pool.
+    #
+    # ``browser_pool_size`` bounds concurrent pages/contexts per worker process —
+    # each can balloon to ~hundreds of MB, so this caps memory blast radius (doc
+    # 18 §6.1). Burst is absorbed by ingest queue depth + HPA, not by an unbounded
+    # pool (autoscaling on queue depth lives in O3's Helm chart — workerIngest.hpa
+    # in infra/helm/.../templates/hpa.yaml).
+    browser_pool_size: int = 4
+    # Per-navigation timeout: a page that never finishes loading fails the fetch
+    # rather than hanging the worker (doc 18 §4 "Page never finishes loading").
+    browser_nav_timeout_ms: int = 30_000
+    # Wait policy after navigation: "load" | "domcontentloaded" | "networkidle".
+    # "networkidle" is the default for SPAs whose content only appears after the
+    # async XHR/fetch settle; recipes that just need DOMContentLoaded can override.
+    browser_wait_until: Literal["load", "domcontentloaded", "networkidle"] = "networkidle"
+    # Bound time spent waiting for a recipe-supplied "ready" selector to appear
+    # before giving up and returning whatever rendered.
+    browser_selector_timeout_ms: int = 10_000
+    # Time budget for launching the browser process on first use (a cold launch
+    # has to start Chromium); separate from the per-navigation timeout above.
+    browser_launch_timeout_ms: int = 30_000
+    # Browser launch is headless; never run headful in containers. Exposed so a
+    # local debugger can flip it.
+    browser_headless: bool = True
+
     # ---------------------------------------------------------------------------
     # Observability (A6) — all optional, safe defaults = disabled.
     # No external accounts are required to run the app; these enable integrations
