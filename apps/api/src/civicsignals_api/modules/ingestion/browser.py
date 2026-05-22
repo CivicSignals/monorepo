@@ -118,10 +118,16 @@ class _PlaywrightLauncher:
         # so shutdown can stop it. mypy can't see the lazy import's types.
         self._playwright = await async_api.async_playwright().start()  # type: ignore[attr-defined]
         assert self._playwright is not None
-        return await self._playwright.chromium.launch(
-            headless=self._headless,
-            timeout=self._launch_timeout_ms,
-        )
+        try:
+            return await self._playwright.chromium.launch(
+                headless=self._headless,
+                timeout=self._launch_timeout_ms,
+            )
+        except BaseException:
+            # Chromium failed to launch (e.g. binary missing / timeout): stop the
+            # driver subprocess we just started so it doesn't leak, then re-raise.
+            await self.shutdown()
+            raise
 
     async def shutdown(self) -> None:
         if self._playwright is not None:
@@ -205,12 +211,21 @@ class BrowserPool:
         context manager, which guarantees release even on error.
         """
         await self._semaphore.acquire()
+        context: BrowserContext | None = None
         try:
             browser = await self._ensure_browser()
             context = await browser.new_context()
             self.contexts_opened += 1
             page = await context.new_page()
         except BaseException:
+            # If new_page() failed after the context opened, best-effort close it
+            # so we don't leak a context (and keep the opened/closed tally even).
+            if context is not None:
+                try:
+                    await context.close()
+                    self.contexts_closed += 1
+                except Exception:
+                    pass  # cleanup is best-effort; the original error re-raises
             # Never leak the slot if context/page creation failed.
             self._semaphore.release()
             raise
@@ -411,7 +426,12 @@ class BrowserFetcher:
             self._loop.call_soon_threadsafe(self._loop.stop)
             if self._loop_thread is not None:
                 self._loop_thread.join(timeout=5.0)
-            self._loop.close()
+            # Only close a loop whose thread has actually stopped: closing a still-
+            # running loop raises RuntimeError. If the thread is wedged we drop the
+            # references and let the daemon thread die with the process rather than
+            # crash shutdown.
+            if self._loop_thread is None or not self._loop_thread.is_alive():
+                self._loop.close()
             self._loop = None
             self._loop_thread = None
 

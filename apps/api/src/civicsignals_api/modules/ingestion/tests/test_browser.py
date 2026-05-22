@@ -206,6 +206,39 @@ async def test_pool_releases_slot_when_new_context_fails() -> None:
     await pool.aclose()
 
 
+async def test_pool_closes_context_when_new_page_fails() -> None:
+    class BadPageContext(FakeContext):
+        async def new_page(self) -> FakePage:
+            raise RuntimeError("page boom")
+
+    class BadPageBrowser(FakeBrowser):
+        async def new_context(self) -> FakeContext:
+            self.live += 1
+            self.max_live = max(self.max_live, self.live)
+            ctx = BadPageContext(FakePage(self._html, self._status, self._headers))
+            self.contexts.append(ctx)
+            return ctx
+
+    class BadPageLauncher(FakeLauncher):
+        async def launch(self) -> FakeBrowser:
+            self.launches += 1
+            self.browser = BadPageBrowser(self.html, self.status, self.headers)
+            return self.browser
+
+    launcher = BadPageLauncher()
+    pool = BrowserPool(launcher, size=1)
+    with pytest.raises(RuntimeError, match="page boom"):
+        await pool.acquire()
+    # The context created before new_page() failed must be closed (no leak), and
+    # the slot freed so a follow-up lease doesn't deadlock.
+    assert launcher.browser is not None
+    assert launcher.browser.contexts[0].closed
+    assert pool.contexts_opened == pool.contexts_closed == 1
+    with pytest.raises(RuntimeError, match="page boom"):
+        await pool.acquire()  # would hang if the slot leaked
+    await pool.aclose()
+
+
 async def test_pool_aclose_is_idempotent_and_closes_browser() -> None:
     launcher = FakeLauncher()
     pool = BrowserPool(launcher, size=1)

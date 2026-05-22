@@ -1,7 +1,7 @@
 """Celery tasks for the ingestion module (doc 06 §8, doc 18 §6).
 
 All tasks here are named ``ingestion.*`` and therefore route to the ``ingest``
-queue (``celery_app.task_routes``), drained by the ``worker_ingest`` process
+queue (``celery_app.conf.task_routes``), drained by the ``worker_ingest`` process
 (doc 18 §6.2). The headless-browser fetch path runs *only* on that worker — it
 is the only image that carries the ``ingestion`` extra (Playwright) and the
 Chromium binary (the lean ``api`` image carries neither).
