@@ -22,6 +22,7 @@ DB-gated suites simply skip).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from collections.abc import Iterator
 
@@ -35,9 +36,19 @@ _REQUIRED_EXTENSIONS = ("citext", "pg_trgm", "vector")
 
 @pytest.fixture(scope="session", autouse=True)
 def _ensure_pg_extensions() -> Iterator[None]:
-    """Create the Postgres extensions the test schema needs (no-op without a DSN)."""
+    """Create the Postgres extensions the test schema needs.
+
+    Best-effort: a no-op when no DSN is configured, and *tolerant of an unreachable
+    DB*. This fixture is autouse + session-scoped, so it runs at the start of every
+    test session — including jobs (e.g. the OpenAPI contract job) that don't bring up
+    a Postgres service. Those sessions must not fail here just because a DB connect
+    is impossible; the genuinely DB-backed suites are individually DSN-gated and will
+    skip/fail on their own. So a connection failure is swallowed and the schema-
+    building suites that *do* reach the DB still get their extensions created first.
+    """
     if _DSN:
-        asyncio.run(_create_extensions(_DSN))
+        with contextlib.suppress(Exception):
+            asyncio.run(_create_extensions(_DSN))
     yield
 
 
