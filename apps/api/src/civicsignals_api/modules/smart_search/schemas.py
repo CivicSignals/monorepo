@@ -16,6 +16,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from civicsignals_api.modules.signals.schemas import SignalRead
+
 # Closed enums copied from the documented feed filters (doc 08 §3.2). The rewrite
 # must only emit values from these sets; anything else is dropped during repair so
 # a hallucinated ``signal_type`` never reaches the query layer.
@@ -153,3 +155,104 @@ class RewriteResponse(BaseModel):
 
     query: StructuredQuery
     usage: RewriteUsage | None = None
+
+
+# --- Hybrid retrieval (TODO I3) ------------------------------------------------
+#
+# Default fusion limits + weights, kept here so they are one importable place the
+# service and tests share (and the request body can override per call). Hybrid
+# retrieval (doc 14 §6.2) runs three independent retrievers — vector ANN, BM25
+# full-text, structured filter — and fuses the vector + BM25 rankings with weighted
+# reciprocal-rank fusion (RRF), intersected with the structured filters.
+
+# How many candidates each retriever pulls before fusion. Generous relative to the
+# returned top-N so a signal ranked low by one retriever but high by another still
+# enters the fused set (doc 14 §6.2).
+DEFAULT_CANDIDATE_LIMIT = 100
+MAX_CANDIDATE_LIMIT = 500
+
+# Top-N returned to the caller (page size). Cursor pagination over the fused order
+# (doc 06 §5); the cursor is an opaque offset into the deterministic fused ranking.
+DEFAULT_TOP_N = 25
+MAX_TOP_N = 100
+
+# RRF constant `k`: a larger k flattens the contribution of rank position, a smaller
+# k sharpens the top of each list. 60 is the value from the original RRF paper and a
+# sane default; exposed for tuning.
+DEFAULT_RRF_K = 60
+
+
+class FusionWeights(BaseModel):
+    """Tunable weights for the hybrid-retrieval fusion (doc 14 §6.2, TODO I3).
+
+    The fused score for a signal is a weighted reciprocal-rank fusion of its rank in
+    the vector-ANN list and its rank in the BM25 full-text list. Structured filters
+    are an *intersection* (a hard gate), not a weighted term. Weights are clamped
+    ``>= 0``; both zero is rejected (nothing would rank). ``rrf_k`` is the RRF
+    smoothing constant. ``# TODO F3``: a per-workspace ``workspace_score`` weight is
+    folded in here once F3's ``signals_workspace_score`` lands.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    vector: float = Field(default=1.0, ge=0.0)
+    bm25: float = Field(default=1.0, ge=0.0)
+    rrf_k: int = Field(default=DEFAULT_RRF_K, ge=1)
+
+    @model_validator(mode="after")
+    def _check_not_all_zero(self) -> FusionWeights:
+        if self.vector == 0.0 and self.bm25 == 0.0:
+            raise ValueError("at least one of vector/bm25 weight must be > 0")
+        return self
+
+
+class SmartSearchRequest(BaseModel):
+    """``POST /smart-search`` request body (NL query + optional explicit filters).
+
+    ``query`` is the natural-language search box text; the rewrite (I2) turns it into
+    structured filters + a residual text query. ``filters`` lets a caller pin
+    additional structured constraints directly (intersected with the rewrite's), so
+    a UI with filter chips can pass them without round-tripping through NL. ``top_n``
+    is the page size; ``candidate_limit`` caps how many rows each retriever pulls
+    before fusion. ``weights`` overrides the default fusion weights for tuning.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+    filters: SearchFilters = Field(default_factory=SearchFilters)
+    top_n: int = Field(default=DEFAULT_TOP_N, ge=1, le=MAX_TOP_N)
+    candidate_limit: int = Field(default=DEFAULT_CANDIDATE_LIMIT, ge=1, le=MAX_CANDIDATE_LIMIT)
+    weights: FusionWeights = Field(default_factory=FusionWeights)
+    cursor: str | None = None
+
+
+class SmartSearchResult(BaseModel):
+    """One ranked hit: the global signal + its fused score and per-retriever provenance.
+
+    ``score`` is the fused RRF score (higher = more relevant; not a calibrated 0-1
+    probability — it is a ranking score). ``matched_via`` lists which retrievers
+    surfaced this signal (``"vector"``, ``"bm25"``, ``"filter"``) so the UI can show
+    *why* a result is here (doc 14 §6.2 explanation bullets seam). Per-retriever ranks
+    are exposed for debugging/tuning and the "inspect" panel.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal: SignalRead
+    score: float
+    matched_via: list[str]
+    vector_rank: int | None = None
+    bm25_rank: int | None = None
+
+
+class SmartSearchResponse(BaseModel):
+    """``POST /smart-search`` response: a ranked, cursor-paginated page of hits."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    results: list[SmartSearchResult]
+    next_cursor: str | None = None
+    # Echo back the structured rewrite so the client can show "we searched for …".
+    query: StructuredQuery
+    degraded: bool = False
