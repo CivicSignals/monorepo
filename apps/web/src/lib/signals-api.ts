@@ -102,6 +102,45 @@ export interface FeedPage {
   };
 }
 
+// ---- Signal detail shapes (G2; mirrors signals.schemas.SignalDetailRead) ----
+
+export interface SourceDocumentRead {
+  raw_document_id: string;
+  recipe_id: string | null;
+  source_url: string | null;
+  fetched_at: string | null;
+  content_type: string | null;
+  missing: boolean;
+}
+
+export interface SuggestedContactRead {
+  contact_id: string;
+  name: string;
+  title: string | null;
+  department: string | null;
+  canonical_email: string | null;
+  status: string;
+  verified: boolean;
+}
+
+export interface RelatedSignalRead {
+  signal: SignalRead;
+}
+
+export interface SignalDetailRead {
+  signal: SignalRead;
+  entity_id: string | null;
+  entity_name: string | null;
+  score: number | null;
+  status: FeedStatus | null;
+  score_breakdown: Record<string, unknown> | null;
+  matched_keywords: string[];
+  extracted_fields: Record<string, unknown>;
+  source_documents: SourceDocumentRead[];
+  suggested_contacts: SuggestedContactRead[];
+  related_signals: RelatedSignalRead[];
+}
+
 // ---- Filter params (doc 08 §1.6) -------------------------------------------
 
 export interface FeedFilters {
@@ -171,4 +210,23 @@ export function listFeedSignals(
     token,
     workspaceId,
   });
+}
+
+/**
+ * Fetch one signal's full detail view in the workspace's context (G2).
+ *
+ * Returns the global signal + the calling workspace's score / breakdown (null
+ * when the signal did not score into this workspace's feed — the corpus is
+ * global), source documents, suggested contacts, and related signals.
+ * Workspace-scoped via X-Workspace-Id (doc 08 §1.4).
+ */
+export function getSignalDetail(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+): Promise<SignalDetailRead> {
+  return request<SignalDetailRead>(
+    `/signals/${encodeURIComponent(signalId)}/detail`,
+    { token, workspaceId },
+  );
 }

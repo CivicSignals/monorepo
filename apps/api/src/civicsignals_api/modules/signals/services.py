@@ -994,6 +994,261 @@ class WorkspaceFeedPage:
     next_cursor: str | None
 
 
+# ---------------------------------------------------------------------------
+# The G2 signal-detail read seam (doc 07 §2, doc 14 §5.3)
+# ---------------------------------------------------------------------------
+#
+# The detail page (G2) shows one signal in full: the global signal core, the
+# *calling workspace's* score / breakdown / status (when the signal scored into
+# this workspace's feed — the row is workspace-scoped, never another tenant's),
+# the source documents that corroborate it, the suggested contacts at the
+# signal's entity, and related signals about the same entity. The cross-module
+# data (source docs, contacts, entity name) is fetched through the owning
+# module's ``services.py`` only — no module reaches into another's models
+# (doc 06 §3) — so this aggregator imports ``ingestion.services`` /
+# ``contacts.services`` / ``entities.services`` lazily at call time (the same
+# one-directional, explicit-at-call-site pattern as the F3 scorer above).
+
+# How many related signals + suggested contacts the detail view surfaces. Bounded
+# so the detail read stays a fixed handful of cheap queries (the full lists live on
+# the entity profile / contacts pages).
+RELATED_SIGNALS_LIMIT: int = 10
+SUGGESTED_CONTACTS_LIMIT: int = 10
+
+
+@dataclass(slots=True)
+class SignalSourceDocument:
+    """One corroborating source document for a signal (G2; doc 19 §7.3).
+
+    A lightweight provenance projection of an ``ingestion_raw_document`` row
+    (resolved via ``ingestion.services.get_raw_document``) — the originating URL,
+    recipe, fetch time, and content type so the detail page can list "where this
+    came from" and deep-link to the source. ``missing`` flags a referenced id that
+    no longer resolves (a doc pruned after the signal was stored) so the UI can
+    show a tombstone rather than silently dropping it.
+    """
+
+    raw_document_id: uuid.UUID
+    recipe_id: str | None
+    source_url: str | None
+    fetched_at: datetime | None
+    content_type: str | None
+    missing: bool = False
+
+
+@dataclass(slots=True)
+class SuggestedContact:
+    """One suggested contact at the signal's entity (G2; doc 07 §2 contacts).
+
+    A projection of a global ``contacts_contact`` row (via
+    ``contacts.services.list_contacts_for_entity``). Contacts are global per entity
+    (doc 07 §3), so this is the same directory the entity profile shows — surfaced
+    here so a user acting on a signal can reach the right person without leaving the
+    detail page. ``None`` entity → no suggestions (an unresolved signal, doc 19 §4.3).
+    """
+
+    contact_id: uuid.UUID
+    name: str
+    title: str | None
+    department: str | None
+    canonical_email: str | None
+    status: str
+    verified: bool
+
+
+@dataclass(slots=True)
+class RelatedSignal:
+    """One related signal about the same entity (G2; doc 14 §5.3).
+
+    Other (non-merged) signals for the signal's resolved entity, newest-first,
+    excluding the signal itself. Carries the global signal core only — the related
+    signal's per-workspace score is not joined here (the user can open it to see
+    that). ``None`` entity → no related signals (cannot relate by entity).
+    """
+
+    signal: SignalRead
+
+
+@dataclass(slots=True)
+class WorkspaceSignalDetail:
+    """The full G2 signal-detail view for one (workspace, signal) pair.
+
+    Aggregates the global signal, the calling workspace's score row (when present —
+    a signal can be opened by id even if it did not score into this workspace's
+    feed, in which case ``score``/``status``/``score_breakdown`` are ``None``), the
+    resolved entity name, the corroborating source documents, the suggested contacts
+    at the entity, and the related signals about the same entity. The
+    ``extracted_fields`` is the validated per-type payload (``details_jsonb``) lifted
+    out for the "Extracted fields" + inspect panel; it is the same map as
+    ``signal.details`` (surfaced explicitly so the UI need not reach into ``signal``).
+    """
+
+    signal: SignalRead
+    entity_id: uuid.UUID | None
+    entity_name: str | None
+    score: float | None
+    status: str | None
+    score_breakdown: dict[str, Any] | None
+    matched_keywords: list[str]
+    extracted_fields: dict[str, Any]
+    source_documents: list[SignalSourceDocument]
+    suggested_contacts: list[SuggestedContact]
+    related_signals: list[RelatedSignal]
+
+
+async def _related_signals_for_entity(
+    session: AsyncSession,
+    *,
+    entity_id: uuid.UUID,
+    exclude_signal_id: uuid.UUID,
+    limit: int,
+) -> list[RelatedSignal]:
+    """Load up to ``limit`` non-merged signals for an entity, newest-first (G2).
+
+    Excludes the signal being viewed and any soft-deleted (``merged``) rows so the
+    detail page's "Related signals" section mirrors what ``list_signals`` would show
+    for the same entity (doc 19 §7.4 merged rows stay hidden).
+    """
+    stmt = (
+        select(Signal)
+        .where(Signal.entity_id == entity_id)
+        .where(Signal.id != exclude_signal_id)
+        .where(Signal.status != SIGNAL_STATUS_MERGED)
+        .order_by(Signal.observed_at.desc(), Signal.id.desc())
+        .limit(limit)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    return [RelatedSignal(signal=SignalRead.model_validate(r)) for r in rows]
+
+
+async def _source_documents_for_signal(
+    session: AsyncSession,
+    raw_document_ids: Sequence[uuid.UUID],
+) -> list[SignalSourceDocument]:
+    """Resolve a signal's ``raw_document_ids`` to source-document projections (G2).
+
+    Reads each referenced ``ingestion_raw_document`` through
+    ``ingestion.services.get_raw_document`` (the owning module's seam, doc 06 §3); a
+    referenced id that no longer resolves is kept as a ``missing`` tombstone so the
+    provenance list stays complete and explainable.
+    """
+    from civicsignals_api.modules.ingestion import services as ingestion_services
+
+    docs: list[SignalSourceDocument] = []
+    for doc_id in raw_document_ids:
+        stored = await ingestion_services.get_raw_document(session, doc_id)
+        if stored is None:
+            docs.append(SignalSourceDocument(raw_document_id=doc_id, recipe_id=None,
+                                             source_url=None, fetched_at=None,
+                                             content_type=None, missing=True))
+            continue
+        docs.append(
+            SignalSourceDocument(
+                raw_document_id=stored.id,
+                recipe_id=stored.recipe_id,
+                source_url=stored.source_url,
+                fetched_at=stored.fetched_at,
+                content_type=stored.content_type,
+            )
+        )
+    return docs
+
+
+async def get_signal_detail(
+    session: AsyncSession,
+    *,
+    signal_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> WorkspaceSignalDetail | None:
+    """The full G2 detail view for one signal in one workspace's context.
+
+    Returns ``None`` only when the global signal does not exist (or is a soft-deleted
+    ``merged`` row — those are not directly viewable). A signal that exists but did
+    **not** score into the calling workspace's feed is still returned, with the
+    per-workspace fields (``score``/``status``/``score_breakdown``) left ``None`` —
+    the signal corpus is global (doc 07 §3), so the detail page can be reached by id
+    (e.g. a shared link) even from a workspace whose ICP did not match it.
+
+    The per-workspace score row is read **scoped to the calling workspace** via the
+    ``(workspace_id, signal_id)`` unique key — workspace A can never read workspace
+    B's score for the same global signal (doc 14 §5.3). Source documents, suggested
+    contacts, and the resolved entity name come through the owning modules'
+    ``services.py`` (doc 06 §3). Related signals are other non-merged signals for the
+    same entity. The caller does not commit (this only reads).
+
+    TODO F4: the "Why this signal?" panel renders human-readable bullets from
+    ``score_breakdown`` — the structured breakdown is already returned here.
+    TODO G4: status transitions (dismiss/pin/push) will PATCH the score row this
+    view reads ``status`` from.
+    """
+    signal = await session.get(Signal, signal_id)
+    if signal is None or signal.status == SIGNAL_STATUS_MERGED:
+        return None
+
+    # The calling workspace's score row for this signal, if any (scoped to the
+    # workspace — never another tenant's). A signal can be viewed without a score
+    # row (it simply did not match this workspace's ICP); the per-workspace fields
+    # stay None in that case.
+    score_row = (
+        await session.execute(
+            select(WorkspaceScore)
+            .where(WorkspaceScore.workspace_id == workspace_id)
+            .where(WorkspaceScore.signal_id == signal_id)
+        )
+    ).scalar_one_or_none()
+
+    entity_id = signal.entity_id
+    entity_name: str | None = signal.entity_name_raw
+    suggested_contacts: list[SuggestedContact] = []
+    related_signals: list[RelatedSignal] = []
+    if entity_id is not None:
+        from civicsignals_api.modules.contacts import services as contact_services
+        from civicsignals_api.modules.entities import services as entity_services
+
+        entity = await entity_services.get_entity(session, entity_id)
+        if entity is not None:
+            entity_name = entity.name
+        contact_page = await contact_services.list_contacts_for_entity(
+            session, entity_id, limit=SUGGESTED_CONTACTS_LIMIT
+        )
+        suggested_contacts = [
+            SuggestedContact(
+                contact_id=c.id,
+                name=c.name,
+                title=c.title,
+                department=c.department,
+                canonical_email=c.canonical_email,
+                status=c.status,
+                verified=c.verified,
+            )
+            for c in contact_page.items
+        ]
+        related_signals = await _related_signals_for_entity(
+            session,
+            entity_id=entity_id,
+            exclude_signal_id=signal_id,
+            limit=RELATED_SIGNALS_LIMIT,
+        )
+
+    source_documents = await _source_documents_for_signal(
+        session, [uuid.UUID(d) for d in signal.raw_document_ids]
+    )
+
+    return WorkspaceSignalDetail(
+        signal=SignalRead.model_validate(signal),
+        entity_id=entity_id,
+        entity_name=entity_name,
+        score=float(score_row.score) if score_row is not None else None,
+        status=score_row.status if score_row is not None else None,
+        score_breakdown=score_row.score_breakdown if score_row is not None else None,
+        matched_keywords=list(score_row.matched_keywords) if score_row is not None else [],
+        extracted_fields=dict(signal.details),
+        source_documents=source_documents,
+        suggested_contacts=suggested_contacts,
+        related_signals=related_signals,
+    )
+
+
 async def list_workspace_signals(
     session: AsyncSession,
     *,
@@ -1114,10 +1369,12 @@ __all__ = [
     "HIGH_STAKES_TYPES",
     "MAX_LIMIT",
     "PAYLOAD_BY_TYPE",
+    "RELATED_SIGNALS_LIMIT",
     "REVIEW_STATUS_APPROVED",
     "REVIEW_STATUS_PENDING",
     "REVIEW_STATUS_REJECTED",
     "SIGNAL_STATUS_MERGED",
+    "SUGGESTED_CONTACTS_LIMIT",
     "BandThresholds",
     "CandidateInput",
     "ConfidenceBand",
@@ -1130,6 +1387,7 @@ __all__ = [
     "FuzzyReviewNotFoundError",
     "FuzzyReviewSignalMissingError",
     "IcpCriteria",
+    "RelatedSignal",
     "ScoreResult",
     "ScoringConfig",
     "SignalDimensions",
@@ -1137,12 +1395,15 @@ __all__ = [
     "SignalPage",
     "SignalPayload",
     "SignalRead",
+    "SignalSourceDocument",
     "SignalType",
     "SignalValidationError",
+    "SuggestedContact",
     "WorkspaceFeedItem",
     "WorkspaceFeedPage",
     "WorkspaceScore",
     "WorkspaceScoreResult",
+    "WorkspaceSignalDetail",
     "backfill_embeddings",
     "build_embedding_text",
     "candidate_icp_filter",
@@ -1159,6 +1420,7 @@ __all__ = [
     "find_duplicate",
     "get_fuzzy_review",
     "get_signal",
+    "get_signal_detail",
     "is_high_stakes_type",
     "list_fuzzy_reviews",
     "list_signals",

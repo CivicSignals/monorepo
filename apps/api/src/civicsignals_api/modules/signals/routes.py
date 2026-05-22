@@ -13,6 +13,7 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   GET  /signals/fuzzy-reviews/{id}           — get one review row
   POST /signals/fuzzy-reviews/{id}/approve   — approve → merge candidate into match
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
+  GET  /signals/{id}/detail                  — workspace-scoped signal detail (G2)
   GET  /signals/{id}                         — get one signal
 
 Route ordering note: ``/feed``, ``/fuzzy-reviews`` and their sub-paths MUST be
@@ -42,8 +43,15 @@ from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import RequireAdmin, RequireViewer
 
 from . import services
-from .schemas import SignalPage, SignalRead
-from .services import WorkspaceFeedPage
+from .schemas import (
+    RelatedSignalRead,
+    SignalDetailRead,
+    SignalPage,
+    SignalRead,
+    SourceDocumentRead,
+    SuggestedContactRead,
+)
+from .services import WorkspaceFeedPage, WorkspaceSignalDetail
 
 router = APIRouter(prefix="/signals", tags=["signals"])
 
@@ -406,6 +414,72 @@ async def reject_fuzzy_review(
         )
     await session.commit()
     return FuzzyReviewRead.model_validate(row)
+
+
+# ---------------------------------------------------------------------------
+# G2 signal-detail endpoint — workspace-scoped composite read.
+#
+# Registered before the bare ``/{signal_id}`` (below): ``/{signal_id}/detail`` is
+# a deeper path so FastAPI matches it first, but ordering it here keeps the
+# convention (more-specific routes precede the catch-all) explicit.
+# ---------------------------------------------------------------------------
+
+
+def _signal_detail(detail: WorkspaceSignalDetail) -> SignalDetailRead:
+    """Convert the service-layer :class:`WorkspaceSignalDetail` to the HTTP shape."""
+    return SignalDetailRead(
+        signal=detail.signal,
+        entity_id=detail.entity_id,
+        entity_name=detail.entity_name,
+        score=detail.score,
+        status=detail.status,
+        score_breakdown=detail.score_breakdown,
+        matched_keywords=detail.matched_keywords,
+        extracted_fields=detail.extracted_fields,
+        source_documents=[
+            SourceDocumentRead.model_validate(d) for d in detail.source_documents
+        ],
+        suggested_contacts=[
+            SuggestedContactRead.model_validate(c) for c in detail.suggested_contacts
+        ],
+        related_signals=[
+            RelatedSignalRead(signal=r.signal) for r in detail.related_signals
+        ],
+    )
+
+
+@router.get(
+    "/{signal_id}/detail",
+    response_model=SignalDetailRead,
+    summary="Workspace-scoped signal detail (G2)",
+)
+async def get_signal_detail(
+    signal_id: uuid.UUID,
+    ctx: RequireViewer,
+    session: SessionDep,
+) -> SignalDetailRead | JSONResponse:
+    """Full signal-detail view in the calling workspace's context (G2).
+
+    Returns the global signal plus the calling workspace's score / status / breakdown
+    (``None`` when the signal did not score into this workspace's feed — the corpus is
+    global, doc 07 §3, so a signal stays viewable by id), the validated extracted
+    fields, the corroborating source documents, the suggested contacts at the
+    signal's entity, and related signals about the same entity (doc 14 §5.3). The
+    per-workspace score row is read scoped to the calling workspace (``RequireViewer``
+    resolves the workspace from :class:`WorkspaceContext`, never a query param), so
+    one workspace can never read another's score (doc 08 §1.4).
+
+    404 (RFC 7807) when the signal does not exist or is a soft-deleted ``merged`` row.
+
+    TODO F4: the "Why this signal?" panel renders bullets from ``score_breakdown``.
+    TODO G4: per-signal status transitions (dismiss/pin/push) will PATCH the score row.
+    """
+    detail = await services.get_signal_detail(
+        session, signal_id=signal_id, workspace_id=ctx.workspace.id
+    )
+    if detail is None:
+        return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
+    return _signal_detail(detail)
 
 
 # ---------------------------------------------------------------------------

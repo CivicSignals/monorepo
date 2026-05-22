@@ -12,11 +12,11 @@
 //   not workspace-level client state).
 //
 // Seams:
-// - TODO G2: click-through to /signals/[id] detail page.
 // - TODO G5: polish loading skeletons / empty / error states.
 
 "use client";
 
+import Link from "next/link";
 import type { FeedItemRead, FeedFilters, SignalType, FeedStatus } from "@/lib/signals-api";
 import { SIGNAL_TYPE_LABELS } from "@/lib/signals-api";
 import { useWorkspaceFeed } from "@/hooks/use-signals";
@@ -51,7 +51,6 @@ function FeedItemCard({ item }: { item: FeedItemRead }) {
   const sig = item.signal;
 
   return (
-    // TODO G2: replace with <Link href={`/signals/${sig.id}`}> once detail page lands.
     <article
       data-testid="feed-item"
       className="border border-gray-200 rounded-lg p-4 hover:border-gray-300 hover:shadow-sm transition-all bg-white"
@@ -69,10 +68,15 @@ function FeedItemCard({ item }: { item: FeedItemRead }) {
               <span className="text-xs text-gray-500 capitalize">{item.status}</span>
             )}
           </div>
-          {/* Title: link to detail placeholder (G2) */}
+          {/* Title links to the signal detail page (G2). */}
           <h3 className="text-sm font-semibold text-gray-900 line-clamp-2 mb-1">
-            {/* TODO G2: wrap in <Link href={`/signals/${sig.id}`}> */}
-            {sig.title}
+            <Link
+              href={`/signals/${sig.id}`}
+              data-testid="feed-item-link"
+              className="hover:text-indigo-700 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500"
+            >
+              {sig.title}
+            </Link>
           </h3>
           {/* Summary */}
           <p className="text-xs text-gray-500 line-clamp-2 mb-2">{sig.summary}</p>

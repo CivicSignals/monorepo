@@ -5,14 +5,17 @@
 //
 // useWorkspaceFeed   — paginated, filterable workspace feed (score desc)
 // useLoadMoreFeed    — cursor "load more" by appending pages
+// useSignalDetail    — one signal's full detail view (G2)
 
 "use client";
 
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import {
   type FeedFilters,
   type FeedPage,
+  type SignalDetailRead,
   FEED_PAGE_LIMIT,
+  getSignalDetail,
   listFeedSignals,
 } from "@/lib/signals-api";
 import { useSessionStore } from "@/store/session";
@@ -34,6 +37,8 @@ export const feedKeys = {
     [...feedKeys.all, workspaceId ?? "none"] as const,
   list: (workspaceId: string | null, filters: Omit<FeedFilters, "cursor">) =>
     [...feedKeys.workspace(workspaceId), "list", filters] as const,
+  detail: (workspaceId: string | null, signalId: string) =>
+    [...feedKeys.workspace(workspaceId), "detail", signalId] as const,
 };
 
 // ---- useWorkspaceFeed -------------------------------------------------------
@@ -71,5 +76,33 @@ export function useWorkspaceFeed(filters: Omit<FeedFilters, "cursor"> = {}) {
     getNextPageParam: (lastPage) =>
       lastPage.page.has_more ? lastPage.page.next_cursor : undefined,
     enabled: token !== null && workspaceId !== null,
+  });
+}
+
+// ---- useSignalDetail --------------------------------------------------------
+
+/**
+ * Query hook for a single signal's full detail view (G2).
+ *
+ * Workspace-scoped: the query key includes workspaceId so the per-workspace
+ * score/status never bleeds across workspace switches. Returns the global signal
+ * plus source documents, suggested contacts, and related signals.
+ *
+ * Server state only — do NOT put detail data in Zustand (doc 06 §2).
+ */
+export function useSignalDetail(signalId: string | undefined) {
+  const { token, workspaceId } = useAuth();
+
+  return useQuery<SignalDetailRead, Error>({
+    queryKey: feedKeys.detail(workspaceId, signalId ?? "none"),
+    queryFn: () => {
+      // Guarded by `enabled`; the non-null assertions are safe here.
+      return getSignalDetail(token!, workspaceId!, signalId!);
+    },
+    enabled:
+      token !== null &&
+      workspaceId !== null &&
+      signalId !== undefined &&
+      signalId !== "",
   });
 }

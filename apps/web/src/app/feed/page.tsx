@@ -10,7 +10,7 @@
 // - activeWorkspaceId in Zustand UI store selects which workspace to load for.
 //
 // Seams:
-// - TODO G2: signal detail page at /signals/[id].
+// - G2 (done): feed rows link through to the signal detail page at /signals/[id].
 // - TODO G3: bulk actions (dismiss/pin batch).
 // - TODO G4: per-signal status transitions.
 // - TODO G5: polished loading/empty/error states (leave the FeedList seams).
@@ -57,7 +57,6 @@ function FeedPageInner() {
 
   return (
     <>
-      {/* TODO G2: link to /signals/[id] from each card */}
       {/* TODO G3: bulk action bar */}
       {/* TODO G5: polished empty / error states */}
       <FeedList filters={filters} onFiltersChange={handleFiltersChange} />

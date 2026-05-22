@@ -343,3 +343,76 @@ class SignalPage(BaseModel):
 
     items: list[SignalRead]
     next_cursor: str | None = None
+
+
+# --- G2 signal-detail read shapes (the detail page; doc 14 §5.3) ---------------
+
+
+class SourceDocumentRead(BaseModel):
+    """One corroborating source document on the signal-detail page (G2).
+
+    A provenance projection of an ``ingestion_raw_document`` row: where the signal
+    came from and when it was fetched. ``missing`` flags a referenced id that no
+    longer resolves (a doc pruned after the signal was stored).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    raw_document_id: uuid.UUID
+    recipe_id: str | None
+    source_url: str | None
+    fetched_at: datetime | None
+    content_type: str | None
+    missing: bool = False
+
+
+class SuggestedContactRead(BaseModel):
+    """One suggested contact at the signal's entity on the detail page (G2).
+
+    A projection of a global ``contacts_contact`` row (contacts are global per
+    entity, doc 07 §3) — surfaced so a user acting on a signal can reach the right
+    person without leaving the page.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    contact_id: uuid.UUID
+    name: str
+    title: str | None
+    department: str | None
+    canonical_email: str | None
+    status: str
+    verified: bool
+
+
+class RelatedSignalRead(BaseModel):
+    """One related signal about the same entity on the detail page (G2)."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    signal: SignalRead
+
+
+class SignalDetailRead(BaseModel):
+    """The full signal-detail view for one (workspace, signal) pair (G2).
+
+    The global signal plus the calling workspace's score / status / breakdown (all
+    ``None`` when the signal did not score into this workspace's feed — the corpus is
+    global, so a signal is viewable by id regardless), the validated extracted
+    fields, the corroborating source documents, the suggested contacts at the
+    signal's entity, and the related signals about the same entity (doc 14 §5.3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal: SignalRead
+    entity_id: uuid.UUID | None
+    entity_name: str | None
+    score: float | None
+    status: str | None
+    score_breakdown: dict[str, object] | None
+    matched_keywords: list[str]
+    extracted_fields: dict[str, object]
+    source_documents: list[SourceDocumentRead]
+    suggested_contacts: list[SuggestedContactRead]
+    related_signals: list[RelatedSignalRead]
