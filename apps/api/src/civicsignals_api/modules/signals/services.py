@@ -293,13 +293,10 @@ async def store_signal(
             now=now,
         )
         if fuzzy_result.auto_merged and fuzzy_result.matched_signal_id is not None:
-            # Auto-merge folded the new evidence into the surviving signal; soft-delete
-            # the candidate row so it no longer surfaces in list_signals / feed queries.
-            # The row is kept for the audit trail (its raw_document_ids were merged into
-            # the surviving signal by run_fuzzy_dedupe → merge_signal above).
-            row.status = SIGNAL_STATUS_MERGED
-            row.merged_into = fuzzy_result.matched_signal_id
-            await session.flush()
+            # Auto-merge folded the new evidence into the surviving signal;
+            # run_fuzzy_dedupe already set candidate.status=merged + merged_into.
+            # Return the matched (surviving) signal so callers always receive the
+            # authoritative deduped signal.
             surviving = await session.get(Signal, fuzzy_result.matched_signal_id)
             if surviving is not None:
                 return surviving
