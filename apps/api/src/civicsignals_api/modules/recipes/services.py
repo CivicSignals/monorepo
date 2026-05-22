@@ -16,8 +16,10 @@ staff preview endpoint both go through the functions here.
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -143,6 +145,29 @@ async def persist_dead_letters(
 # ----------------------------------------------------------------------------
 
 
+def _validate_preview_url(url: str) -> None:
+    """Guard against SSRF: only allow http/https, reject loopback/link-local/private IPs.
+
+    Hostname targets (non-IP) are allowed through; network-level egress controls
+    or a dedicated egress proxy are the second line of defense for those. We block
+    obvious numeric IP targets to prevent accidental access to the cloud metadata
+    endpoint (169.254.169.254), loopback (127.x / ::1), RFC-1918, and ULA ranges.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise RecipeError("preview URL must use http or https")
+    host = parsed.hostname or ""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return  # not an IP literal — hostname, allow through
+    if addr.is_loopback or addr.is_link_local or addr.is_private or addr.is_reserved:
+        raise RecipeError(
+            f"preview URL targets a non-routable address ({host!r}); "
+            "internal / loopback / link-local / private addresses are not allowed"
+        )
+
+
 def _resolve_recipe(request: PreviewRequest) -> Recipe:
     """Resolve a :class:`PreviewRequest` to a parsed recipe (id XOR inline YAML)."""
     if (request.recipe_id is None) == (request.recipe_yaml is None):
@@ -175,6 +200,7 @@ def preview_recipe(
         return preview_html(recipe, request.html)
 
     assert request.url is not None  # narrowed by the XOR check above
+    _validate_preview_url(request.url)
     if fetcher is not None:
         return preview_url(recipe, request.url, fetcher)
     with HttpxFetcher() as live_fetcher:

@@ -13,11 +13,16 @@ the schema, the scaffold fails loudly instead of emitting a broken file).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
 
 from .runner import RecipeError, recipes_dir, validate_recipe_data
+
+# Recipe ids and connector names must be safe identifiers so they can be
+# substituted into the YAML template via str.format without injection risk.
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 # A minimal but complete, schema-valid recipe. ``{recipe_id}`` / ``{connector}``
 # are substituted in. Required-field guidance is inline so an author knows what
@@ -67,9 +72,19 @@ def render_recipe(recipe_id: str, *, connector: str = "http_static") -> str:
 
     Returns the YAML text without touching the filesystem — handy for the CLI's
     ``--stdout`` mode and for tests. Raises :class:`RecipeError` if ``recipe_id``
-    is not a valid id per the schema's pattern, or if the rendered skeleton ever
-    fails validation.
+    or ``connector`` is not a valid identifier per ``[a-z0-9][a-z0-9_-]*``, or
+    if the rendered skeleton ever fails validation (template/schema drift).
     """
+    if not _ID_RE.match(recipe_id):
+        raise RecipeError(
+            f"recipe_id {recipe_id!r} must match [a-z0-9][a-z0-9_-]* "
+            "(lowercase letters, digits, hyphens, underscores; must start with letter/digit)"
+        )
+    if not _ID_RE.match(connector):
+        raise RecipeError(
+            f"connector {connector!r} must match [a-z0-9][a-z0-9_-]* "
+            "(lowercase letters, digits, hyphens, underscores; must start with letter/digit)"
+        )
     text = _TEMPLATE.format(recipe_id=recipe_id, connector=connector)
     data = yaml.safe_load(text)
     # Defensive: the template should always be valid; surface drift loudly.

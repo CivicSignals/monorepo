@@ -224,6 +224,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
+    # Handle --help/-h explicitly before the backward-compat check so they are
+    # not silently treated as recipe ids and passed to fixture replay.
+    if args and args[0] in ("-h", "--help"):
+        _build_parser().print_help()
+        return 0
+
     # Backward-compat (D1): no subcommand -> fixture replay over the given ids.
     if not args or args[0] not in _SUBCOMMANDS:
         return _cmd_test(args)

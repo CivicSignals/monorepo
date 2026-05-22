@@ -819,14 +819,16 @@ class RecipeRunner:
     def field_values(self, html: str) -> dict[str, str | None]:
         """Per-field extracted values for ``html`` — public, never raises.
 
-        A *non-raising* sibling of :meth:`extract`: it returns every declared
-        field's value (``None`` for a miss, including a missing required field)
-        rather than rejecting at the boundary. The authoring preview (D5) needs
-        the full field-level picture even when a required field is absent, so
-        this gives it a supported surface instead of reaching into the
-        extraction internals. Uses the same parse + extraction path as
-        :meth:`extract`; selecting the matching selector / fallback handling is
-        the runner's concern (D11), not the caller's.
+        A *non-raising*, **selector-only** sibling of :meth:`extract`: it runs
+        only the CSS-selector chain (primary → fallback selectors, via
+        :func:`_extract_field`) for each field and returns every declared
+        field's value (``None`` for a miss). It does *not* invoke the
+        LLM-assisted rung (``llm_extractor``) or the dead-letter path that
+        :meth:`preview_extract` / :meth:`extract` use via :meth:`_resolve_field`.
+        Use :meth:`preview_extract` when the full extraction picture — including
+        LLM-assisted fallback and per-field diagnostics — is required (D5 authoring
+        preview). This method is still useful for fast, network-free selector
+        smoke-tests where LLM assistance is not needed.
         """
         doc = ParsedDocument(_parse_html(html), html)
         return {

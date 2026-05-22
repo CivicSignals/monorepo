@@ -6,9 +6,8 @@
 //
 // TODO B7: this is a staff/admin surface. Real route-level RBAC gating lands
 // with auth (B1) + roles (B7); the API endpoint enforces the interim staff
-// token gate today. Until B7 lands, the staff token can be injected via the
-// NEXT_PUBLIC_RECIPE_PREVIEW_STAFF_TOKEN env var or entered directly in the
-// form below.
+// token gate today. Staff supply the token directly in the form (never injected
+// server-side to avoid leaking it in the RSC payload).
 import { RecipePreviewForm } from "@/components/admin/recipe-preview-form";
 
 export const metadata = {
@@ -16,15 +15,6 @@ export const metadata = {
 };
 
 export default function RecipePreviewPage() {
-  // Read the token from the server-only env var so it is never bundled into
-  // client JS. The form receives it as an initial value for the token input
-  // (which users can override); the actual fetch happens client-side so the
-  // header is sent at runtime, not baked into the bundle. Operators set this in
-  // their deployment env; in local dev the API gate is open when the var is
-  // absent (environment == "development"). TODO B7: replace with a session-
-  // scoped credential once real RBAC is in place.
-  const envToken = process.env.RECIPE_PREVIEW_STAFF_TOKEN ?? "";
-
   return (
     <main className="container max-w-4xl py-12">
       <header className="mb-8">
@@ -41,10 +31,10 @@ export default function RecipePreviewPage() {
         </p>
       </header>
 
-      {/* Pass the env token as the default; the form lets staff override it inline
-          so the page stays usable in environments where the env var is not set
-          (TODO B7: remove once real RBAC is in place). */}
-      <RecipePreviewForm defaultStaffToken={envToken} />
+      {/* No server-side token injection: the RSC payload is visible in the
+          browser, so passing a secret here would leak it. Staff paste the token
+          directly in the form. TODO B7: gate on session auth instead. */}
+      <RecipePreviewForm />
     </main>
   );
 }

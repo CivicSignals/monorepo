@@ -53,22 +53,12 @@ function RadioGroup<T extends string>({
   );
 }
 
-export function RecipePreviewForm({
-  defaultStaffToken = "",
-}: {
-  /**
-   * The default X-Staff-Token value. The page injects this from the
-   * `NEXT_PUBLIC_RECIPE_PREVIEW_STAFF_TOKEN` env var so staff don't have to
-   * type it on every load. An inline text input lets them override it in
-   * environments where the env var is not set (TODO B7: remove once real RBAC
-   * is in place and the token gate is retired).
-   */
-  defaultStaffToken?: string;
-}) {
+export function RecipePreviewForm() {
   const [state, setState] = useState<PreviewFormState>(INITIAL_STATE);
-  // Inline token override: starts from the server-injected env default and lets
-  // staff paste a value directly in non-development environments.
-  const [staffToken, setStaffToken] = useState<string>(defaultStaffToken);
+  // The staff token is client-only state — never injected server-side to avoid
+  // leaking it in the RSC payload. Staff paste it directly into the form.
+  // TODO B7: remove this field and gate on the session credential instead.
+  const [staffToken, setStaffToken] = useState<string>("");
 
   const mutation = useMutation<PreviewResult, Error, PreviewFormState>({
     mutationFn: (formState) =>
@@ -90,9 +80,10 @@ export function RecipePreviewForm({
   return (
     <div className="space-y-6">
       <form onSubmit={onSubmit} className="space-y-5" aria-label="Recipe preview">
-        {/* Staff token gate (TODO B7). Always shown so staff can supply or change
-            it in any environment; the server injects a default value from the
-            server-only env var so it is pre-filled when the operator has set it. */}
+        {/* Staff token gate (TODO B7). Always shown; staff paste the token
+            directly in non-development environments where the API gate is
+            enabled. The value is never sent to the server as a prop — it
+            stays in client-only React state to avoid RSC payload exposure. */}
         <div className="space-y-1">
           <label
             htmlFor="staff-token"
