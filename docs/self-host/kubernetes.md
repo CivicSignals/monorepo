@@ -20,18 +20,19 @@ cd monorepo
 helm dependency update infra/helm/civicsignals
 
 # 3. Install with bundled datastores
-#    Service names inside the cluster will be:
+#    With release name "civicsignals" the rendered Service names are:
 #      Postgres:  civicsignals-postgresql:5432
 #      Redis:     civicsignals-redis-master:6379
 #      MinIO:     civicsignals-minio:9000
-#      PgBouncer: civicsignals-civicsignals-pgbouncer:6432
+#      PgBouncer: civicsignals-pgbouncer:6432
+#    (civicsignals.fullname = "civicsignals" when release name contains chart name)
 helm upgrade --install civicsignals infra/helm/civicsignals \
   --namespace civicsignals \
   --create-namespace \
   --set bundled.postgres.enabled=true \
   --set bundled.redis.enabled=true \
   --set bundled.minio.enabled=true \
-  --set secrets.databaseUrl="postgresql+asyncpg://civicsignals:civicsignals@civicsignals-civicsignals-pgbouncer:6432/civicsignals" \
+  --set secrets.databaseUrl="postgresql+asyncpg://civicsignals:civicsignals@civicsignals-pgbouncer:6432/civicsignals" \
   --set secrets.databaseDirectUrl="postgresql+asyncpg://civicsignals:civicsignals@civicsignals-postgresql:5432/civicsignals" \
   --set secrets.celeryBrokerUrl="redis://civicsignals-redis-master:6379/1" \
   --set secrets.celeryResultBackend="redis://civicsignals-redis-master:6379/2" \
@@ -39,6 +40,7 @@ helm upgrade --install civicsignals infra/helm/civicsignals \
   --set config.s3EndpointUrl="http://civicsignals-minio:9000" \
   --set secrets.s3AccessKeyId="civicsignals" \
   --set secrets.s3SecretAccessKey="civicsignals" \
+  --set secrets.pgbouncerDbPassword="civicsignals" \
   --set secrets.secretKey="$(openssl rand -hex 32)" \
   --set ingress.web.host=civicsignals.example.com \
   --set ingress.api.host=api.civicsignals.example.com

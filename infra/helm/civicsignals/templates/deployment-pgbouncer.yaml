@@ -51,8 +51,10 @@ spec:
             # edoburu/pgbouncer expects individual connection parameters,
             # not a connection URL.  Override these via pgbouncer.extraEnv
             # or set pgbouncer.dbHost/dbUser/dbPassword/dbName in values.
+            # Default to <release>-postgresql which matches the Bitnami postgresql
+            # subchart Service name (alias: postgresql). Override for external RDS.
             - name: DB_HOST
-              value: {{ .Values.pgbouncer.dbHost | default (printf "%s-postgresql" (include "civicsignals.fullname" .)) | quote }}
+              value: {{ .Values.pgbouncer.dbHost | default (printf "%s-postgresql" .Release.Name) | quote }}
             - name: DB_PORT
               value: {{ .Values.pgbouncer.dbPort | default "5432" | quote }}
             - name: DB_USER

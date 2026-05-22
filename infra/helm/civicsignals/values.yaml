@@ -47,11 +47,12 @@ podAnnotations: {}
 podLabels: {}
 
 # Non-root security context (doc 06 §11)
+# UID/GID 1001 matches the 'appuser' created in the API Dockerfile.
 podSecurityContext:
   runAsNonRoot: true
-  runAsUser: 1000
-  runAsGroup: 1000
-  fsGroup: 1000
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
 
 containerSecurityContext:
   allowPrivilegeEscalation: false
@@ -171,7 +172,7 @@ workerIngest:
   enabled: true
   replicaCount: 2
   command: ["/app/docker-entrypoint.sh"]
-  # The entrypoint passes --concurrency $CELERY_CONCURRENCY when set (see templates).
+  # CELERYD_CONCURRENCY env var is natively read by Celery to set pool size.
   args: ["worker_ingest"]
 
   resources:
@@ -358,7 +359,9 @@ secrets:
   #   <release-name>-postgresql:5432
   # Alembic uses async_engine_from_config so both URLs must use an async driver.
   databaseUrl: "postgresql+asyncpg://civicsignals:CHANGEME@RELEASE-NAME-civicsignals-pgbouncer:6432/civicsignals"
-  databaseDirectUrl: "postgresql+asyncpg://civicsignals:CHANGEME@RELEASE-NAME-civicsignals-pgbouncer:6432/civicsignals"
+  # DATABASE_DIRECT_URL bypasses PgBouncer (port 5432) for Alembic DDL, LISTEN/NOTIFY.
+  # Must point at the raw Postgres service, NOT PgBouncer.
+  databaseDirectUrl: "postgresql+asyncpg://civicsignals:CHANGEME@RELEASE-NAME-postgresql:5432/civicsignals"
 
   # Celery broker + result backend (separate Redis DBs to avoid key collisions)
   # When using bundled Redis: redis://RELEASE-NAME-redis-master:6379/1
@@ -416,7 +419,7 @@ config:
   webBaseUrl: "https://civicsignals.example.com"
 
   # Celery concurrency per worker type.
-  # Passed via --concurrency flag in the worker entrypoint args.
+  # Injected as CELERYD_CONCURRENCY env var (read natively by Celery to set pool size).
   # Increase for CPU-bound workers; tune alongside resource limits.
   celeryIngestConcurrency: "4"
   celeryExtractConcurrency: "2"
@@ -425,43 +428,56 @@ config:
 
 # ---------------------------------------------------------------------------
 # Bundled datastores (for evaluation / local K8s; NOT for production)
-# Set bundled.*.enabled = true to deploy the subchart alongside the app.
-# When enabled, values below override the subchart's own defaults.
+# Set bundled.*.enabled = true to include the subchart.
+# Each `enabled` flag is read by Chart.yaml dependency conditions.
+#
+# Subchart configuration lives under the top-level alias keys below
+# (postgresql / redis / minio) which Helm passes to each subchart.
 # ---------------------------------------------------------------------------
 bundled:
   postgres:
     enabled: false
-    auth:
-      username: civicsignals
-      password: civicsignals
-      database: civicsignals
-    primary:
-      persistence:
-        enabled: true
-        size: 10Gi
-    # pgvector extension — handled via initdbScripts in bundled postgres
+  redis:
+    enabled: false
+  minio:
+    enabled: false
+
+# Bitnami postgresql subchart values (alias: postgresql).
+# Only applied when bundled.postgres.enabled=true.
+postgresql:
+  auth:
+    username: civicsignals
+    password: civicsignals
+    database: civicsignals
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+    # pgvector extension — created via initdbScripts on first boot
     initdbScripts:
       enable_pgvector.sql: |
         CREATE EXTENSION IF NOT EXISTS vector;
 
-  redis:
+# Bitnami redis subchart values (alias: redis).
+# Only applied when bundled.redis.enabled=true.
+redis:
+  auth:
     enabled: false
-    auth:
-      enabled: false
-    master:
-      persistence:
-        enabled: true
-        size: 2Gi
-
-  minio:
-    enabled: false
-    auth:
-      rootUser: civicsignals
-      rootPassword: civicsignals
-    defaultBuckets: "civicsignals"
+  master:
     persistence:
       enabled: true
-      size: 20Gi
+      size: 2Gi
+
+# Bitnami minio subchart values (alias: minio).
+# Only applied when bundled.minio.enabled=true.
+minio:
+  auth:
+    rootUser: civicsignals
+    rootPassword: civicsignals
+  defaultBuckets: "civicsignals"
+  persistence:
+    enabled: true
+    size: 20Gi
 
 # ---------------------------------------------------------------------------
 # PgBouncer sidecar/deployment (transaction-mode connection pool)
