@@ -14,6 +14,9 @@ from civicsignals_api.config import get_settings
 from civicsignals_api.logging import configure_logging
 from civicsignals_api.middleware import RequestContextMiddleware
 from civicsignals_api.modules.admin.listeners import register_listeners
+from civicsignals_api.modules.signals.listeners import (
+    register_listeners as register_signals_listeners,
+)
 from civicsignals_api.otel import init_otel, instrument_app
 from civicsignals_api.problems import install_problem_handlers
 from civicsignals_api.sentry import init_sentry
@@ -64,6 +67,10 @@ def create_app() -> FastAPI:
     # audit rows.  Must be called after the router is mounted so the DB engine is
     # ready, but before the app starts serving requests.
     register_listeners()
+    # F3: score each new signal for every workspace whose ICP pre-filter matches,
+    # on ``signal.created`` (doc 14 §6) — the live matcher → scorer half of the
+    # global-signal → per-workspace-feed path.
+    register_signals_listeners()
 
     @app.get("/healthz", tags=["meta"])
     async def healthz() -> dict[str, str]:

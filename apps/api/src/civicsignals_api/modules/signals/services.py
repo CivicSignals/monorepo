@@ -33,11 +33,19 @@ from __future__ import annotations
 import base64
 import binascii
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import select
+import structlog
+from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from civicsignals_api.ids import uuid7
+from civicsignals_api.modules.entities.models import Entity
+from civicsignals_api.modules.icp.models import IcpDefinition
 
 from .dedupe import (
     DEDUPE_WINDOWS,
@@ -100,6 +108,24 @@ from .scoring import (
     config_from_recipe,
     score_candidate_confidence,
 )
+from .workspace_score_model import (
+    FEED_VISIBLE_STATUSES,
+    MATCHED_VIA_ICP,
+    SCORE_STATUSES,
+    WorkspaceScore,
+)
+from .workspace_scoring import (
+    DEFAULT_SCORING_CONFIG,
+    IcpCriteria,
+    KeywordExcludedError,
+    ScoringConfig,
+    SignalDimensions,
+    WorkspaceScoreResult,
+    score_signal_against_icp,
+    signal_matches_icp,
+)
+
+log = structlog.get_logger(__name__)
 
 # Pagination defaults (doc 06 §5, doc 08 §1.5).
 DEFAULT_LIMIT = 25
@@ -503,12 +529,496 @@ async def list_signals(
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-workspace matcher + scorer (F3, doc 14 §6)
+# ---------------------------------------------------------------------------
+#
+# The cheap pre-filter (doc 14 §6.1) is the SQL candidate query below; the full
+# score (doc 14 §6.2) blends the components in ``signals.workspace_scoring`` and
+# the result is sparse-upserted into ``signals_workspace_score`` when it clears the
+# ICP threshold (doc 14 §5.2, §6.2). The pure matcher predicate + blend math live in
+# ``workspace_scoring`` (no DB); this layer does the joins, the fan-out, and the
+# upsert. Cross-module callers reach all of this through ``signals.services``.
+
+
+def _icp_criteria(icp: IcpDefinition) -> IcpCriteria:
+    """Snapshot an ICP row into the matcher/scorer's pure :class:`IcpCriteria`.
+
+    Decouples the scorer from the ``icp`` ORM so ``workspace_scoring`` stays pure
+    (no DB import). Threshold is on the 0..100 scale shared with the score (doc 07
+    §icp, doc 14 §5.2).
+    """
+    return IcpCriteria(
+        signal_types=tuple(icp.signal_types),
+        countries=tuple(icp.countries),
+        states=tuple(icp.states),
+        entity_kinds=tuple(icp.entity_kinds),
+        min_size=icp.min_size,
+        max_size=icp.max_size,
+        signal_weights={k: float(v) for k, v in icp.signal_weights.items()},
+        keywords_required=tuple(icp.keywords_required),
+        keywords_excluded=tuple(icp.keywords_excluded),
+        threshold=float(icp.threshold),
+    )
+
+
+def _signal_dimensions(signal: Signal, entity: Entity | None) -> SignalDimensions:
+    """Resolve a signal's matchable dimensions from the signal + its entity (§6.1).
+
+    Country / state / entity-kind / size come from the resolved ``entities_entity``
+    (doc 14 §6.1); an unresolved signal (``entity_id`` NULL, doc 19 §4.3) carries no
+    geo/kind/size, so those stay ``None`` and only match an ICP that does not
+    restrict them.
+    """
+    size: int | None = None
+    country: str | None = None
+    state: str | None = None
+    entity_kind: str | None = None
+    if entity is not None:
+        country = entity.country
+        state = entity.state
+        entity_kind = entity.type
+        # Entity size = enrollment (school orgs) or population (general government),
+        # whichever the directory has — the band the ICP compares against (§6.1).
+        size = entity.enrollment if entity.enrollment is not None else entity.population
+    return SignalDimensions(
+        signal_type=signal.signal_type,
+        country=country,
+        state=state,
+        entity_kind=entity_kind,
+        size=size,
+    )
+
+
+def _signal_text_blob(signal: Signal) -> str:
+    """The text surface keyword scoring runs over (doc 14 §6.2).
+
+    Reuses the embedding text builder (title + summary + a few high-signal details
+    fields) so keyword matching and semantic matching share one surface.
+    """
+    return embedding_text_for_signal(signal)
+
+
+def candidate_icp_filter(dims: SignalDimensions) -> Any:
+    """The SQL pre-filter predicate matching ``signal_matches_icp`` (doc 14 §6.1).
+
+    Encodes "could this signal match this ICP?" as a WHERE clause over the
+    GIN-indexed ICP dimension columns: empty array == all values, else ``@>`` set
+    membership; the size band is a numeric range with NULL bounds meaning
+    open-ended (doc 14 §6.1). An unknown signal dimension (``None``) can only
+    satisfy an *unrestricted* ICP dimension — the same NULL-excludes rule the pure
+    :func:`~.workspace_scoring.signal_matches_icp` applies — so a restricting array
+    is required to be empty when the signal value is unknown.
+    """
+    clauses: list[Any] = [IcpDefinition.is_active.is_(True)]
+
+    def _array_clause(column: Any, value: str | None) -> Any:
+        # Empty TEXT[] == "all values" (doc 14 §6.1). ``func.cardinality`` is the
+        # portable "array is empty" test (avoids the SQLAlchemy ``== []`` warning).
+        empty = func.cardinality(column) == 0
+        if value is None:
+            # Unknown dimension: only an unrestricted (empty) ICP array matches.
+            return empty
+        return or_(empty, column.contains([value]))
+
+    clauses.append(_array_clause(IcpDefinition.signal_types, dims.signal_type))
+    clauses.append(_array_clause(IcpDefinition.countries, dims.country))
+    clauses.append(_array_clause(IcpDefinition.states, dims.state))
+    clauses.append(_array_clause(IcpDefinition.entity_kinds, dims.entity_kind))
+
+    if dims.size is None:
+        # Unknown size only satisfies an ICP with no size band (both bounds NULL).
+        clauses.append(IcpDefinition.min_size.is_(None))
+        clauses.append(IcpDefinition.max_size.is_(None))
+    else:
+        clauses.append(or_(IcpDefinition.min_size.is_(None), IcpDefinition.min_size <= dims.size))
+        clauses.append(or_(IcpDefinition.max_size.is_(None), IcpDefinition.max_size >= dims.size))
+    return and_(*clauses)
+
+
+async def _load_signal_with_entity(
+    session: AsyncSession, signal_id: uuid.UUID
+) -> tuple[Signal, Entity | None] | None:
+    """Load a signal + its (optional) resolved entity for scoring, or ``None``."""
+    signal = await session.get(Signal, signal_id)
+    if signal is None:
+        return None
+    entity: Entity | None = None
+    if signal.entity_id is not None:
+        entity = await session.get(Entity, signal.entity_id)
+    return signal, entity
+
+
+async def _upsert_score(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    result: WorkspaceScoreResult,
+) -> None:
+    """Sparse upsert one ``signals_workspace_score`` row (doc 14 §5.2, §7.3).
+
+    ``INSERT ... ON CONFLICT (workspace_id, signal_id) DO UPDATE`` so re-scoring (a
+    new signal arriving, an F6 backfill, an F5 re-weight) is idempotent — the score /
+    breakdown / matched flags are refreshed without resetting the user-owned
+    ``status`` (doc 14 §7.3: existing-still-valid rows are not reset). The caller
+    owns the transaction.
+    """
+    dims = result.matched
+    values = {
+        # UUID v7 (time-ordered) so the feed cursor's id tiebreaker stays stable
+        # and index locality holds (matches the model's ``default=uuid7``); a fresh
+        # id is only used on INSERT — the ON CONFLICT path keeps the existing row.
+        "id": uuid7(),
+        "workspace_id": workspace_id,
+        "signal_id": signal_id,
+        "score": result.score,
+        "score_breakdown": result.breakdown,
+        "matched_via": MATCHED_VIA_ICP,
+        "matched_signal_type": dims.signal_type,
+        "matched_country": dims.country,
+        "matched_state": dims.state,
+        "matched_entity_kind": dims.entity_kind,
+        "matched_size_band": dims.size_band,
+        "matched_keywords": list(result.matched_keywords),
+    }
+    stmt = pg_insert(WorkspaceScore).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_sws_workspace_signal",
+        set_={
+            "score": stmt.excluded.score,
+            "score_breakdown": stmt.excluded.score_breakdown,
+            "matched_signal_type": stmt.excluded.matched_signal_type,
+            "matched_country": stmt.excluded.matched_country,
+            "matched_state": stmt.excluded.matched_state,
+            "matched_entity_kind": stmt.excluded.matched_entity_kind,
+            "matched_size_band": stmt.excluded.matched_size_band,
+            "matched_keywords": stmt.excluded.matched_keywords,
+            "updated_at": datetime.now(UTC),
+        },
+    )
+    await session.execute(stmt)
+
+
+async def _delete_score(
+    session: AsyncSession, *, workspace_id: uuid.UUID, signal_id: uuid.UUID
+) -> None:
+    """Remove a stale score row (a re-score that now falls below threshold / excluded).
+
+    When a re-score (an ICP edit via F6, an F5 re-weight) drops a previously-matched
+    signal below the threshold or trips an excluded keyword, the existing row must go
+    so the feed no longer shows it (doc 14 §7.3 idempotency). A no-op when no row
+    exists. The caller owns the transaction.
+    """
+    await session.execute(
+        delete(WorkspaceScore).where(
+            WorkspaceScore.workspace_id == workspace_id,
+            WorkspaceScore.signal_id == signal_id,
+        )
+    )
+
+
+async def score_signal_for_workspace(
+    session: AsyncSession,
+    *,
+    signal_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    icp: IcpDefinition | None = None,
+    config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+    icp_vector: Sequence[float] | None = None,
+    now: datetime | None = None,
+) -> WorkspaceScoreResult | None:
+    """Score one signal against one workspace's active ICP (doc 14 §6.2).
+
+    The single-pair scorer F4/F6 build on. Loads the signal + its entity, snapshots
+    the workspace's active ICP (looked up via ``icp.services.get_active_icp`` unless
+    one is passed in), pre-filters (doc 14 §6.1), full-scores (doc 14 §6.2), and:
+
+    - **at/above threshold** → sparse-upsert a ``signals_workspace_score`` row and
+      return the :class:`~.workspace_scoring.WorkspaceScoreResult`;
+    - **below threshold / pre-filter miss / excluded keyword** → remove any stale row
+      and return ``None`` (the workspace simply does not see the signal, doc 14 §5.2).
+
+    The caller owns the transaction (this flushes via the session, not commits). The
+    optional ``icp_vector`` is the ICP-keyword embedding (I1) for the semantic
+    component; when ``None`` the score blends the structured + keyword signal alone
+    (the semantic weight renormalises away, doc 14 §6.2).
+    """
+    # Lazy import to avoid a module-load cycle (icp.services has no signals import,
+    # but keep the dependency one-directional + explicit at the call site).
+    from civicsignals_api.modules.icp import services as icp_services
+
+    loaded = await _load_signal_with_entity(session, signal_id)
+    if loaded is None:
+        return None
+    signal, entity = loaded
+
+    if icp is None:
+        icp = await icp_services.get_active_icp(session, workspace_id=workspace_id)
+    if icp is None:
+        # No active ICP → the workspace has no feed lens; nothing to score against.
+        await _delete_score(session, workspace_id=workspace_id, signal_id=signal_id)
+        return None
+
+    criteria = _icp_criteria(icp)
+    dims = _signal_dimensions(signal, entity)
+
+    if not signal_matches_icp(dims, criteria):
+        await _delete_score(session, workspace_id=workspace_id, signal_id=signal_id)
+        return None
+
+    try:
+        result = score_signal_against_icp(
+            dims,
+            criteria,
+            text_blob=_signal_text_blob(signal),
+            confidence=signal.confidence,
+            observed_at=signal.observed_at,
+            signal_vector=signal.vector_embedding,
+            icp_vector=icp_vector,
+            config=config,
+            now=now,
+        )
+    except KeywordExcludedError:
+        # Excluded keyword / no required-keyword hit → hard drop (doc 14 §3.1).
+        await _delete_score(session, workspace_id=workspace_id, signal_id=signal_id)
+        return None
+
+    if not result.passes_threshold:
+        await _delete_score(session, workspace_id=workspace_id, signal_id=signal_id)
+        return None
+
+    await _upsert_score(session, workspace_id=workspace_id, signal_id=signal_id, result=result)
+    return result
+
+
+async def score_signal_for_all_workspaces(
+    session: AsyncSession,
+    *,
+    signal_id: uuid.UUID,
+    config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+    now: datetime | None = None,
+) -> int:
+    """Fan a new signal out to every workspace whose ICP pre-filter matches (§6).
+
+    The live matcher path triggered on ``signal.created`` (doc 14 §4.1): resolve the
+    signal's dimensions, run the **cheap pre-filter** (doc 14 §6.1) as one indexed SQL
+    query that returns only candidate active ICPs (the matcher is workspace-blind to
+    non-overlapping ICPs — doc 14 §6.4), then full-score each candidate and sparse-
+    upsert the rows that clear threshold (doc 14 §6.2). Returns the number of score
+    rows written. The caller owns the transaction.
+
+    # TODO F6: this is the new-signal path. The ICP-change *backfill* (doc 14 §7) runs
+    # the same pre-filter over a historical signal window for one workspace — the
+    # symmetric direction — and upserts via the same ``_upsert_score`` seam.
+    """
+    loaded = await _load_signal_with_entity(session, signal_id)
+    if loaded is None:
+        return 0
+    signal, entity = loaded
+    dims = _signal_dimensions(signal, entity)
+
+    # Cheap pre-filter (doc 14 §6.1): one indexed query → only candidate ICPs.
+    candidates = list(
+        (await session.execute(select(IcpDefinition).where(candidate_icp_filter(dims))))
+        .scalars()
+        .all()
+    )
+
+    written = 0
+    for icp in candidates:
+        result = await score_signal_for_workspace(
+            session,
+            signal_id=signal_id,
+            workspace_id=icp.workspace_id,
+            icp=icp,
+            config=config,
+            now=now,
+        )
+        if result is not None:
+            written += 1
+    log.info(
+        "signals.workspace_score.fanout",
+        signal_id=str(signal_id),
+        candidates=len(candidates),
+        written=written,
+    )
+    return written
+
+
+async def score_workspace_candidates(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_ids: Sequence[uuid.UUID],
+    icp: IcpDefinition | None = None,
+    config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+    icp_vector: Sequence[float] | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Score a batch of candidate signals for one workspace (doc 14 §6.2, §7).
+
+    The workspace-centric direction the F6 backfill drives: given a set of candidate
+    signal ids (the backfill pre-filters the historical window into these), score
+    each against the workspace's active ICP and sparse-upsert the matches. Loads the
+    active ICP once (unless passed in) so a long backfill does not re-query it per
+    signal. Returns the number of score rows written. The caller owns the
+    transaction.
+    """
+    from civicsignals_api.modules.icp import services as icp_services
+
+    if icp is None:
+        icp = await icp_services.get_active_icp(session, workspace_id=workspace_id)
+    if icp is None:
+        return 0
+
+    written = 0
+    for signal_id in signal_ids:
+        result = await score_signal_for_workspace(
+            session,
+            signal_id=signal_id,
+            workspace_id=workspace_id,
+            icp=icp,
+            config=config,
+            icp_vector=icp_vector,
+            now=now,
+        )
+        if result is not None:
+            written += 1
+    return written
+
+
+# ---------------------------------------------------------------------------
+# The G1 feed read seam (doc 14 §5.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class WorkspaceFeedItem:
+    """One scored signal in a workspace's feed (the join of score + signal, §5.3).
+
+    Carries the ``signals_workspace_score`` row's score / breakdown / status / matched
+    flags alongside the global :class:`SignalRead` so G1 renders the feed item + its
+    "Why this signal?" panel from one read.
+    """
+
+    score_id: uuid.UUID
+    signal: SignalRead
+    score: float
+    status: str
+    score_breakdown: dict[str, Any]
+    matched_keywords: list[str]
+    created_at: datetime
+
+
+@dataclass(slots=True)
+class WorkspaceFeedPage:
+    """A cursor-paginated page of feed items (doc 06 §5)."""
+
+    items: list[WorkspaceFeedItem]
+    next_cursor: str | None
+
+
+async def list_workspace_signals(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_type: str | None = None,
+    statuses: Sequence[str] | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> WorkspaceFeedPage:
+    """The workspace feed: scored signals ranked highest-first (G1, doc 14 §5.3).
+
+    Reads ``signals_workspace_score`` for the workspace (workspace-scoped — never
+    another tenant's rows), joined to the global ``signals_signal`` row, ordered by
+    ``score DESC, created_at DESC, id DESC`` — the hot composite index (doc 14 §5.3).
+    Filters to the feed-visible statuses (new/reviewed/pinned) by default; pass
+    ``statuses`` to override (e.g. include ``dismissed`` for a "show hidden" view).
+    Optional ``signal_type`` narrows to one type.
+
+    Cursor pagination is keyset on the score row id (UUID v7, time-ordered) so the
+    opaque cursor is stable; we fetch ``limit + 1`` to decide ``next_cursor``. The id
+    tiebreaker keeps the ordering total even when many rows share a score.
+
+    This is what G1's feed UI calls; it is **the** per-workspace ranked surface F3
+    exists to produce (doc 14 §1).
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    if statuses is None:
+        # No filter requested → the default feed-visible statuses (doc 14 §5.3).
+        status_filter: Sequence[str] = FEED_VISIBLE_STATUSES
+    else:
+        # An explicit filter — drop unknown values. If the caller asked only for
+        # invalid statuses, the result is an *empty* feed (not "all statuses"): the
+        # request named no valid bucket, so nothing matches.
+        status_filter = [s for s in statuses if s in SCORE_STATUSES]
+        if not status_filter:
+            return WorkspaceFeedPage(items=[], next_cursor=None)
+
+    stmt = (
+        select(WorkspaceScore, Signal)
+        .join(Signal, Signal.id == WorkspaceScore.signal_id)
+        .where(WorkspaceScore.workspace_id == workspace_id)
+        .where(WorkspaceScore.status.in_(status_filter))
+    )
+    if signal_type is not None:
+        stmt = stmt.where(Signal.signal_type == signal_type)
+
+    if cursor is not None:
+        cursor_id = decode_cursor(cursor)
+        cursor_row = await session.get(WorkspaceScore, cursor_id)
+        if cursor_row is None or cursor_row.workspace_id != workspace_id:
+            raise ValueError("invalid cursor")
+        # Keyset on (score DESC, created_at DESC, id DESC): strictly "after" the
+        # cursor row in the feed order.
+        stmt = stmt.where(
+            or_(
+                WorkspaceScore.score < cursor_row.score,
+                and_(
+                    WorkspaceScore.score == cursor_row.score,
+                    WorkspaceScore.created_at < cursor_row.created_at,
+                ),
+                and_(
+                    WorkspaceScore.score == cursor_row.score,
+                    WorkspaceScore.created_at == cursor_row.created_at,
+                    WorkspaceScore.id < cursor_id,
+                ),
+            )
+        )
+
+    stmt = stmt.order_by(
+        WorkspaceScore.score.desc(),
+        WorkspaceScore.created_at.desc(),
+        WorkspaceScore.id.desc(),
+    ).limit(limit + 1)
+
+    rows = list((await session.execute(stmt)).all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = [
+        WorkspaceFeedItem(
+            score_id=score.id,
+            signal=SignalRead.model_validate(signal),
+            score=float(score.score),
+            status=score.status,
+            score_breakdown=score.score_breakdown,
+            matched_keywords=list(score.matched_keywords),
+            created_at=score.created_at,
+        )
+        for score, signal in rows
+    ]
+    next_cursor = encode_cursor(items[-1].score_id) if has_more and items else None
+    return WorkspaceFeedPage(items=items, next_cursor=next_cursor)
+
+
 __all__ = [
     "DEDUPE_WINDOWS",
     "DEFAULT_CONFIG",
     "DEFAULT_DEDUPE_WINDOW",
     "DEFAULT_FUZZY_CONFIG",
     "DEFAULT_LIMIT",
+    "DEFAULT_SCORING_CONFIG",
     "FUZZY_COSINE_THRESHOLD",
     "GRADUATION_COUNT",
     "HIGH_STAKES_TYPES",
@@ -529,15 +1039,23 @@ __all__ = [
     "FuzzyReviewAlreadyDecidedError",
     "FuzzyReviewNotFoundError",
     "FuzzyReviewSignalMissingError",
+    "IcpCriteria",
     "ScoreResult",
+    "ScoringConfig",
+    "SignalDimensions",
     "SignalFuzzyReview",
     "SignalPage",
     "SignalPayload",
     "SignalRead",
     "SignalType",
     "SignalValidationError",
+    "WorkspaceFeedItem",
+    "WorkspaceFeedPage",
+    "WorkspaceScore",
+    "WorkspaceScoreResult",
     "backfill_embeddings",
     "build_embedding_text",
+    "candidate_icp_filter",
     "compute_dedupe_hash",
     "compute_dedupe_hash_for_payload",
     "config_from_recipe",
@@ -553,11 +1071,17 @@ __all__ = [
     "is_high_stakes_type",
     "list_fuzzy_reviews",
     "list_signals",
+    "list_workspace_signals",
     "merge_signal",
     "parse_signal_payload",
     "promote_candidate_to_signal",
     "run_fuzzy_dedupe",
     "score_candidate_confidence",
+    "score_signal_against_icp",
+    "score_signal_for_all_workspaces",
+    "score_signal_for_workspace",
+    "score_workspace_candidates",
+    "signal_matches_icp",
     "store_signal",
     "window_for",
 ]
