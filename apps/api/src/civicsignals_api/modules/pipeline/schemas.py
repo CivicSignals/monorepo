@@ -88,6 +88,34 @@ class ItemCreate(BaseModel):
     value_estimate: Decimal | None = Field(default=None, ge=Decimal("0"))
 
 
+class ManualPipelineItemCreate(BaseModel):
+    """Request body for ``POST /pipeline/items/manual`` (J4).
+
+    Creates a pipeline item that is NOT tied to a signal — manual entry by a
+    team member. ``signal_id`` is intentionally absent; use the generic
+    ``POST /pipeline/items`` endpoint to link a signal at creation time.
+
+    Fields:
+    - ``title``          — required; short name for the opportunity (max 500 chars).
+    - ``stage_id``       — optional; defaults to the workspace's default (intake) stage.
+    - ``notes``          — optional free-text description / context.
+    - ``value_estimate`` — optional USD deal value (must be >= 0).
+    - ``owner_id``       — optional ``accounts_member.id`` (loose ref, no DB FK yet).
+    """
+
+    title: str = Field(min_length=1, max_length=500, description="Short name for the opportunity.")
+    stage_id: UUID | None = Field(
+        default=None, description="Stage to place the item in; defaults to the workspace default."
+    )
+    notes: str | None = Field(default=None, description="Optional description / context.")
+    value_estimate: Decimal | None = Field(
+        default=None, ge=Decimal("0"), description="Estimated deal value in USD."
+    )
+    owner_id: UUID | None = Field(
+        default=None, description="accounts_member.id of the assignee; optional."
+    )
+
+
 class ItemUpdate(BaseModel):
     """Request body for ``PATCH /pipeline/items/{item_id}``."""
 
