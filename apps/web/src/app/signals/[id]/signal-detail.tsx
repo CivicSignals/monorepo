@@ -28,6 +28,7 @@ import {
 import { useSignalDetail } from "@/hooks/use-signals";
 import { ProblemError } from "@/lib/auth-api";
 import { StatusControls } from "@/components/signals/status-controls";
+import { FeedbackControls } from "@/components/signals/feedback-controls";
 import { WhyThisSignal } from "./why-this-signal";
 
 // ---- Helpers ----------------------------------------------------------------
@@ -314,6 +315,11 @@ export function SignalDetail({ id }: SignalDetailProps) {
         {data.status && (
           <StatusControls signalId={signal.id} status={data.status} />
         )}
+        {/* Relevance feedback controls (F5, doc 14 §12). Always available in the
+            workspace context — feedback re-weights subsequent scoring even for a
+            signal that did not (yet) score into the feed, and wrong_extraction is a
+            quality flag independent of the score. Reflects the user's own verdict. */}
+        <FeedbackControls signalId={signal.id} current={data.feedback} />
         {data.entity_id && (
           <Link
             href={`/entities/${data.entity_id}`}

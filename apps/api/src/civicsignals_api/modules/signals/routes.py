@@ -15,13 +15,16 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
   GET  /signals/{id}/detail                  — workspace-scoped signal detail (G2)
   PATCH /signals/{id}/status                 — transition the per-workspace status (G4)
+  POST /signals/{id}/feedback                — record / change / retract user feedback (F5)
   GET  /signals/{id}                         — get one signal
 
 Route ordering note: ``/feed``, ``/fuzzy-reviews`` and their sub-paths MUST be
 registered before ``/{signal_id}`` (the parameterised catch-all) so that FastAPI's
 routing evaluates the static prefix first. Moving ``/{signal_id}`` to the end of
 the file preserves this invariant regardless of how many static-prefix endpoints
-are added later.
+are added later. ``/{signal_id}/feedback`` is a deeper path than ``/{signal_id}``,
+so FastAPI matches it first regardless, but it is kept before the catch-all by
+convention.
 
 Fuzzy-review endpoints are admin-gated (doc 19 §7.4 — the review queue is an
 internal tool to validate the 0.92 cosine threshold before enabling auto-merge).
@@ -451,6 +454,7 @@ def _signal_detail(detail: WorkspaceSignalDetail) -> SignalDetailRead:
             SuggestedContactRead.model_validate(c) for c in detail.suggested_contacts
         ],
         related_signals=[RelatedSignalRead(signal=r.signal) for r in detail.related_signals],
+        feedback=detail.feedback,
     )
 
 
@@ -482,7 +486,10 @@ async def get_signal_detail(
     below, which PATCHes the same score row this view reads ``status`` from.
     """
     detail = await services.get_signal_detail(
-        session, signal_id=signal_id, workspace_id=ctx.workspace.id
+        session,
+        signal_id=signal_id,
+        workspace_id=ctx.workspace.id,
+        user_id=ctx.user.id,
     )
     if detail is None:
         return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
@@ -596,6 +603,112 @@ async def change_status(
         log.warning("signal_status_changed_event_failed", signal_id=str(signal_id))
 
     return StatusChangeRead(score_id=row.id, signal_id=signal_id, status=row.status)
+
+
+# ---------------------------------------------------------------------------
+# F5 feedback endpoint — workspace-scoped POST/DELETE of the user's verdict.
+#
+# Registered before the bare ``/{signal_id}`` (below). ``/{signal_id}/feedback`` is a
+# deeper path so FastAPI matches it first, but ordering it here keeps the convention
+# (more-specific routes precede the catch-all) explicit.
+# ---------------------------------------------------------------------------
+
+
+# The three feedback verdicts (F5, doc 14 §12). A ``Literal`` so an unknown kind is a
+# 422 (request validation) before it reaches the service.
+FeedbackKind = Literal["relevant", "not_relevant", "wrong_extraction"]
+
+
+class FeedbackIn(BaseModel):
+    """Request body for the F5 feedback verdict (doc 14 §12)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: FeedbackKind
+
+
+class FeedbackRead(BaseModel):
+    """The recorded feedback verdict for one (workspace, signal) pair (F5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal_id: uuid.UUID
+    kind: str
+
+
+@router.post(
+    "/{signal_id}/feedback",
+    response_model=FeedbackRead,
+    summary="Record / change a signal's relevance feedback (F5)",
+)
+async def submit_feedback(
+    signal_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+    body: Annotated[FeedbackIn, Body()],
+) -> FeedbackRead | JSONResponse:
+    """Record (or change) the calling user's feedback on a signal (F5, doc 14 §12).
+
+    Captures one of ``relevant`` / ``not_relevant`` / ``wrong_extraction`` for the
+    ``(workspace, signal, user)`` triple — upserting so re-submitting a different kind
+    changes the verdict. ``relevant`` / ``not_relevant`` aggregate into a **bounded**
+    per-workspace nudge to the signal type's weight that re-weights *subsequent* scores
+    (doc 14 §12, applied via ``services.scoring_config_for_workspace`` in the F3 fan-out
+    + F6 backfill). ``wrong_extraction`` is an extraction-quality flag and does **not**
+    alter scoring — it is recorded + surfaced for review (QA-7 / E-epic seam).
+
+    Member-gated (``RequireMember``: viewers cannot mutate workspace data, B7) and
+    workspace-scoped — the workspace + user come from the resolved
+    :class:`WorkspaceContext` (never a body/query param), so one workspace/user can
+    never write another's feedback (doc 14 §12, doc 08 §1.4). RFC 7807 errors.
+
+    Note: this records the verdict and nudges *future* scoring; it does not
+    synchronously re-score the existing feed (a full re-score is the F6 backfill's job).
+    """
+    try:
+        row = await services.set_signal_feedback(
+            session,
+            workspace_id=ctx.workspace.id,
+            signal_id=signal_id,
+            user_id=ctx.user.id,
+            kind=body.kind,
+        )
+    except services.FeedbackKindError as exc:  # pragma: no cover - schema rejects first
+        return _problem(422, "Invalid feedback kind", str(exc))
+    await session.commit()
+    return FeedbackRead(signal_id=signal_id, kind=row.kind)
+
+
+@router.delete(
+    "/{signal_id}/feedback",
+    response_model=FeedbackRead,
+    summary="Retract a signal's relevance feedback (F5)",
+)
+async def retract_feedback(
+    signal_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+) -> FeedbackRead | JSONResponse:
+    """Retract the calling user's feedback verdict on a signal (F5, doc 14 §12).
+
+    Deletes the ``(workspace, signal, user)`` verdict so it no longer contributes to
+    the per-workspace re-weighting. Idempotent: a 404 is returned only when there was
+    no verdict to retract. Member-gated + workspace/user-scoped (B7, doc 14 §12).
+    """
+    removed = await services.clear_signal_feedback(
+        session,
+        workspace_id=ctx.workspace.id,
+        signal_id=signal_id,
+        user_id=ctx.user.id,
+    )
+    if not removed:
+        return _problem(
+            404,
+            "No feedback to retract",
+            f"You have no feedback recorded for signal {signal_id}.",
+        )
+    await session.commit()
+    return FeedbackRead(signal_id=signal_id, kind="")
 
 
 # ---------------------------------------------------------------------------

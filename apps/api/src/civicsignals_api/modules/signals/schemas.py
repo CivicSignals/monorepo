@@ -416,3 +416,7 @@ class SignalDetailRead(BaseModel):
     source_documents: list[SourceDocumentRead]
     suggested_contacts: list[SuggestedContactRead]
     related_signals: list[RelatedSignalRead]
+    # The calling user's current F5 feedback verdict on this signal (relevant /
+    # not_relevant / wrong_extraction), or ``None`` if they have not given one
+    # (doc 14 §12). Lets the detail page's feedback controls reflect the selection.
+    feedback: str | None = None

@@ -186,6 +186,7 @@ describe("useChangeSignalStatus — optimistic update", () => {
       source_documents: [],
       suggested_contacts: [],
       related_signals: [],
+      feedback: null,
     });
 
     // Never-resolving request so we observe the optimistic state mid-flight.

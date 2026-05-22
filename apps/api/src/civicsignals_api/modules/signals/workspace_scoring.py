@@ -30,10 +30,16 @@ shape. The DB-bound matcher query, the fan-out, and the upsert live in
 ``signals.services``; the optional embedding fetch is the caller's job (the I1
 ``embed()`` gateway call), passed in as plain vectors here.
 
-# TODO F5: the feedback loop (relevant / not_relevant / wrong_extraction) re-weights
-# subsequent scores for a workspace (doc 14 §12 "negative training"). The seam is the
-# per-workspace weight overrides — :class:`ScoringConfig` carries the knobs; F5 will
-# populate them from accumulated feedback rather than the static defaults.
+F5 (implemented): the feedback loop (relevant / not_relevant / wrong_extraction)
+re-weights subsequent scores for a workspace (doc 14 §12 "negative training"). The
+seam is the per-workspace **signal-type weight overrides** — :class:`ScoringConfig`
+carries them, and :func:`derive_signal_type_overrides` turns accumulated
+``relevant`` / ``not_relevant`` feedback (aggregated per signal type) into a bounded
+multiplicative nudge applied in :func:`_signal_type_weight`. ``wrong_extraction`` is
+deliberately *not* a scoring signal — it flags extraction quality, not relevance, so
+it never reaches the override math (the service records it and surfaces it instead;
+see ``signals.services`` and the QA-7 / E-epic extraction-quality seam). With no
+feedback the override map is empty and the scorer is byte-for-byte the F3 baseline.
 """
 
 from __future__ import annotations
@@ -77,6 +83,20 @@ NEUTRAL_CONFIDENCE: Final = 0.5
 # (else the matcher would have excluded the signal), so it is wanted — just not
 # explicitly weighted; treat it as moderately wanted rather than 0.
 DEFAULT_SIGNAL_TYPE_WEIGHT: Final = 0.6
+
+# --- F5 feedback re-weighting bounds (doc 14 §12 "negative training") ----------
+#
+# The feedback loop nudges a workspace's per-signal-type weight up (``relevant``) or
+# down (``not_relevant``) based on accumulated feedback, but the nudge is
+# **bounded + clamped** so it can never run away or invert the ICP. The override is a
+# multiplicative factor in ``[1 - MAX_FEEDBACK_ADJUSTMENT, 1 + MAX_FEEDBACK_ADJUSTMENT]``
+# applied to the signal-type-weight component; ±25% is enough to re-rank a borderline
+# type without letting feedback override the explicit ICP intent (doc 14 §12 keeps
+# this "simple + explainable, not ML"). A signal type needs at least
+# :data:`MIN_FEEDBACK_FOR_OVERRIDE` data points before any nudge applies, so one stray
+# click does not move the feed.
+MAX_FEEDBACK_ADJUSTMENT: Final = 0.25
+MIN_FEEDBACK_FOR_OVERRIDE: Final = 3
 
 
 class KeywordExcludedError(Exception):
@@ -128,16 +148,33 @@ class ScoringConfig:
 
     ``weights`` is the component blend; ``recency_half_life_days`` controls how fast
     the recency component decays. ``DEFAULT_SCORING_CONFIG`` is the documented
-    baseline. F5's feedback loop will derive per-workspace overrides from accumulated
-    feedback (doc 14 §12) — the config is the seam it writes through.
+    baseline. ``signal_type_weight_overrides`` is the **F5 feedback seam** (doc 14
+    §12): a per-workspace ``{signal_type: multiplier}`` map derived from accumulated
+    relevant / not_relevant feedback by :func:`derive_signal_type_overrides`, applied
+    multiplicatively to the signal-type-weight component in :func:`_signal_type_weight`.
+    Empty by default → the scorer is the unchanged F3 baseline (the feedback loop is a
+    strict no-op for a workspace with no feedback). Every multiplier is validated to
+    sit inside the documented ``[1 - MAX_FEEDBACK_ADJUSTMENT, 1 + MAX_FEEDBACK_ADJUSTMENT]``
+    band so a malformed override cannot escape the bound.
     """
 
     weights: ComponentWeights = field(default_factory=ComponentWeights)
     recency_half_life_days: float = RECENCY_HALF_LIFE_DAYS
+    signal_type_weight_overrides: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.recency_half_life_days <= 0:
             raise ValueError("recency_half_life_days must be > 0")
+        lo = 1.0 - MAX_FEEDBACK_ADJUSTMENT
+        hi = 1.0 + MAX_FEEDBACK_ADJUSTMENT
+        for signal_type, multiplier in self.signal_type_weight_overrides.items():
+            # A tiny epsilon absorbs float round-trips so a legitimately-clamped
+            # override (exactly at the bound) is not spuriously rejected.
+            if not (lo - 1e-9 <= multiplier <= hi + 1e-9):
+                raise ValueError(
+                    f"signal_type_weight_overrides[{signal_type!r}]={multiplier} "
+                    f"outside the [{lo}, {hi}] feedback band"
+                )
 
 
 #: The documented §6.2 baseline used when no per-workspace override exists.
@@ -349,16 +386,68 @@ def _clamp_unit(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _signal_type_weight(icp: IcpCriteria, signal_type: str) -> float:
+def _signal_type_weight(
+    icp: IcpCriteria,
+    signal_type: str,
+    *,
+    overrides: Mapping[str, float] | None = None,
+) -> float:
     """The ICP's per-signal-type weight (doc 14 §3.1 ``custom_weights``, §6.2).
 
     Falls back to :data:`DEFAULT_SIGNAL_TYPE_WEIGHT` when the ICP listed the type as
     of-interest but pinned no explicit weight — the type is wanted, just unweighted.
+
+    ``overrides`` is the F5 per-workspace feedback nudge (doc 14 §12): a bounded
+    multiplier (default 1.0 == no nudge) applied to the base weight, then re-clamped
+    to ``[0, 1]`` so the component stays a unit value. A missing entry leaves the base
+    weight untouched, so a workspace with no feedback gets the F3 baseline exactly.
     """
     raw = icp.signal_weights.get(signal_type)
-    if raw is None:
-        return DEFAULT_SIGNAL_TYPE_WEIGHT
-    return _clamp_unit(float(raw))
+    base = DEFAULT_SIGNAL_TYPE_WEIGHT if raw is None else _clamp_unit(float(raw))
+    multiplier = 1.0 if overrides is None else overrides.get(signal_type, 1.0)
+    return _clamp_unit(base * multiplier)
+
+
+def derive_signal_type_overrides(
+    feedback_counts: Mapping[str, tuple[int, int]],
+    *,
+    max_adjustment: float = MAX_FEEDBACK_ADJUSTMENT,
+    min_volume: int = MIN_FEEDBACK_FOR_OVERRIDE,
+) -> dict[str, float]:
+    """Turn aggregated per-signal-type feedback into bounded weight multipliers (F5).
+
+    Pure, no-DB, no-I/O — the testable core of the feedback loop (doc 14 §12). The
+    input maps each signal type to a ``(relevant_count, not_relevant_count)`` pair (the
+    ``wrong_extraction`` kind is **excluded upstream** — it is an extraction-quality
+    signal, not a relevance one, so it never reaches here). For each type with at least
+    ``min_volume`` total data points, the net sentiment
+
+        net = (relevant - not_relevant) / (relevant + not_relevant)   in [-1, 1]
+
+    scales a bounded nudge ``1 + max_adjustment * net``, clamped to
+    ``[1 - max_adjustment, 1 + max_adjustment]`` so concentrated feedback can re-rank a
+    type without ever running away or inverting the ICP intent. A type below the volume
+    floor, or one whose net is exactly 0 (balanced feedback → multiplier 1.0), is
+    omitted so the override map stays sparse and the scorer is a no-op for it.
+
+    The result is suitable for :attr:`ScoringConfig.signal_type_weight_overrides`; an
+    empty input (no feedback) yields an empty map (the documented no-op default).
+    """
+    lo = 1.0 - max_adjustment
+    hi = 1.0 + max_adjustment
+    overrides: dict[str, float] = {}
+    for signal_type, (relevant, not_relevant) in feedback_counts.items():
+        total = relevant + not_relevant
+        if total < min_volume or total <= 0:
+            continue
+        net = (relevant - not_relevant) / total
+        multiplier = 1.0 + max_adjustment * net
+        multiplier = max(lo, min(hi, multiplier))
+        if multiplier == 1.0:
+            # Balanced (or below-resolution) feedback → no nudge; keep the map sparse.
+            continue
+        overrides[signal_type] = multiplier
+    return overrides
 
 
 def recency_score(observed_at: datetime | None, *, now: datetime, half_life_days: float) -> float:
@@ -481,7 +570,9 @@ def score_signal_against_icp(
     now = now or datetime.now(UTC)
     weights = config.weights
 
-    type_weight = _signal_type_weight(icp, signal.signal_type)
+    type_weight = _signal_type_weight(
+        icp, signal.signal_type, overrides=config.signal_type_weight_overrides
+    )
     dims = _dimension_match(signal, icp)
     recency = recency_score(observed_at, now=now, half_life_days=config.recency_half_life_days)
     conf = NEUTRAL_CONFIDENCE if confidence is None else _clamp_unit(confidence)
@@ -571,7 +662,9 @@ def _explanation_bullets(
 
 __all__ = [
     "DEFAULT_SCORING_CONFIG",
+    "MAX_FEEDBACK_ADJUSTMENT",
     "MAX_SCORE",
+    "MIN_FEEDBACK_FOR_OVERRIDE",
     "ComponentWeights",
     "DimensionMatch",
     "IcpCriteria",
@@ -579,6 +672,7 @@ __all__ = [
     "ScoringConfig",
     "SignalDimensions",
     "WorkspaceScoreResult",
+    "derive_signal_type_overrides",
     "keyword_match",
     "recency_score",
     "score_signal_against_icp",

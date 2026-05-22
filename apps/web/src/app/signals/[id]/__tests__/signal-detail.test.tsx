@@ -24,9 +24,16 @@ vi.mock("next/link", () => ({
 
 vi.mock("@/hooks/use-signals", () => ({
   useSignalDetail: vi.fn(),
-  // The detail header renders StatusControls (G4), which calls useChangeSignalStatus —
-  // stub it as an idle mutation so the detail view renders without a real client.
+  // The detail header renders StatusControls (G4) + FeedbackControls (F5), which call
+  // useChangeSignalStatus / useSignalFeedback — stub both as idle mutations so the
+  // detail view renders without a real client.
   useChangeSignalStatus: () => ({
+    mutate: vi.fn(),
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
+  useSignalFeedback: () => ({
     mutate: vi.fn(),
     isPending: false,
     isError: false,
@@ -111,6 +118,7 @@ function makeDetail(over: Partial<SignalDetailRead> = {}): SignalDetailRead {
         },
       },
     ],
+    feedback: null,
     ...over,
   };
 }

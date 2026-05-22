@@ -61,6 +61,21 @@ export const FEED_STATUS_LABELS: Record<FeedStatus, string> = {
   dismissed: "Dismissed",
 };
 
+// ---- Feedback verdicts (F5; mirrors models_feedback.FEEDBACK_KINDS) ---------
+
+/**
+ * The three F5 feedback verdicts (doc 14 §12). ``relevant`` / ``not_relevant``
+ * re-weight subsequent scoring for the workspace; ``wrong_extraction`` is an
+ * extraction-quality flag that does not alter scoring.
+ */
+export type FeedbackKind = "relevant" | "not_relevant" | "wrong_extraction";
+
+export const FEEDBACK_KIND_LABELS: Record<FeedbackKind, string> = {
+  relevant: "Relevant",
+  not_relevant: "Not relevant",
+  wrong_extraction: "Wrong extraction",
+};
+
 // ---- Response shapes (mirrors G1 FeedItemRead / FeedPage) ------------------
 
 export interface SignalRead {
@@ -184,6 +199,8 @@ export interface SignalDetailRead {
   source_documents: SourceDocumentRead[];
   suggested_contacts: SuggestedContactRead[];
   related_signals: RelatedSignalRead[];
+  /** The calling user's current F5 feedback verdict, or null (doc 14 §12). */
+  feedback: FeedbackKind | null;
 }
 
 // ---- Filter params (doc 08 §1.6) -------------------------------------------
@@ -315,5 +332,57 @@ export function changeSignalStatus(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     },
+  );
+}
+
+// ---- Feedback (F5; doc 14 §12) ----------------------------------------------
+
+/** Response of the F5 feedback POST/DELETE: the signal + its recorded kind. */
+export interface FeedbackRead {
+  signal_id: string;
+  /** Empty string on a retraction (DELETE); the kind otherwise. */
+  kind: string;
+}
+
+/**
+ * Record (or change) the calling user's relevance feedback on a signal (F5).
+ *
+ * POSTs ``{ kind }`` to record / change the verdict for the (workspace, signal, user)
+ * triple. ``relevant`` / ``not_relevant`` re-weight subsequent scoring;
+ * ``wrong_extraction`` flags extraction quality (no scoring change). Workspace-scoped
+ * via X-Workspace-Id (doc 08 §1.4); member-gated server-side (B7).
+ */
+export function submitSignalFeedback(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+  kind: FeedbackKind,
+): Promise<FeedbackRead> {
+  return request<FeedbackRead>(
+    `/signals/${encodeURIComponent(signalId)}/feedback`,
+    {
+      method: "POST",
+      token,
+      workspaceId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind }),
+    },
+  );
+}
+
+/**
+ * Retract the calling user's feedback verdict on a signal (F5).
+ *
+ * DELETEs the (workspace, signal, user) verdict. A 404 means there was nothing to
+ * retract — surfaced as a {@link ProblemError}. Workspace-scoped + member-gated.
+ */
+export function retractSignalFeedback(
+  token: string,
+  workspaceId: string,
+  signalId: string,
+): Promise<FeedbackRead> {
+  return request<FeedbackRead>(
+    `/signals/${encodeURIComponent(signalId)}/feedback`,
+    { method: "DELETE", token, workspaceId },
   );
 }

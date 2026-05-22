@@ -17,6 +17,8 @@ import {
   type InfiniteData,
 } from "@tanstack/react-query";
 import {
+  type FeedbackKind,
+  type FeedbackRead,
   type FeedFilters,
   type FeedItemRead,
   type FeedPage,
@@ -27,6 +29,8 @@ import {
   changeSignalStatus,
   getSignalDetail,
   listFeedSignals,
+  retractSignalFeedback,
+  submitSignalFeedback,
 } from "@/lib/signals-api";
 import { useSessionStore } from "@/store/session";
 import { useUiStore } from "@/store/ui";
@@ -216,6 +220,77 @@ export function useChangeSignalStatus() {
       void queryClient.invalidateQueries({
         queryKey: feedKeys.workspace(workspaceId),
       });
+      void queryClient.invalidateQueries({
+        queryKey: feedKeys.detail(workspaceId, signalId),
+      });
+    },
+  });
+}
+
+// ---- useSignalFeedback (F5, doc 14 §12) -------------------------------------
+
+/**
+ * Variables for the F5 feedback mutation: which signal, and the target verdict —
+ * or ``null`` to retract the current verdict.
+ */
+export interface SignalFeedbackVars {
+  signalId: string;
+  kind: FeedbackKind | null;
+}
+
+/** Snapshot of the detail cache we touched, kept so onError can roll back. */
+interface FeedbackRollback {
+  detail: SignalDetailRead | undefined;
+}
+
+/**
+ * Mutation hook for the F5 per-signal relevance feedback (mark relevant / not
+ * relevant / wrong extraction, or retract). Optimistically patches the signal's
+ * ``feedback`` in the detail cache, rolls back on error, and invalidates the detail
+ * query on settle so the server stays the source of truth (doc 06 §2).
+ *
+ * Passing ``kind: null`` retracts the current verdict (DELETE); a non-null kind
+ * records / changes it (POST). Server state only — the optimistic write lives in the
+ * TanStack Query cache, never Zustand. Workspace-scoped + member-gated server-side (B7).
+ */
+export function useSignalFeedback() {
+  const { token, workspaceId } = useAuth();
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    FeedbackRead,
+    Error,
+    SignalFeedbackVars,
+    FeedbackRollback
+  >({
+    mutationFn: ({ signalId, kind }) => {
+      if (!token || !workspaceId)
+        return Promise.reject(new Error("not authenticated"));
+      return kind === null
+        ? retractSignalFeedback(token, workspaceId, signalId)
+        : submitSignalFeedback(token, workspaceId, signalId, kind);
+    },
+    onMutate: async ({ signalId, kind }) => {
+      const detailKey = feedKeys.detail(workspaceId, signalId);
+      await queryClient.cancelQueries({ queryKey: detailKey });
+      const detail = queryClient.getQueryData<SignalDetailRead>(detailKey);
+      if (detail) {
+        queryClient.setQueryData<SignalDetailRead>(detailKey, {
+          ...detail,
+          feedback: kind,
+        });
+      }
+      return { detail };
+    },
+    onError: (_err, { signalId }, context) => {
+      if (context?.detail) {
+        queryClient.setQueryData(
+          feedKeys.detail(workspaceId, signalId),
+          context.detail,
+        );
+      }
+    },
+    onSettled: (_data, _err, { signalId }) => {
       void queryClient.invalidateQueries({
         queryKey: feedKeys.detail(workspaceId, signalId),
       });

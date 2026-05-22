@@ -34,9 +34,9 @@ import base64
 import binascii
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 from sqlalchemy import and_, delete, func, or_, select
@@ -46,6 +46,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.ids import uuid7
 from civicsignals_api.modules.entities.models import Entity
 from civicsignals_api.modules.icp.models import IcpDefinition
+
+if TYPE_CHECKING:
+    from sqlalchemy import CursorResult
 
 from .dedupe import (
     DEDUPE_WINDOWS,
@@ -82,6 +85,14 @@ from .models import (
     SIGNAL_STATUS_NEW,
     SIGNAL_STATUS_PENDING_REVIEW,
     Signal,
+)
+from .models_feedback import (
+    FEEDBACK_KINDS,
+    FEEDBACK_NOT_RELEVANT,
+    FEEDBACK_RELEVANT,
+    FEEDBACK_SCORING_KINDS,
+    FEEDBACK_WRONG_EXTRACTION,
+    SignalFeedback,
 )
 from .models_fuzzy_review import (
     REVIEW_STATUS_APPROVED,
@@ -126,6 +137,7 @@ from .workspace_scoring import (
     ScoringConfig,
     SignalDimensions,
     WorkspaceScoreResult,
+    derive_signal_type_overrides,
     score_signal_against_icp,
     signal_matches_icp,
 )
@@ -832,12 +844,18 @@ async def score_signal_for_all_workspaces(
 
     written = 0
     for icp in candidates:
+        # F5: each candidate workspace scores through its own feedback-nudged config
+        # (doc 14 §12). A no-op when the caller passed a non-default config or the
+        # workspace has no feedback — the override map is empty → baseline scoring.
+        ws_config = config
+        if config is DEFAULT_SCORING_CONFIG:
+            ws_config = await scoring_config_for_workspace(session, workspace_id=icp.workspace_id)
         result = await score_signal_for_workspace(
             session,
             signal_id=signal_id,
             workspace_id=icp.workspace_id,
             icp=icp,
-            config=config,
+            config=ws_config,
             now=now,
         )
         if result is not None:
@@ -877,6 +895,13 @@ async def score_workspace_candidates(
         icp = await icp_services.get_active_icp(session, workspace_id=workspace_id)
     if icp is None:
         return 0
+
+    # F5: fold the workspace's accumulated feedback into the config once for the whole
+    # batch (the backfill direction, doc 14 §7 + §12). A no-op when the caller already
+    # passed a non-default config (an explicit override wins) or the workspace has no
+    # feedback. Done once here — not per signal — so a long backfill stays cheap.
+    if config is DEFAULT_SCORING_CONFIG:
+        config = await scoring_config_for_workspace(session, workspace_id=workspace_id)
 
     written = 0
     for signal_id in signal_ids:
@@ -1017,6 +1042,231 @@ async def change_workspace_score_status(
     row.status = target_status
     await session.flush()
     return row
+
+
+# ---------------------------------------------------------------------------
+# Per-(workspace, signal) feedback loop (F5, doc 14 §12 "negative training")
+# ---------------------------------------------------------------------------
+#
+# A user marks a scored signal ``relevant`` / ``not_relevant`` / ``wrong_extraction``.
+# The first two aggregate (per signal type) into a bounded per-workspace nudge to the
+# signal-type weight via ``workspace_scoring.derive_signal_type_overrides``, applied
+# when the ``ScoringConfig`` is built for scoring/backfill (see
+# :func:`scoring_config_for_workspace`). ``wrong_extraction`` is an *extraction
+# quality* signal, not a relevance one, so it is recorded + surfaced but never alters
+# scoring weights — see :func:`workspace_wrong_extraction_count` and the QA-7 / E-epic
+# hand-off below.
+
+# The settable feedback kinds (the F5 verdicts). Re-exported through the service seam
+# so routes / cross-module callers reference these, not the model module directly.
+SETTABLE_FEEDBACK_KINDS: tuple[str, ...] = FEEDBACK_KINDS
+
+
+class FeedbackKindError(ValueError):
+    """An unknown feedback kind was supplied (route → 422 / defensive backstop)."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        super().__init__(
+            f"unknown feedback kind {kind!r}; expected one of {sorted(FEEDBACK_KINDS)}"
+        )
+
+
+async def set_signal_feedback(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    user_id: uuid.UUID,
+    kind: str,
+) -> SignalFeedback:
+    """Record (or change) one user's feedback verdict on a signal (F5, doc 14 §12).
+
+    Upserts the ``(workspace_id, signal_id, user_id)`` row: a first verdict inserts, a
+    changed verdict flips ``kind`` (ON CONFLICT DO UPDATE) — at most one live verdict
+    per user per (workspace, signal). Workspace-scoped: the workspace id comes from the
+    resolved context (B5), never a body param, so one workspace can never write
+    another's feedback (doc 14 §12). Raises :class:`FeedbackKindError` on an unknown
+    kind (the route should reject it at the schema layer; this is the backstop). The
+    caller owns the transaction (this flushes, not commits).
+
+    Note: this does **not** synchronously re-score the workspace's feed. The nudge is
+    applied to *subsequent* scores (the F3 fan-out + the F6 backfill build their
+    ``ScoringConfig`` through :func:`scoring_config_for_workspace`), matching doc 14
+    §12 ("re-weights subsequent scores") — an immediate full re-score is the F6
+    backfill's job, which a future trigger can invoke.
+    """
+    if kind not in FEEDBACK_KINDS:
+        raise FeedbackKindError(kind)
+
+    values = {
+        "id": uuid7(),
+        "workspace_id": workspace_id,
+        "signal_id": signal_id,
+        "user_id": user_id,
+        "kind": kind,
+    }
+    stmt = pg_insert(SignalFeedback).values(**values)
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_signal_feedback_ws_signal_user",
+        set_={"kind": stmt.excluded.kind, "updated_at": datetime.now(UTC)},
+    )
+    await session.execute(stmt)
+    # ``populate_existing`` so a *changed* verdict refreshes the identity-map instance
+    # that an earlier call in the same session may have loaded — the raw ON CONFLICT
+    # UPDATE bypasses the ORM, so without this the cached ``kind`` would be stale.
+    row = (
+        await session.execute(
+            select(SignalFeedback)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.signal_id == signal_id)
+            .where(SignalFeedback.user_id == user_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    return row
+
+
+async def clear_signal_feedback(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> bool:
+    """Retract one user's feedback verdict on a signal (F5, doc 14 §12).
+
+    Deletes the ``(workspace_id, signal_id, user_id)`` row. Returns ``True`` when a row
+    was removed, ``False`` when there was nothing to retract (idempotent). Workspace-
+    scoped; the caller owns the transaction (this flushes, not commits).
+    """
+    result = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            delete(SignalFeedback)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.signal_id == signal_id)
+            .where(SignalFeedback.user_id == user_id)
+        ),
+    )
+    return bool(result.rowcount)
+
+
+async def get_user_signal_feedback(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    signal_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> str | None:
+    """The calling user's current verdict kind on a signal, or ``None`` (F5).
+
+    Surfaced on the detail/feed read so the feedback controls can reflect the user's
+    own current verdict. Workspace + user scoped (never another tenant's / user's).
+    """
+    return (
+        await session.execute(
+            select(SignalFeedback.kind)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.signal_id == signal_id)
+            .where(SignalFeedback.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+
+
+async def feedback_counts_by_signal_type(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+) -> dict[str, tuple[int, int]]:
+    """Aggregate a workspace's *relevance* feedback per signal type (F5, doc 14 §12).
+
+    Joins ``signals_signal_feedback`` to ``signals_signal`` (for the signal type) and
+    counts ``relevant`` vs ``not_relevant`` verdicts per type. ``wrong_extraction`` is
+    excluded — it is an extraction-quality signal, not a relevance one (doc 14 §12), so
+    it never reaches the re-weighting math. Returns ``{signal_type: (relevant_count,
+    not_relevant_count)}`` ready for :func:`~.workspace_scoring.derive_signal_type_overrides`.
+
+    Workspace-scoped: only this workspace's feedback is aggregated, so one workspace's
+    verdicts can never re-weight another's (doc 14 §12).
+    """
+    rows = (
+        await session.execute(
+            select(
+                Signal.signal_type,
+                SignalFeedback.kind,
+                func.count().label("n"),
+            )
+            .join(Signal, Signal.id == SignalFeedback.signal_id)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.kind.in_(tuple(FEEDBACK_SCORING_KINDS)))
+            .group_by(Signal.signal_type, SignalFeedback.kind)
+        )
+    ).all()
+
+    counts: dict[str, tuple[int, int]] = {}
+    for signal_type, kind, n in rows:
+        relevant, not_relevant = counts.get(signal_type, (0, 0))
+        if kind == FEEDBACK_RELEVANT:
+            relevant += int(n)
+        elif kind == FEEDBACK_NOT_RELEVANT:
+            not_relevant += int(n)
+        counts[signal_type] = (relevant, not_relevant)
+    return counts
+
+
+async def workspace_wrong_extraction_count(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+) -> int:
+    """Count a workspace's ``wrong_extraction`` flags (F5 → extraction-quality seam).
+
+    ``wrong_extraction`` deliberately does NOT alter scoring weights — it flags a bad
+    *extraction*, not an irrelevant signal (doc 14 §12). It is surfaced here as a count
+    so the UI / an operator can see how often extraction is being flagged.
+
+    # TODO QA-7 / E-epic: route these flags into the extraction-quality sampling /
+    # dead-letter review (doc 19 §6, QA-7 extraction-quality sampling) rather than only
+    # counting them — a flagged signal is a candidate for re-extraction / a recipe-
+    # selector review, which the extraction module owns (doc 06 §3, cross-module via
+    # its services seam).
+    """
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(SignalFeedback)
+            .where(SignalFeedback.workspace_id == workspace_id)
+            .where(SignalFeedback.kind == FEEDBACK_WRONG_EXTRACTION)
+        )
+    ).scalar_one()
+
+
+async def scoring_config_for_workspace(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    base_config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+) -> ScoringConfig:
+    """Build a workspace's :class:`ScoringConfig` with the F5 feedback nudge applied.
+
+    Aggregates the workspace's relevance feedback (:func:`feedback_counts_by_signal_type`)
+    and derives bounded per-signal-type weight overrides
+    (:func:`~.workspace_scoring.derive_signal_type_overrides`), returning a copy of
+    ``base_config`` carrying them. **No-op by default**: a workspace with no (or
+    perfectly balanced / below-volume) feedback yields an empty override map, so the
+    returned config is the unchanged baseline and scoring is identical to F3.
+
+    This is the seam the scoring/backfill paths build their config through so the
+    re-weighting applies to *subsequent* scores (doc 14 §12). The caller passes the
+    result as ``config=`` to the scorer.
+    """
+    counts = await feedback_counts_by_signal_type(session, workspace_id=workspace_id)
+    overrides = derive_signal_type_overrides(counts)
+    if not overrides:
+        # No nudge → return the base config untouched (a strict no-op, doc 14 §12).
+        return base_config
+    return replace(base_config, signal_type_weight_overrides=overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -1231,6 +1481,10 @@ class WorkspaceSignalDetail:
     source_documents: list[SignalSourceDocument]
     suggested_contacts: list[SuggestedContact]
     related_signals: list[RelatedSignal]
+    # The calling user's current feedback verdict on this signal (F5, doc 14 §12), or
+    # ``None`` if they have not given one — lets the detail page's feedback controls
+    # reflect the user's own current selection.
+    feedback: str | None = None
 
 
 async def _related_signals_for_entity(
@@ -1303,6 +1557,7 @@ async def get_signal_detail(
     *,
     signal_id: uuid.UUID,
     workspace_id: uuid.UUID,
+    user_id: uuid.UUID | None = None,
 ) -> WorkspaceSignalDetail | None:
     """The full G2 detail view for one signal in one workspace's context.
 
@@ -1320,14 +1575,26 @@ async def get_signal_detail(
     ``services.py`` (doc 06 §3). Related signals are other non-merged signals for the
     same entity. The caller does not commit (this only reads).
 
-    TODO F4: the "Why this signal?" panel renders human-readable bullets from
+    When ``user_id`` is supplied, the calling user's current F5 feedback verdict on the
+    signal is read (scoped to the workspace + user) and surfaced as ``feedback`` so the
+    detail page's feedback controls reflect the user's own selection (doc 14 §12).
+
+    F4: the "Why this signal?" panel renders human-readable bullets from
     ``score_breakdown`` — the structured breakdown is already returned here.
-    TODO G4: status transitions (dismiss/pin/push) will PATCH the score row this
-    view reads ``status`` from.
+    G4: status transitions (dismiss/pin/push) PATCH the score row this view reads
+    ``status`` from.
     """
     signal = await session.get(Signal, signal_id)
     if signal is None or signal.status == SIGNAL_STATUS_MERGED:
         return None
+
+    # The calling user's current feedback verdict on this signal (F5, doc 14 §12),
+    # scoped to the workspace + user so it reflects only their own selection.
+    user_feedback: str | None = None
+    if user_id is not None:
+        user_feedback = await get_user_signal_feedback(
+            session, workspace_id=workspace_id, signal_id=signal_id, user_id=user_id
+        )
 
     # The calling workspace's score row for this signal, if any (scoped to the
     # workspace — never another tenant's). A signal can be viewed without a score
@@ -1402,6 +1669,7 @@ async def get_signal_detail(
         source_documents=source_documents,
         suggested_contacts=suggested_contacts,
         related_signals=related_signals,
+        feedback=user_feedback,
     )
 
 
@@ -1520,6 +1788,11 @@ __all__ = [
     "DEFAULT_FUZZY_CONFIG",
     "DEFAULT_LIMIT",
     "DEFAULT_SCORING_CONFIG",
+    "FEEDBACK_KINDS",
+    "FEEDBACK_NOT_RELEVANT",
+    "FEEDBACK_RELEVANT",
+    "FEEDBACK_SCORING_KINDS",
+    "FEEDBACK_WRONG_EXTRACTION",
     "FUZZY_COSINE_THRESHOLD",
     "GRADUATION_COUNT",
     "HIGH_STAKES_TYPES",
@@ -1529,6 +1802,7 @@ __all__ = [
     "REVIEW_STATUS_APPROVED",
     "REVIEW_STATUS_PENDING",
     "REVIEW_STATUS_REJECTED",
+    "SETTABLE_FEEDBACK_KINDS",
     "SIGNAL_STATUS_MERGED",
     "STATUS_TRANSITIONS",
     "SUGGESTED_CONTACTS_LIMIT",
@@ -1540,6 +1814,7 @@ __all__ = [
     "ConfidenceConfig",
     "ConfidenceWeights",
     "EmbeddingDimMismatchError",
+    "FeedbackKindError",
     "FuzzyDedupeConfig",
     "FuzzyDedupeResult",
     "FuzzyReviewAlreadyDecidedError",
@@ -1551,6 +1826,7 @@ __all__ = [
     "ScoreResult",
     "ScoringConfig",
     "SignalDimensions",
+    "SignalFeedback",
     "SignalFuzzyReview",
     "SignalPage",
     "SignalPayload",
@@ -1570,19 +1846,23 @@ __all__ = [
     "candidate_icp_filter",
     "candidate_signal_ids_for_icp",
     "change_workspace_score_status",
+    "clear_signal_feedback",
     "compute_dedupe_hash",
     "compute_dedupe_hash_for_payload",
     "config_from_recipe",
     "decide_fuzzy_review",
     "decode_cursor",
     "dedupe_key_for_candidate",
+    "derive_signal_type_overrides",
     "embed_signals",
     "embedding_text_for_signal",
     "encode_cursor",
+    "feedback_counts_by_signal_type",
     "find_duplicate",
     "get_fuzzy_review",
     "get_signal",
     "get_signal_detail",
+    "get_user_signal_feedback",
     "is_high_stakes_type",
     "list_fuzzy_reviews",
     "list_signals",
@@ -1596,7 +1876,10 @@ __all__ = [
     "score_signal_for_all_workspaces",
     "score_signal_for_workspace",
     "score_workspace_candidates",
+    "scoring_config_for_workspace",
+    "set_signal_feedback",
     "signal_matches_icp",
     "store_signal",
     "window_for",
+    "workspace_wrong_extraction_count",
 ]
