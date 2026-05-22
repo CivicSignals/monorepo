@@ -17,16 +17,22 @@ the E8 :class:`RelevanceClassifier`. Several stages are intentional stubs with a
 clear seam:
 
 - **parse**: handles text/html/pdf; ``# TODO E9`` OCR hook for short PDFs.
-- **extract**: emits permissive :class:`CandidateRecord` dicts; ``# TODO E4`` for
-  the strict typed per-signal-type schema + required-field gate (doc 19 §6.1).
+- **extract**: emits permissive :class:`CandidateRecord` dicts; the **strict typed
+  per-signal-type schema + required-field hard gate** (doc 19 §6.1; E4) runs in the
+  store stage when a candidate is promoted into a signal.
 - **score**: ``# TODO E6`` confidence blend — passthrough now.
 - **dedupe**: ``# TODO E5`` per-type dedup key + merge — passthrough now.
-- **store**: persists candidates to ``extraction_candidate`` so E4/E5 pick them up
-  (``signals_*`` tables don't exist yet — ``# TODO E4/E5``).
+- **store**: persists candidates to ``extraction_candidate`` (the staging row E5
+  reads) **and** promotes each validated candidate into a global
+  ``signals_signal`` row via ``signals.services.promote_candidate_to_signal`` (E4).
+  A candidate that fails the strict schema gate raises and dead-letters the job
+  with the surfaced validation error (doc 19 §6.1) — the candidate row is still
+  persisted (rejected, for the audit) but no signal is written.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -38,6 +44,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.llm_gateway import TASK_EXTRACTION, LLMGateway, get_gateway
 from civicsignals_api.modules.ingestion import services as ingestion_services
 from civicsignals_api.modules.ingestion.services import RawDocumentStorage, StoredRawDocument
+from civicsignals_api.modules.signals import services as signals_services
+from civicsignals_api.modules.signals.services import CandidateInput, SignalValidationError
 
 from .models import ExtractionCandidate
 from .relevance import RelevanceClassifier
@@ -468,6 +476,32 @@ def dedupe_candidate(candidate: CandidateRecord) -> CandidateRecord:
 # ---------------------------------------------------------------------------
 
 
+# Status the candidate row carries once it is promoted / rejected (mirrors
+# ``extraction_candidate.status``; doc 19 §5.1, §6.1).
+CANDIDATE_STATUS_PROMOTED: Final = "promoted"
+CANDIDATE_STATUS_REJECTED: Final = "rejected"
+
+
+def _candidate_content_hash(candidate: CandidateRecord) -> str:
+    """Derive a coarse dedupe ``content_hash`` for the signal row (doc 19 §7.1).
+
+    E5 lands the real per-signal-type canonical dedupe key + windowed merge. Until
+    then we hash the dedupe-stage placeholder key (or, if it computed none, the
+    signal type + a stable digest of the fields) so the ``signals_signal`` unique
+    dedupe index is populated and re-promotion of the *same* candidate is idempotent
+    rather than tripping the constraint.
+    """
+    basis = candidate.dedup_key
+    if not basis:
+        payload = json.dumps(
+            {"type": candidate.signal_type, "fields": candidate.fields},
+            sort_keys=True,
+            default=str,
+        )
+        basis = payload
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
 async def store_candidates(
     session: AsyncSession,
     *,
@@ -476,15 +510,27 @@ async def store_candidates(
     recipe_id: str,
     candidates: list[CandidateRecord],
 ) -> list[ExtractionCandidate]:
-    """Persist candidate records to ``extraction_candidate`` (doc 19 §1; E1).
+    """Persist candidates + promote validated ones into ``signals_signal`` (E1/E4).
 
-    The caller owns the transaction (this flushes, not commits). Persisting to an
-    extraction-owned table keeps the funnel lossless until the global
-    ``signals_signal`` table exists.
+    Two responsibilities (doc 19 §1 "store", §6.1 "validate"):
 
-    # TODO E4/E5: once the strict signal schema (E4) and ``signals_signal`` table
-    # land, validated candidates promote into real signals here (E5 dedupe/merge);
-    # ``extraction_candidate`` becomes the staging row E5 reads and updates.
+    1. Persist each candidate to ``extraction_candidate`` — the staging row E5 reads
+       (the funnel stays lossless; nothing is dropped silently).
+    2. Run the **strict per-type schema hard gate** (E4) and promote each valid
+       candidate into a global ``signals_signal`` row via
+       ``signals.services.promote_candidate_to_signal``. The candidate row is
+       stamped ``promoted`` (with the resulting signal's id) on success.
+
+    On a schema-validation failure the candidate row is stamped ``rejected`` (for
+    the doc 19 §6.1 audit) and a :class:`SignalValidationError` is re-raised so the
+    task dead-letters the job with the surfaced error — **no signal is written for a
+    candidate that fails the gate**. The caller owns the transaction (this flushes,
+    not commits), so on the raised error nothing is committed and the raw snapshot
+    stays replayable.
+
+    # TODO E5: dedupe before store (per-type key + windowed merge, doc 19 §7) —
+    # E4 promotes with the exact-key upsert only.
+    # TODO E6: the real confidence blend feeds ``confidence`` (doc 19 §6.2).
     """
     rows: list[ExtractionCandidate] = []
     for candidate in candidates:
@@ -500,8 +546,46 @@ async def store_candidates(
         )
         session.add(row)
         rows.append(row)
+    await session.flush()  # assign candidate ids before promotion links to them
+
+    for candidate, row in zip(candidates, rows, strict=True):
+        candidate_input = CandidateInput(
+            signal_type=candidate.signal_type,
+            fields=dict(candidate.fields),
+            recipe_id=recipe_id,
+            raw_document_id=raw_document_id,
+            content_hash=_candidate_content_hash(candidate),
+            # TODO E10: entity resolution (doc 19 §4.3) supplies a resolved
+            # entity_id; until then the signal is stored resolution-pending (the
+            # service flags it review_required) with the raw name from the fields.
+            entity_id=None,
+            entity_name=_candidate_entity_name(candidate),
+            confidence=candidate.confidence,
+            extraction_job_id=job_id,
+            source_candidate_id=row.id,
+        )
+        try:
+            await signals_services.promote_candidate_to_signal(session, candidate_input)
+        except SignalValidationError:
+            # Hard gate (doc 19 §6.1): record the rejection for audit, then surface
+            # the error so the job dead-letters with it (no signal written).
+            row.status = CANDIDATE_STATUS_REJECTED
+            await session.flush()
+            raise
+        # The reverse link (signal -> candidate) lives on
+        # ``signals_signal.source_candidate_id`` (set during promotion), so the
+        # candidate row just records that it was promoted.
+        row.status = CANDIDATE_STATUS_PROMOTED
     await session.flush()
     return rows
+
+
+def _candidate_entity_name(candidate: CandidateRecord) -> str | None:
+    """Pull the raw entity name from the candidate fields, if the extractor gave one."""
+    if not isinstance(candidate.fields, dict):
+        return None
+    raw = candidate.fields.get("entity_name")
+    return str(raw) if isinstance(raw, str) and raw.strip() else None
 
 
 # ---------------------------------------------------------------------------

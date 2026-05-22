@@ -6,10 +6,15 @@ store chain without a real database, using:
 - a ``FakeBackend`` gateway (relevance + extract calls, no network),
 - a fake :class:`RawDocumentStorage` returning seeded bytes,
 - a fake ingestion ``get_raw_document`` (monkeypatched) returning a seeded row,
-- a minimal fake ``AsyncSession`` that records ``add()``\\ed rows.
+- a minimal fake ``AsyncSession`` that records ``add()``\\ed rows,
+- a stubbed ``signals.services.promote_candidate_to_signal`` (the store stage's
+  E4 promotion needs real Postgres upsert semantics, exercised in
+  ``test_pipeline_persistence.py``); the stub records the candidates it received so
+  the orchestrator wiring can be asserted DB-free.
 
 The relevance-gate-drop path (no extract call) and the persistence shape are the
-key behaviours. The live-Postgres round-trip is in ``test_pipeline_persistence.py``.
+key behaviours. The live-Postgres round-trip + real candidate→signal promotion is
+in ``test_pipeline_persistence.py``.
 """
 
 from __future__ import annotations
@@ -116,8 +121,30 @@ def _patch_get_raw_document(monkeypatch: pytest.MonkeyPatch) -> StoredRawDocumen
     return doc
 
 
+@pytest.fixture
+def _stub_promote(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Stub the E4 promotion (needs real Postgres upsert; covered in persistence test).
+
+    Records the :class:`CandidateInput` instances the store stage builds so the
+    orchestrator wiring can be asserted without a database. Returns a fake signal
+    object so ``store_candidates`` proceeds as on a successful promote.
+    """
+    received: list[object] = []
+
+    async def _fake_promote(session: object, candidate: object) -> object:
+        received.append(candidate)
+        return object()  # a stand-in "signal"; the store stage only reads its id
+
+    monkeypatch.setattr(
+        "civicsignals_api.modules.extraction.pipeline.signals_services.promote_candidate_to_signal",
+        _fake_promote,
+    )
+    return received
+
+
 async def test_pipeline_relevant_produces_candidates(
     _patch_get_raw_document: StoredRawDocument,
+    _stub_promote: list[object],
 ) -> None:
     doc = _patch_get_raw_document
     gw, _extract_be = _gateway(
@@ -155,6 +182,14 @@ async def test_pipeline_relevant_produces_candidates(
     assert candidate_rows[0].job_id == job_id
     assert candidate_rows[0].raw_document_id == doc.id
     assert candidate_rows[0].dedup_key == "rfp_posted:erp rfp"
+    # The candidate row was stamped promoted, and the store stage handed exactly one
+    # CandidateInput to the signals promotion service (E4).
+    assert candidate_rows[0].status == pipeline.CANDIDATE_STATUS_PROMOTED
+    assert len(_stub_promote) == 1
+    promoted = _stub_promote[0]
+    assert promoted.signal_type == "rfp_posted"  # type: ignore[attr-defined]
+    assert promoted.extraction_job_id == job_id  # type: ignore[attr-defined]
+    assert promoted.source_candidate_id == candidate_rows[0].id  # type: ignore[attr-defined]
 
 
 async def test_pipeline_irrelevant_skips_extract(
