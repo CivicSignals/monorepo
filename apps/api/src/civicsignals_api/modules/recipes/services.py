@@ -31,8 +31,8 @@ from .models import DeadLetter
 from .preview import preview_html, preview_url
 from .runner import (
     Clock,
-    FetchFailedError,
     Fetcher,
+    FetchFailedError,
     GatewayFieldExtractor,
     LLMFieldExtractor,
     RealClock,

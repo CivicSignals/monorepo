@@ -81,7 +81,7 @@ def _field_previews(recipe: Recipe, values: dict[str, str | None]) -> list[Field
                 matched=value is not None,
                 required=spec.required,
                 attr=spec.attr,
-                selectors=list(spec.selectors),
+                selectors=[s.selector for s in spec.selectors],
                 missing_required=value is None and spec.required,
             )
         )
