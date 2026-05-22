@@ -247,7 +247,7 @@ async def create_request(
     description=(
         "Return a cursor-paginated list of FOIA requests in the current workspace. "
         "Optionally filter by ``status`` or ``entity_id``. "
-        "Results are ordered by creation time (newest first via UUID v7 ordering). "
+        "Results are ordered by creation time ascending (oldest first) via UUID v7 keyset pagination. "
         "Use ``cursor`` from the previous response to fetch the next page."
     ),
 )

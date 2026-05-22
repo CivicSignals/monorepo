@@ -170,8 +170,8 @@ _DSN = (
 _db_skip = pytest.mark.skipif(_DSN is None, reason="no Postgres DSN configured")
 
 # Tables this test module manages.  We include the dependency tables so
-# create_all has the FKs it needs.  We drop only the foia tables in teardown
-# to keep the test truly isolated from other module tests.
+# create_all has the FKs it needs, and we drop them all in teardown
+# (own + dep) using CASCADE to cleanly undo the full schema we created.
 _OWN_TABLE_NAMES = ("foia_request", "foia_request_event")
 _DEP_TABLE_NAMES = (
     "accounts_member",
@@ -211,13 +211,14 @@ _register_models()
 
 @pytest_asyncio.fixture
 async def session() -> AsyncIterator[AsyncSession]:
-    """Fresh schema + session for each DB test.
+    """Fresh tables + session for each DB test.
 
-    Uses a dedicated test schema (``foia_test_schema``) to stay fully isolated
-    from any already-created public-schema tables in the shared test DB. Tables
-    are created fresh from the ORM metadata and torn down at the end.
-    We DROP CASCADE because the FK graph is complex — dependencies between our
-    dep tables and other modules' tables that may already exist in the DB.
+    Creates the full table set (foia + dependency tables) from scratch in the
+    target DB, then tears them down afterwards.  Isolation relies on DROP …
+    CASCADE before each run so leftover state from a previous run does not leak.
+    The target database is selected via the ``FOIA_TEST_DSN`` / ``DATABASE_DIRECT_URL``
+    / ``DATABASE_URL`` env var; a dedicated test DB (e.g. ``civicsignals_m2_test``)
+    is recommended to avoid colliding with migration-managed tables.
     """
     assert _DSN is not None
     engine = create_async_engine(_DSN, poolclass=NullPool)
