@@ -717,6 +717,245 @@ class SalesforceProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
         )
 
 
+# --- Slack provider (L1) -------------------------------------------------------
+# Slack OAuth v2 (oauth.v2.access), bot token, channel listing.  The HTTP layer
+# is the injected httpx.AsyncClient (no live Slack calls in tests).  Token
+# material is never logged (threat-model §4.2).
+
+SLACK_OAUTH_AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
+SLACK_OAUTH_TOKEN_URL = "https://slack.com/api/oauth.v2.access"
+SLACK_CONVERSATIONS_LIST_URL = "https://slack.com/api/conversations.list"
+
+# Default scopes: bot token needs channels:read (list channels) + chat:write
+# (send messages — consumed by L2).  chat:write.public is added so the bot can
+# post to channels it hasn't been invited to.
+SLACK_DEFAULT_SCOPES: tuple[str, ...] = (
+    "channels:read",
+    "chat:write",
+    "chat:write.public",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SlackChannel:
+    """A Slack channel returned by conversations.list (L1)."""
+
+    id: str
+    name: str
+    is_private: bool = False
+    is_member: bool = False
+
+
+@register_provider
+class SlackProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
+    """The Slack workspace-install connector (L1).
+
+    OAuth v2 install flow (``oauth.v2.access``): the bot token is returned
+    in ``access_token`` (no user token for this flow); the team id/name come
+    from the ``team`` block and are stored in ``provider_account`` (non-secret).
+    Slack does not issue a refresh_token for bot tokens (they don't expire), so
+    ``refresh`` raises ``NotImplementedError`` in the bot-token path.
+
+    Channel listing via ``conversations.list`` is exposed via a dedicated
+    ``list_channels`` method (called by the L1 routes) rather than the K2
+    discovery interface (which is object/field-level, not channel-level).
+
+    ``push`` is a L2 seam: the L1 task is connection + channel selection only.
+    L2 lands the formatted message send; ``push`` raises ``NotImplementedError``
+    here to make accidental routing obvious.
+
+    Config-gated: ``SLACK_CLIENT_ID`` / ``SLACK_CLIENT_SECRET`` (no-op /
+    ``provider_not_configured`` when unset, like other providers).
+    """
+
+    kind = IntegrationProviderKind.SLACK
+    is_oauth: bool = True
+
+    def oauth_config(self) -> OAuthConfig:
+        return OAuthConfig(
+            authorize_url=SLACK_OAUTH_AUTHORIZE_URL,
+            token_url=SLACK_OAUTH_TOKEN_URL,
+            scopes=SLACK_DEFAULT_SCOPES,
+            client_id=self.settings.slack_client_id,
+            client_secret=self.settings.slack_client_secret,
+        )
+
+    def parse_token_response(self, body: dict[str, object]) -> TokenSet:
+        """Map a Slack oauth.v2.access response to a TokenSet (L1).
+
+        Slack v2 returns ``ok: True`` on success; the bot access token lives at
+        ``access_token``; team metadata lives in ``team``.  Scopes are in
+        ``scope`` (comma-separated) on the bot-token body or on the
+        ``authed_user`` sub-object (we capture the bot scopes).  No refresh_token
+        is issued (bot tokens don't expire).
+        """
+        ok = body.get("ok")
+        if ok is not True:
+            error = body.get("error", "unknown_error")
+            raise ProviderError(
+                PushErrorCode.AUTH,
+                f"Slack token exchange failed: {error}",
+                response={"error": error},
+            )
+        access = body.get("access_token")
+        if not isinstance(access, str) or not access:
+            raise ProviderError(
+                PushErrorCode.AUTH,
+                "Slack token response missing access_token",
+                response={"keys": sorted(body)},
+            )
+        scope_raw = body.get("scope", "")
+        scopes: tuple[str, ...] = ()
+        if isinstance(scope_raw, str) and scope_raw:
+            scopes = tuple(scope_raw.split(","))
+
+        account: dict[str, object] = {}
+        team = body.get("team")
+        if isinstance(team, dict):
+            if isinstance(team.get("id"), str):
+                account["team_id"] = team["id"]
+            if isinstance(team.get("name"), str):
+                account["team_name"] = team["name"]
+        bot_user_id = body.get("bot_user_id")
+        if isinstance(bot_user_id, str):
+            account["bot_user_id"] = bot_user_id
+        # app_id is non-secret and useful for the UI.
+        app_id = body.get("app_id")
+        if isinstance(app_id, str):
+            account["app_id"] = app_id
+
+        return TokenSet(
+            access_token=access,
+            refresh_token=None,  # bot tokens don't expire
+            expires_at=None,
+            scopes=scopes,
+            provider_account=account,
+        )
+
+    async def exchange_code(self, *, code: str, redirect_uri: str) -> TokenSet:
+        """Exchange an authorization code via oauth.v2.access (L1).
+
+        Slack v2 uses HTTP Basic auth (client_id:client_secret) rather than
+        including credentials in the request body; the mixin's ``_token_request``
+        is not used here (it injects credentials into the body, which Slack also
+        accepts, but Basic auth is the recommended form).
+        """
+        config = self.oauth_config()
+        if not config.configured:
+            raise ProviderError(
+                PushErrorCode.AUTH,
+                "Slack OAuth client is not configured (SLACK_CLIENT_ID/SECRET missing)",
+            )
+        data = {
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
+        try:
+            resp = await self.http.post(
+                config.token_url,
+                data=data,
+                auth=(config.client_id or "", config.client_secret or ""),
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                PushErrorCode.TRANSIENT, "Slack token endpoint unreachable"
+            ) from exc
+        if resp.status_code >= 400:
+            raise ProviderError(
+                map_http_status_to_error_code(resp.status_code),
+                f"Slack token endpoint returned {resp.status_code}",
+                response={"status_code": resp.status_code},
+            )
+        return self.parse_token_response(resp.json())
+
+    async def refresh(self, *, refresh_token: str) -> TokenSet:
+        """Bot tokens do not expire; this is a no-op seam (L1).
+
+        Slack workspace app bot tokens are long-lived and have no refresh flow.
+        If a token is revoked the admin must reconnect (the status transitions to
+        ``needs_reauth`` when a Slack API call returns ``invalid_auth``).
+        """
+        raise ProviderError(
+            PushErrorCode.AUTH,
+            "Slack bot tokens do not support refresh; reconnect required",
+        )
+
+    async def list_channels(self, *, access_token: str) -> list[SlackChannel]:
+        """List joinable public channels via conversations.list (L1).
+
+        Returns channels the bot can post to.  Paginates automatically (cursor-
+        based).  Rate-limited by Slack Tier 2 (20 req/min); we fetch up to 5
+        pages of 200 channels (1 000 channels max) which covers typical orgs.
+        Raises :class:`ProviderError` on Slack API failure.
+        """
+        channels: list[SlackChannel] = []
+        cursor: str | None = None
+        max_pages = 5
+        for _ in range(max_pages):
+            params: dict[str, str] = {
+                "exclude_archived": "true",
+                "types": "public_channel",
+                "limit": "200",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                resp = await self.http.get(
+                    SLACK_CONVERSATIONS_LIST_URL,
+                    params=params,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            except httpx.HTTPError as exc:
+                raise ProviderError(
+                    PushErrorCode.TRANSIENT, "Slack conversations.list unreachable"
+                ) from exc
+            if resp.status_code >= 400:
+                raise ProviderError(
+                    map_http_status_to_error_code(resp.status_code),
+                    f"Slack conversations.list returned {resp.status_code}",
+                )
+            body = resp.json()
+            if not body.get("ok"):
+                error = body.get("error", "unknown_error")
+                if error in ("invalid_auth", "token_revoked", "account_inactive"):
+                    raise ProviderError(PushErrorCode.AUTH, f"Slack auth error: {error}")
+                raise ProviderError(PushErrorCode.UNKNOWN, f"conversations.list failed: {error}")
+            for ch in body.get("channels", []):
+                if not isinstance(ch, dict):
+                    continue
+                ch_id = ch.get("id")
+                ch_name = ch.get("name")
+                if not isinstance(ch_id, str) or not isinstance(ch_name, str):
+                    continue
+                channels.append(
+                    SlackChannel(
+                        id=ch_id,
+                        name=ch_name,
+                        is_private=bool(ch.get("is_private")),
+                        is_member=bool(ch.get("is_member")),
+                    )
+                )
+            next_cursor = (body.get("response_metadata") or {}).get("next_cursor")
+            if not isinstance(next_cursor, str) or not next_cursor:
+                break
+            cursor = next_cursor
+        return channels
+
+    async def push(self, *, access_token: str, request: PushRequest) -> PushResult:
+        """L2 seam: send a formatted Slack message (not yet implemented in L1).
+
+        L1 is connection + channel selection only; L2 lands the message format
+        and the actual ``chat.postMessage`` call.  Raising here makes accidental
+        routing obvious without silently dropping the push.
+
+        # TODO L2: implement Slack push (chat.postMessage to the selected channel).
+        """
+        raise NotImplementedError(
+            "Slack push (chat.postMessage) is implemented in L2. "
+            "L1 covers connection + channel selection only."
+        )
+
+
 # --- L3: Webhook provider (non-OAuth, secret-based) ---------------------------
 # Webhook subscriptions are managed directly via the /webhooks CRUD endpoints;
 # the provider registration here lets the integrations framework recognise
