@@ -227,17 +227,30 @@ def _content_hash(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
-def _robots_allows(robots_body: str | None, url: str, user_agent: str) -> bool:
-    """True if ``robots_body`` permits ``user_agent`` to fetch ``url``.
+def _parse_robots(robots_body: str | None) -> urllib.robotparser.RobotFileParser | None:
+    """Parse a robots.txt body into a reusable matcher.
 
-    Missing/empty robots.txt is permissive (the convention when a site ships
-    none). A robots.txt we can't parse is also treated as permissive — we only
-    block on an explicit, parseable disallow.
+    Returns ``None`` for a missing/empty robots.txt, which is the permissive
+    convention (a site that ships none allows everything). The returned matcher
+    is host-wide, so it can be cached per host for the duration of a run.
     """
     if not robots_body:
-        return True
+        return None
     parser = urllib.robotparser.RobotFileParser()
     parser.parse(robots_body.splitlines())
+    return parser
+
+
+def _robots_allows(
+    parser: urllib.robotparser.RobotFileParser | None, url: str, user_agent: str
+) -> bool:
+    """True if ``parser`` permits ``user_agent`` to fetch ``url``.
+
+    No parser (missing robots.txt) is permissive — we only block on an explicit,
+    parseable disallow.
+    """
+    if parser is None:
+        return True
     return parser.can_fetch(user_agent, url)
 
 
@@ -254,8 +267,14 @@ def _extract_field(html: str, spec: FieldSpec) -> str | None:
     a fallback matches — is D11. The extension point is intentional: iterate
     ``spec.selectors`` here and thread a ``degraded`` flag back out.
     """
-    from bs4 import BeautifulSoup
-    from bs4.element import Tag
+    try:
+        from bs4 import BeautifulSoup
+        from bs4.element import Tag
+    except ImportError as exc:  # pragma: no cover - guards a misbuilt image
+        raise RecipeError(
+            "the recipe runner's HTML extractor needs beautifulsoup4 "
+            "(a core dependency of civicsignals-api); install the package deps"
+        ) from exc
 
     soup = BeautifulSoup(html, "html.parser")
     primary = spec.selectors[0]
@@ -297,6 +316,11 @@ class RecipeRunner:
         self.clock = clock if clock is not None else RealClock()
         # Per-host timestamp of the last fetch, for the politeness window.
         self._last_fetch_at: dict[str, float] = {}
+        # Per-host parsed robots.txt, cached for the duration of this run so a
+        # multi-page crawl of one host fetches robots.txt once, not per URL.
+        # ``host in cache`` distinguishes "not yet looked up" from a cached
+        # ``None`` (host ships no robots.txt — permissive).
+        self._robots_cache: dict[str, urllib.robotparser.RobotFileParser | None] = {}
 
     # -- discover -----------------------------------------------------------
     def discover(self, seed_urls: Sequence[str]) -> list[SourcePointer]:
@@ -329,6 +353,21 @@ class RecipeRunner:
         if policy.jitter_seconds > 0:
             self.clock.sleep(random.uniform(0, policy.jitter_seconds))
 
+    # -- robots -------------------------------------------------------------
+    def _robots_for(
+        self, host: str, url: str, user_agent: str
+    ) -> urllib.robotparser.RobotFileParser | None:
+        """Return the cached robots matcher for ``host``, fetching it once.
+
+        robots.txt is host-wide, so a multi-page crawl consults the fetcher only
+        on the first URL per host (doc 16 §18; avoids redundant load on the
+        source). The cache lives for the duration of this run.
+        """
+        if host not in self._robots_cache:
+            body = self.fetcher.robots_txt(url, user_agent=user_agent)
+            self._robots_cache[host] = _parse_robots(body)
+        return self._robots_cache[host]
+
     # -- fetch --------------------------------------------------------------
     def fetch(self, pointer: SourcePointer) -> RawDocument:
         """Retrieve raw bytes for one pointer (doc 18 §2.2).
@@ -340,8 +379,8 @@ class RecipeRunner:
         host = urlparse(pointer.url).netloc
 
         if policy.respect_robots_txt:
-            robots = self.fetcher.robots_txt(pointer.url, user_agent=policy.user_agent)
-            if not _robots_allows(robots, pointer.url, policy.user_agent):
+            parser = self._robots_for(host, pointer.url, policy.user_agent)
+            if not _robots_allows(parser, pointer.url, policy.user_agent):
                 raise RobotsDisallowedError(pointer.url)
 
         self._apply_politeness(host)

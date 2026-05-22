@@ -331,6 +331,7 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
+    { name = "beautifulsoup4" },
     { name = "boto3" },
     { name = "celery", extra = ["redis"] },
     { name = "fastapi" },
@@ -358,7 +359,6 @@ extraction = [
     { name = "spacy" },
 ]
 ingestion = [
-    { name = "beautifulsoup4" },
     { name = "feedparser" },
     { name = "lxml" },
     { name = "playwright" },
@@ -366,7 +366,6 @@ ingestion = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "beautifulsoup4" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -383,7 +382,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "anthropic", marker = "extra == 'extraction'", specifier = ">=0.39" },
     { name = "asyncpg", specifier = ">=0.30" },
-    { name = "beautifulsoup4", marker = "extra == 'ingestion'", specifier = ">=4.12" },
+    { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "boto3", specifier = ">=1.35" },
     { name = "celery", extras = ["redis"], specifier = ">=5.4" },
     { name = "fastapi", specifier = ">=0.115" },
@@ -412,7 +411,6 @@ provides-extras = ["ingestion", "extraction"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "mypy", specifier = ">=1.12" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },

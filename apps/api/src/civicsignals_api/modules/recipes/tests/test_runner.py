@@ -62,6 +62,7 @@ class RecordingFetcher:
         self.body = body
         self.robots = robots
         self.calls: list[str] = []
+        self.robots_calls: list[str] = []
 
     def fetch(
         self, url: str, *, user_agent: str, max_redirects: int
@@ -70,6 +71,7 @@ class RecordingFetcher:
         return 200, self.body, {"content-type": "text/html"}
 
     def robots_txt(self, url: str, *, user_agent: str) -> str | None:
+        self.robots_calls.append(url)
         return self.robots
 
 
@@ -149,6 +151,17 @@ def test_missing_robots_is_permissive() -> None:
     pointer = runner.discover(["https://example.gov/public/rfp"])[0]
     raw = runner.fetch(pointer)
     assert raw.status_code == 200
+
+
+def test_robots_fetched_once_per_host() -> None:
+    recipe = services.parse_recipe(VALID_RECIPE)
+    fetcher = RecordingFetcher(LISTING_HTML, robots="User-agent: *\nDisallow: /private/\n")
+    runner = services.make_runner(recipe, fetcher, clock=FakeClock())
+    for path in ("a", "b", "c"):
+        runner.fetch(runner.discover([f"https://example.gov/public/{path}"])[0])
+    # robots.txt is host-wide -> consulted once, not once per URL.
+    assert len(fetcher.robots_calls) == 1
+    assert len(fetcher.calls) == 3
 
 
 def test_robots_disabled_skips_check() -> None:

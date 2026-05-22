@@ -1,7 +1,7 @@
 """Public service interface for the recipes module.
 
 Other modules call recipes only through the functions defined here — never by
-importing recipes's models or routes directly (doc 06 §3).
+importing the recipes module's models or routes directly (doc 06 §3).
 
 This module owns the **recipe DSL** and the **recipe runner** (doc 18 §2-§3,
 TODO D1): loading + JSON-Schema-validating recipe YAML, and driving the
