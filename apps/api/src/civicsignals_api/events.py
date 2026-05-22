@@ -28,6 +28,8 @@ MEMBER_ROLE_CHANGED = "member.role_changed"
 INTEGRATION_CONNECTION_CREATED = "integration.connection.created"
 INTEGRATION_CONNECTION_DELETED = "integration.connection.deleted"
 INTEGRATION_PUSH_FAILED = "integration.push.failed"
+# K2: emitted after every push attempt (success or failure) is recorded.
+INTEGRATION_PUSH_RECORDED = "integration.push.recorded"
 
 Handler = Callable[[dict[str, Any]], Awaitable[None]]
 

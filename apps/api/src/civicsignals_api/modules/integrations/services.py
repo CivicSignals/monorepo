@@ -16,6 +16,11 @@ generic outbound-integration framework K2/K3/K4/K5/L1/L3 build on:
   attempt to the push-log with scope-aware typed errors, and computes the
   retry/dead-letter schedule. :func:`due_failed_pushes` is the surface the
   ``retry_failed_pushes`` Celery task drives.
+- **Discovery + field mapping (K2).** :func:`discover_objects` /
+  :func:`describe_object` populate the field-mapping UI from the provider's
+  describe API; :func:`upsert_field_mapping` (and friends) persist a
+  per-connection :class:`~.models.FieldMapping`; :func:`push_source` resolves the
+  target, applies the mapping to a signal/pipeline-item, and runs the push.
 
 The HTTP layer is injectable (``http_client`` arg / a default factory) so tests
 mock the transport.
@@ -48,13 +53,16 @@ from .models import (
     NON_RETRYABLE_ERROR_CODES,
     Connection,
     ConnectionStatus,
+    FieldMapping,
     IntegrationProviderKind,
     PushErrorCode,
     PushLog,
     PushStatus,
 )
 from .providers import (
+    FieldDescriptor,
     IntegrationProvider,
+    ObjectDescriptor,
     ProviderError,
     PushRequest,
     PushResult,
@@ -86,6 +94,23 @@ class OAuthStateError(IntegrationError):
 
 class ConnectionNotConnectedError(IntegrationError):
     """A push/refresh was attempted on a connection with no usable token."""
+
+
+class DiscoveryNotSupportedError(IntegrationError):
+    """The connection's provider does not support object/field discovery (K2)."""
+
+
+class DiscoveryFailedError(IntegrationError):
+    """A discovery call to the provider failed (auth/transient/etc.; K2).
+
+    Carries the scope-aware :class:`PushErrorCode` so the route can branch (e.g.
+    ``auth`` → prompt reconnect) the same way the push runner does.
+    """
+
+    def __init__(self, code: PushErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +509,202 @@ async def ensure_fresh_access_token(
 
 
 # ---------------------------------------------------------------------------
+# Object / field discovery (K2 field-mapping UI)
+# ---------------------------------------------------------------------------
+
+
+async def discover_objects(
+    session: AsyncSession,
+    connection: Connection,
+    *,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> list[ObjectDescriptor]:
+    """List the provider objects this connection can push to (K2).
+
+    Auto-refreshes the access token first, then queries the provider describe.
+    Raises :class:`DiscoveryNotSupportedError` (provider has no discovery, e.g.
+    webhook), :class:`ConnectionNotConnectedError` (no usable token), or
+    :class:`DiscoveryFailedError` (a provider-side error, with scope-aware code).
+    """
+    settings = settings or get_settings()
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        prov = _resolve_provider(connection.provider, settings, http)
+        if not prov.supports_discovery:
+            raise DiscoveryNotSupportedError(
+                f"provider '{connection.provider.value}' does not support discovery"
+            )
+        access_token = await ensure_fresh_access_token(
+            session, connection, settings=settings, http_client=http
+        )
+        try:
+            return await prov.discover_objects(
+                access_token=access_token, provider_account=dict(connection.provider_account)
+            )
+        except ProviderError as exc:
+            raise DiscoveryFailedError(exc.code, exc.message) from exc
+    finally:
+        if own_http:
+            await http.aclose()
+
+
+async def describe_object(
+    session: AsyncSession,
+    connection: Connection,
+    *,
+    object_name: str,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> list[FieldDescriptor]:
+    """List the writable fields on ``object_name`` for this connection (K2)."""
+    settings = settings or get_settings()
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        prov = _resolve_provider(connection.provider, settings, http)
+        if not prov.supports_discovery:
+            raise DiscoveryNotSupportedError(
+                f"provider '{connection.provider.value}' does not support discovery"
+            )
+        access_token = await ensure_fresh_access_token(
+            session, connection, settings=settings, http_client=http
+        )
+        try:
+            return await prov.describe_object(
+                access_token=access_token,
+                provider_account=dict(connection.provider_account),
+                object_name=object_name,
+            )
+        except ProviderError as exc:
+            raise DiscoveryFailedError(exc.code, exc.message) from exc
+    finally:
+        if own_http:
+            await http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Field mapping CRUD (K2; per connection + target object)
+# ---------------------------------------------------------------------------
+
+
+async def list_field_mappings(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID
+) -> list[FieldMapping]:
+    """List a connection's field mappings (workspace-scoped)."""
+    result = await session.execute(
+        select(FieldMapping)
+        .where(
+            FieldMapping.workspace_id == workspace_id,
+            FieldMapping.connection_id == connection_id,
+        )
+        .order_by(FieldMapping.target_object.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_field_mapping(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID, target_object: str
+) -> FieldMapping | None:
+    """Return the mapping for (connection, target object), or ``None``."""
+    result = await session.execute(
+        select(FieldMapping).where(
+            FieldMapping.workspace_id == workspace_id,
+            FieldMapping.connection_id == connection_id,
+            FieldMapping.target_object == target_object,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_field_mapping(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    target_object: str,
+    field_map: dict[str, object],
+    constants: dict[str, object] | None = None,
+) -> FieldMapping:
+    """Create or update the mapping for (connection, target object). Caller commits.
+
+    The field-mapping UI saves one mapping per target object; re-saving the same
+    target replaces ``field_map``/``constants`` (the K6 template seam reuses this).
+    """
+    mapping = await get_field_mapping(
+        session,
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+        target_object=target_object,
+    )
+    if mapping is None:
+        mapping = FieldMapping(
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            target_object=target_object,
+            field_map=dict(field_map),
+            constants=dict(constants or {}),
+        )
+        session.add(mapping)
+    else:
+        mapping.field_map = dict(field_map)
+        mapping.constants = dict(constants or {})
+    await session.flush()
+    return mapping
+
+
+async def delete_field_mapping(session: AsyncSession, mapping: FieldMapping) -> None:
+    """Delete a field mapping. Caller commits."""
+    await session.delete(mapping)
+    await session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Apply a field mapping to a source object → provider payload (K2)
+# ---------------------------------------------------------------------------
+
+
+def resolve_source_path(source: dict[str, object], path: str) -> object | None:
+    """Resolve a dotted ``path`` (e.g. ``signal.title``) against ``source``.
+
+    The push caller supplies a plain ``source`` dict (the signal / pipeline-item
+    field values, already serialized — integrations never imports other modules'
+    models, doc 06 §3). Missing keys resolve to ``None`` (the field is omitted).
+    """
+    node: object | None = source
+    for part in path.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return None
+    return node
+
+
+def apply_field_mapping(
+    mapping: FieldMapping | None, source: dict[str, object]
+) -> dict[str, object]:
+    """Build the provider field→value body from a mapping + a source object (K2).
+
+    Constants are written verbatim; mapped fields resolve their source path and
+    are omitted when the source value is ``None`` (so a push never sends an
+    explicit null for an unmapped value). With no mapping, the (already-shaped)
+    ``source`` is passed through unchanged so a connection can push without first
+    configuring a mapping.
+    """
+    if mapping is None:
+        return dict(source)
+    payload: dict[str, object] = dict(mapping.constants)
+    for provider_field, source_path in mapping.field_map.items():
+        if not isinstance(source_path, str):
+            continue
+        value = resolve_source_path(source, source_path)
+        if value is not None:
+            payload[provider_field] = value
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Push framework + push-log
 # ---------------------------------------------------------------------------
 
@@ -589,8 +810,22 @@ async def execute_push(
             await session.flush()
             return log
 
+        # Inject the connection's non-secret provider account metadata (e.g. the
+        # Salesforce ``instance_url``) so the provider can route the REST call to
+        # the right org. This is a control key (``__``-prefixed) the provider pops
+        # off; it is NOT what was persisted to the push-log ``request`` (that is
+        # the clean mapped payload set at ``create_push_log``), so retries that
+        # rebuild the request from the log still get a fresh, correct account.
+        enriched_payload = dict(request.payload)
+        enriched_payload["__provider_account__"] = dict(connection.provider_account or {})
+        enriched = PushRequest(
+            target=request.target,
+            payload=enriched_payload,
+            idempotency_key=request.idempotency_key,
+            external_id=request.external_id,
+        )
         try:
-            result = await prov.push(access_token=access_token, request=request)
+            result = await prov.push(access_token=access_token, request=enriched)
         except ProviderError as exc:
             _record_failure(log, exc, settings)
             if exc.code is PushErrorCode.AUTH:
@@ -608,6 +843,125 @@ async def execute_push(
     connection.status = ConnectionStatus.HEALTHY
     await session.flush()
     return log
+
+
+def _resolve_target(connection: Connection, target: str | None) -> str:
+    """Resolve the provider-qualified push target (e.g. ``salesforce.Opportunity``).
+
+    Uses the explicit ``target`` if given, else the connection's first
+    ``default_targets`` entry, else ``Opportunity`` for Salesforce. Always
+    returns a provider-qualified ``<provider>.<object>`` string for the push-log.
+    """
+    provider = connection.provider.value
+    obj: str
+    if target:
+        # Accept either a bare object name or an already-qualified target.
+        obj = target.split(".", 1)[1] if target.startswith(f"{provider}.") else target
+    elif connection.default_targets:
+        obj = connection.default_targets[0]
+    else:
+        obj = "Opportunity"
+    return f"{provider}.{obj}"
+
+
+async def push_source(
+    session: AsyncSession,
+    *,
+    connection: Connection,
+    source: dict[str, object],
+    target: str | None = None,
+    field_map_override: dict[str, object] | None = None,
+    signal_id: str | None = None,
+    pipeline_item_id: str | None = None,
+    idempotency_key: str | None = None,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> PushLog:
+    """Push one signal/pipeline-item to the connection's provider (K2).
+
+    Resolves the target object, loads the connection's saved :class:`FieldMapping`
+    for that object (an inline ``field_map_override`` from the request wins), maps
+    the ``source`` field values to the provider body, records a push-log row, and
+    runs :func:`execute_push`. ``idempotency_key`` reuses a prior successful
+    push's ``external_id`` so a re-push updates instead of duplicating (the K4
+    upsert seam). Never raises on a provider failure — the outcome is in the log.
+    The caller commits.
+    """
+    settings = settings or get_settings()
+    qualified_target = _resolve_target(connection, target)
+    object_name = qualified_target.split(".", 1)[1]
+
+    mapping = await get_field_mapping(
+        session,
+        workspace_id=connection.workspace_id,
+        connection_id=connection.id,
+        target_object=object_name,
+    )
+    if field_map_override is not None:
+        # An inline override is applied on top of the saved mapping (or alone).
+        override = FieldMapping(
+            workspace_id=connection.workspace_id,
+            connection_id=connection.id,
+            target_object=object_name,
+            field_map=dict(field_map_override),
+            constants=dict(mapping.constants) if mapping is not None else {},
+        )
+        payload = apply_field_mapping(override, source)
+    else:
+        payload = apply_field_mapping(mapping, source)
+
+    # K4 seam: a prior successful push of the same source object (same
+    # idempotency key) re-pushes as an update against its external id.
+    prior_external_id: str | None = None
+    if idempotency_key:
+        prior = await _last_successful_push(
+            session, connection_id=connection.id, idempotency_key=idempotency_key
+        )
+        if prior is not None:
+            prior_external_id = prior.external_id
+
+    log = await create_push_log(
+        session,
+        workspace_id=connection.workspace_id,
+        connection_id=connection.id,
+        target=qualified_target,
+        request=payload,
+        signal_id=signal_id,
+        pipeline_item_id=pipeline_item_id,
+        idempotency_key=idempotency_key,
+    )
+    request = PushRequest(
+        target=qualified_target,
+        payload=payload,
+        idempotency_key=idempotency_key,
+        external_id=prior_external_id,
+    )
+    return await execute_push(
+        session,
+        connection=connection,
+        log=log,
+        request=request,
+        settings=settings,
+        http_client=http_client,
+    )
+
+
+async def _last_successful_push(
+    session: AsyncSession, *, connection_id: UUID, idempotency_key: str
+) -> PushLog | None:
+    """Return the most recent successful push for an idempotency key (K4 seam)."""
+    result = await session.execute(
+        select(PushLog)
+        .where(
+            PushLog.connection_id == connection_id,
+            PushLog.idempotency_key == idempotency_key,
+            PushLog.status == PushStatus.SUCCESS,
+            PushLog.external_id.is_not(None),
+        )
+        .order_by(PushLog.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 # ---------------------------------------------------------------------------
