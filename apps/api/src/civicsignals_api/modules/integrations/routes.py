@@ -54,7 +54,7 @@ from civicsignals_api.modules.auth.dependencies import RequireAdmin
 from civicsignals_api.problems import ProblemException
 
 from . import services
-from .models import Connection, PushErrorCode, PushStatus
+from .models import Connection, IntegrationProviderKind, PushErrorCode, PushStatus
 from .schemas import (
     ConnectionCreate,
     ConnectionCreated,
@@ -71,6 +71,10 @@ from .schemas import (
     PushLogPageOut,
     PushOut,
     PushRequestIn,
+    SlackChannelListOut,
+    SlackChannelOut,
+    SlackChannelSelectIn,
+    SlackChannelSelectionOut,
     WebhookDeliveryOut,
     WebhookDeliveryPageOut,
     WebhookSubscriptionCreate,
@@ -602,6 +606,173 @@ async def list_push_log(
         data=[PushLogOut.from_orm_log(log) for log in page.items],
         next_cursor=page.next_cursor,
     )
+
+
+# ---------------------------------------------------------------------------
+# L1: Slack channel listing + selection
+# ---------------------------------------------------------------------------
+
+
+def _not_slack_connection() -> ProblemException:
+    return ProblemException(
+        status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        code="not_slack_connection",
+        title="Not a Slack connection",
+        detail="This connection is not a Slack integration.",
+    )
+
+
+def _slack_list_channels_problem(exc: services.SlackListChannelsError) -> ProblemException:
+    """Map a channel-list failure to RFC 7807, branching on the scope-aware code (L1)."""
+    if exc.code is PushErrorCode.AUTH:
+        return ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="reauth_required",
+            title="Reconnect required",
+            detail="The Slack connection's credentials are invalid; reconnect the integration.",
+        )
+    if exc.code is PushErrorCode.PERMISSION:
+        return ProblemException(
+            status=status.HTTP_403_FORBIDDEN,
+            code="provider_permission",
+            title="Insufficient Slack permission",
+            detail=exc.message,
+        )
+    return ProblemException(
+        status=status.HTTP_502_BAD_GATEWAY,
+        code="provider_error",
+        title="Slack request failed",
+        detail=exc.message,
+    )
+
+
+@router.get(
+    "/connections/{connection_id}/slack/channels",
+    response_model=SlackChannelListOut,
+    summary="List available Slack channels for a connected workspace (admin only, L1)",
+)
+async def list_slack_channels(
+    connection_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> SlackChannelListOut:
+    """List the public channels available to the Slack bot for this connection (L1).
+
+    Calls ``conversations.list`` via the mocked-in-tests HTTP client.  Returns
+    ``422`` when the connection is not a Slack connection, ``409`` on auth
+    failure / ``403`` on permission / ``502`` on a provider error.
+
+    The admin selects one channel from this list and persists it via the
+    ``PUT .../slack/channels/select`` endpoint below.
+    """
+    connection = await _require_connection(ctx, session, connection_id)
+    if connection.provider is not IntegrationProviderKind.SLACK:
+        raise _not_slack_connection()
+
+    if connection.access_token_encrypted is None:
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="reauth_required",
+            title="Reconnect required",
+            detail="The Slack connection has no credentials yet; complete OAuth first.",
+        )
+
+    try:
+        channels = await services.list_slack_channels(session, connection, settings=settings)
+        await session.commit()
+    except services.ConnectionNotConnectedError as exc:
+        await session.commit()
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="reauth_required",
+            title="Reconnect required",
+            detail="The connection has no usable credentials; reconnect the integration.",
+        ) from exc
+    except services.SlackListChannelsError as exc:
+        await session.rollback()
+        raise _slack_list_channels_problem(exc) from exc
+
+    return SlackChannelListOut(
+        data=[
+            SlackChannelOut(
+                id=ch.id,
+                name=ch.name,
+                is_private=ch.is_private,
+                is_member=ch.is_member,
+            )
+            for ch in channels
+        ]
+    )
+
+
+@router.put(
+    "/connections/{connection_id}/slack/channels/select",
+    response_model=SlackChannelSelectionOut,
+    summary="Persist the selected Slack notification channel (admin only, L1)",
+)
+async def select_slack_channel(
+    connection_id: uuid.UUID,
+    body: SlackChannelSelectIn,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> SlackChannelSelectionOut:
+    """Save the admin's Slack channel selection for a connection (L1).
+
+    The channel id + name from the ``list_slack_channels`` response are
+    persisted; the display name is stored for the UI (L2 uses the stable id
+    for ``chat.postMessage``).  Upserts — re-saving replaces the prior choice.
+    Returns ``422`` when the connection is not a Slack connection or ``404``
+    when the connection is not found.
+
+    # TODO L2: when the channel is (re)selected, enqueue a Slack message
+    #   acknowledging the connection is set up (a "hello world" from the bot).
+    """
+    connection = await _require_connection(ctx, session, connection_id)
+    if connection.provider is not IntegrationProviderKind.SLACK:
+        raise _not_slack_connection()
+
+    selection = await services.upsert_slack_channel_selection(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        channel_id=body.channel_id,
+        channel_name=body.channel_name,
+    )
+    await session.commit()
+    await session.refresh(selection)
+    return SlackChannelSelectionOut.from_orm_selection(selection)
+
+
+@router.get(
+    "/connections/{connection_id}/slack/channels/selected",
+    response_model=SlackChannelSelectionOut,
+    summary="Get the currently selected Slack notification channel (admin only, L1)",
+)
+async def get_selected_slack_channel(
+    connection_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> SlackChannelSelectionOut:
+    """Return the saved Slack channel selection for a connection (L1).
+
+    Returns ``404`` when the connection has no saved channel selection yet.
+    """
+    connection = await _require_connection(ctx, session, connection_id)
+    if connection.provider is not IntegrationProviderKind.SLACK:
+        raise _not_slack_connection()
+
+    selection = await services.get_slack_channel_selection(
+        session, workspace_id=ctx.workspace_id, connection_id=connection_id
+    )
+    if selection is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="No channel selected",
+            detail="No Slack notification channel has been selected for this connection yet.",
+        )
+    return SlackChannelSelectionOut.from_orm_selection(selection)
 
 
 # ---------------------------------------------------------------------------

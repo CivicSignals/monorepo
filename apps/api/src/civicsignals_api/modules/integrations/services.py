@@ -70,6 +70,7 @@ from .models import (
     PushIdempotency,
     PushLog,
     PushStatus,
+    SlackChannelSelection,
     WebhookDelivery,
     WebhookDeliveryStatus,
     WebhookSubscription,
@@ -81,6 +82,8 @@ from .providers import (
     ProviderError,
     PushRequest,
     PushResult,
+    SlackChannel,
+    SlackProvider,
     TokenSet,
     get_provider,
     is_registered,
@@ -1177,6 +1180,109 @@ async def list_push_log(
     items = rows[:limit]
     next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
     return PushLogPage(items=items, next_cursor=next_cursor)
+
+
+# ---------------------------------------------------------------------------
+# L1: Slack channel listing + selection
+# ---------------------------------------------------------------------------
+
+
+class SlackListChannelsError(IntegrationError):
+    """conversations.list call failed (auth/transient/etc.; L1).
+
+    Carries the scope-aware :class:`PushErrorCode` so the route can branch
+    (e.g. ``auth`` → prompt reconnect) identically to the discovery flow.
+    """
+
+    def __init__(self, code: PushErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+async def list_slack_channels(
+    session: AsyncSession,
+    connection: Connection,
+    *,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> list[SlackChannel]:
+    """List the Slack channels available to the connected bot (L1).
+
+    Calls ``conversations.list`` via the injected HTTP client (mocked in tests).
+    Auto-refreshes the access token first (though Slack bot tokens don't expire,
+    the auto-refresh path is kept for consistency). Raises
+    :class:`ConnectionNotConnectedError` when there is no usable token, or
+    :class:`SlackListChannelsError` on a Slack API failure.
+    """
+    settings = settings or get_settings()
+    http = http_client or default_http_client()
+    own_http = http_client is None
+    try:
+        prov = _resolve_provider(connection.provider, settings, http)
+        if not isinstance(prov, SlackProvider):
+            raise SlackListChannelsError(
+                PushErrorCode.UNKNOWN,
+                f"connection provider '{connection.provider.value}' is not Slack",
+            )
+        access_token = await ensure_fresh_access_token(
+            session, connection, settings=settings, http_client=http
+        )
+        try:
+            return await prov.list_channels(access_token=access_token)
+        except ProviderError as exc:
+            raise SlackListChannelsError(exc.code, exc.message) from exc
+    finally:
+        if own_http:
+            await http.aclose()
+
+
+async def get_slack_channel_selection(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+) -> SlackChannelSelection | None:
+    """Return the saved Slack channel selection for a connection, or None (L1)."""
+    result = await session.execute(
+        select(SlackChannelSelection).where(
+            SlackChannelSelection.workspace_id == workspace_id,
+            SlackChannelSelection.connection_id == connection_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_slack_channel_selection(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    channel_id: str,
+    channel_name: str,
+) -> SlackChannelSelection:
+    """Create or update the Slack channel selection for a connection (L1).
+
+    One selection per connection (unique on ``connection_id``).  Re-saving
+    replaces the prior channel choice.  The caller commits.
+    """
+    existing = await get_slack_channel_selection(
+        session, workspace_id=workspace_id, connection_id=connection_id
+    )
+    if existing is None:
+        selection = SlackChannelSelection(
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            channel_id=channel_id,
+            channel_name=channel_name,
+        )
+        session.add(selection)
+    else:
+        existing.channel_id = channel_id
+        existing.channel_name = channel_name
+        selection = existing
+    await session.flush()
+    return selection
 
 
 # ---------------------------------------------------------------------------

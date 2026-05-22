@@ -436,6 +436,60 @@ class PushIdempotency(Base):
 
 
 # ---------------------------------------------------------------------------
+# L1: Slack channel selection
+# ---------------------------------------------------------------------------
+
+
+class SlackChannelSelection(Base):
+    """The Slack channel an admin has selected to receive notifications (L1).
+
+    One row per :class:`Connection` (upserted on channel selection).  Stores
+    the channel's Slack id (``C0123456``) and display name (``#general``) so the
+    UI can render the name without a round-trip.  The connection FK cascades on
+    delete so channel-selection rows are removed when the Slack connection is
+    disconnected.
+
+    L2 reads this to route ``chat.postMessage`` to the right channel.
+
+    # TODO L2: add a ``message_template`` column for per-workspace formatted
+    #   message customisation once L2 lands the signal → Slack message format.
+    """
+
+    __tablename__ = "integrations_slack_channel"
+    __table_args__ = (Index("ix_integrations_slack_channel_connection", "connection_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_workspace.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("integrations_connection.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,  # One selection per Slack connection.
+    )
+
+    # Slack channel id (e.g. ``C0123456``) — the stable identifier Slack requires
+    # for chat.postMessage; persisted so L2 doesn't need to re-look up the name.
+    channel_id: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # Human-readable channel name (``#general``).  Slack names may change; we
+    # store the name captured at selection time for the UI display.  L2 uses the
+    # stable ``channel_id`` for the actual API call.
+    channel_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
 # L3: Outbound webhook subscriber + delivery log
 # ---------------------------------------------------------------------------
 

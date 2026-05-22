@@ -16,6 +16,7 @@ from .models import (
     PushErrorCode,
     PushLog,
     PushStatus,
+    SlackChannelSelection,
     WebhookDelivery,
     WebhookDeliveryStatus,
     WebhookSubscription,
@@ -230,6 +231,50 @@ class PushOut(BaseModel):
     """POST .../push response — the resulting push-log row (K2)."""
 
     push_log: PushLogOut
+
+
+# ---------------------------------------------------------------------------
+# L1: Slack channel selection
+# ---------------------------------------------------------------------------
+
+
+class SlackChannelOut(BaseModel):
+    """One Slack channel returned by conversations.list (L1)."""
+
+    id: str
+    name: str
+    is_private: bool = False
+    is_member: bool = False
+
+
+class SlackChannelListOut(BaseModel):
+    """GET .../slack/channels response — available channels for a connection (L1)."""
+
+    data: list[SlackChannelOut]
+
+
+class SlackChannelSelectIn(BaseModel):
+    """Body for PUT .../slack/channels/select — persist the chosen channel (L1)."""
+
+    channel_id: str = Field(min_length=1, max_length=64)
+    channel_name: str = Field(min_length=1, max_length=255)
+
+
+class SlackChannelSelectionOut(BaseModel):
+    """The persisted Slack channel selection for a connection (L1)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    connection_id: UUID
+    channel_id: str
+    channel_name: str
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm_selection(cls, sel: SlackChannelSelection) -> SlackChannelSelectionOut:
+        return cls.model_validate(sel)
 
 
 # ---------------------------------------------------------------------------
