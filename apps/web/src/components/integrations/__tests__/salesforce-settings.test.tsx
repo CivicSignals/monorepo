@@ -88,6 +88,25 @@ function setupFetchMocks(
         ],
       });
     }
+    if (path.endsWith("/field-mapping-templates") && method === "POST") {
+      return jsonResponse(
+        {
+          id: "tpl-1",
+          connection_id: CONNECTION_ID,
+          name: "Opportunity defaults",
+          target_object: "Opportunity",
+          field_map: { Name: "signal.title" },
+          constants: {},
+          is_default: true,
+          created_at: "2026-05-01T00:00:00Z",
+          updated_at: "2026-05-01T00:00:00Z",
+        },
+        201,
+      );
+    }
+    if (path.endsWith("/field-mapping-templates")) {
+      return jsonResponse({ data: [] });
+    }
     if (path.endsWith("/field-mappings") && method === "PUT") {
       return jsonResponse(
         opts.saveResponse ?? {
@@ -214,6 +233,133 @@ describe("SalesforceSettings", () => {
 
     await waitFor(() => {
       expect(screen.queryByRole("status")?.textContent).toMatch(/saved/i);
+    });
+  });
+
+  it("saves the current mapping as a default template (K6)", async () => {
+    const fetchSpy = setupFetchMocks();
+    const user = userEvent.setup();
+    render(<SalesforceSettings workspaceId={WORKSPACE_ID} />, { wrapper });
+
+    // Set a row so the snapshot has content.
+    await waitFor(() => {
+      expect(screen.queryByTestId("map-select-Name")).not.toBeNull();
+    });
+    await user.selectOptions(
+      screen.getByTestId("map-select-Name") as HTMLSelectElement,
+      "signal.title",
+    );
+
+    // Name the template, flag it default, and save.
+    await user.type(
+      screen.getByTestId("template-name-input"),
+      "Opportunity defaults",
+    );
+    await user.click(screen.getByTestId("template-default-checkbox"));
+    await user.click(screen.getByTestId("save-template-btn"));
+
+    await waitFor(() => {
+      const postCall = fetchSpy.mock.calls.find(
+        ([input, init]) =>
+          String(input).includes("/field-mapping-templates") &&
+          (init?.method ?? "GET").toUpperCase() === "POST",
+      );
+      expect(postCall).toBeTruthy();
+      const body = JSON.parse(String(postCall?.[1]?.body));
+      expect(body.name).toBe("Opportunity defaults");
+      expect(body.is_default).toBe(true);
+      expect(body.target_object).toBe("Opportunity");
+      expect(body.field_map.Name).toBe("signal.title");
+    });
+  });
+
+  it("applies a saved template onto the live mapping (K6)", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (input, init) => {
+        const url = new URL(String(input), "http://localhost");
+        const path = url.pathname;
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (path.endsWith("/discover/objects")) {
+          return jsonResponse({
+            data: [{ name: "Opportunity", label: "Opportunity", custom: false }],
+          });
+        }
+        if (path.endsWith("/discover/fields")) {
+          return jsonResponse({
+            object: "Opportunity",
+            data: [
+              {
+                name: "Name",
+                label: "Name",
+                type: "string",
+                required: true,
+                createable: true,
+                updateable: true,
+              },
+            ],
+          });
+        }
+        if (path.endsWith("/apply") && method === "POST") {
+          return jsonResponse({
+            id: "fm-applied",
+            connection_id: CONNECTION_ID,
+            target_object: "Opportunity",
+            field_map: { Name: "signal.summary" },
+            constants: {},
+            created_at: "2026-05-01T00:00:00Z",
+            updated_at: "2026-05-01T00:00:00Z",
+          });
+        }
+        if (path.endsWith("/field-mapping-templates")) {
+          return jsonResponse({
+            data: [
+              {
+                id: "tpl-7",
+                connection_id: CONNECTION_ID,
+                name: "Saved one",
+                target_object: "Opportunity",
+                field_map: { Name: "signal.summary" },
+                constants: {},
+                is_default: true,
+                created_at: "2026-05-01T00:00:00Z",
+                updated_at: "2026-05-01T00:00:00Z",
+              },
+            ],
+          });
+        }
+        if (path.endsWith("/field-mappings")) {
+          return jsonResponse({ data: [] });
+        }
+        if (path.endsWith("/integrations/connections")) {
+          return jsonResponse({ data: [healthyConnection()] });
+        }
+        return jsonResponse({ status: 404, title: "nf" }, 404);
+      });
+    const user = userEvent.setup();
+    render(<SalesforceSettings workspaceId={WORKSPACE_ID} />, { wrapper });
+
+    // The saved template shows with a default badge.
+    await waitFor(() => {
+      expect(screen.queryByTestId("template-tpl-7")).not.toBeNull();
+    });
+    expect(screen.queryByTestId("template-default-badge-tpl-7")).not.toBeNull();
+
+    await user.click(screen.getByTestId("apply-template-btn-tpl-7"));
+
+    await waitFor(() => {
+      const applyCall = fetchSpy.mock.calls.find(
+        ([input, init]) =>
+          String(input).includes("/field-mapping-templates/tpl-7/apply") &&
+          (init?.method ?? "GET").toUpperCase() === "POST",
+      );
+      expect(applyCall).toBeTruthy();
+    });
+
+    // The editor re-seeds from the applied mapping's field_map.
+    await waitFor(() => {
+      const sel = screen.getByTestId("map-select-Name") as HTMLSelectElement;
+      expect(sel.value).toBe("signal.summary");
     });
   });
 

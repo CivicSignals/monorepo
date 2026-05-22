@@ -96,23 +96,13 @@ def upgrade() -> None:
             name="ck_foia_request_submission_method",
         ),
         sa.ForeignKeyConstraint(["created_by"], ["accounts_user.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["entity_id"], ["entities_entity.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["workspace_id"], ["accounts_workspace.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["entity_id"], ["entities_entity.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["workspace_id"], ["accounts_workspace.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "ix_foia_request_created_by", "foia_request", ["created_by"], unique=False
-    )
-    op.create_index(
-        "ix_foia_request_entity_id", "foia_request", ["entity_id"], unique=False
-    )
-    op.create_index(
-        "ix_foia_request_workspace_id", "foia_request", ["workspace_id"], unique=False
-    )
+    op.create_index("ix_foia_request_created_by", "foia_request", ["created_by"], unique=False)
+    op.create_index("ix_foia_request_entity_id", "foia_request", ["entity_id"], unique=False)
+    op.create_index("ix_foia_request_workspace_id", "foia_request", ["workspace_id"], unique=False)
     op.create_index(
         "ix_foia_request_workspace_status",
         "foia_request",
@@ -134,9 +124,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.ForeignKeyConstraint(["actor_id"], ["accounts_user.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["request_id"], ["foia_request.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["request_id"], ["foia_request.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(

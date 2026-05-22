@@ -35,7 +35,7 @@ import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -239,9 +239,9 @@ class FieldMapping(Base):
     service applies it. ``constants`` carries static values written on every push
     (e.g. a fixed ``StageName``). Workspace-scoped (B5) for isolation.
 
-    # TODO K6: save a mapping as a reusable template (per-connection default ↔ a
-    #   workspace/library template); this row is the per-connection instance K6
-    #   seeds from / saves to.
+    K6 layers :class:`FieldMappingTemplate` on top of this row: a saved template is
+    a named snapshot of a mapping that can be re-applied (or auto-applied as the
+    connection default) onto this per-target instance.
     """
 
     __tablename__ = "integrations_field_mapping"
@@ -282,6 +282,84 @@ class FieldMapping(Base):
     constants: Mapped[dict[str, object]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
     )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class FieldMappingTemplate(Base):
+    """A reusable, named field-mapping template scoped to a connection (K6).
+
+    K6 lets an admin save the *current* :class:`FieldMapping` (the field map +
+    constants the field-mapping UI is editing) as a named, reusable default per
+    connection, so it can be re-applied later instead of re-built by hand. One row
+    per ``(connection, name)``; the field-mapping UI saves into and applies from
+    these. ``is_default`` flags the one template auto-applied on a fresh push when
+    no per-target :class:`FieldMapping` has been configured yet — at most one
+    default per connection (enforced by a partial unique index).
+
+    Applying a template (``services.apply_field_mapping_template``) upserts the
+    connection's per-target :class:`FieldMapping` for ``target_object`` from the
+    template's ``field_map``/``constants`` — the template is the saved blueprint;
+    the per-target mapping remains the live record the push runner reads.
+    Workspace-scoped (B5) for isolation, like every other table in this module.
+    """
+
+    __tablename__ = "integrations_field_mapping_template"
+    __table_args__ = (
+        Index("ix_integrations_field_mapping_template_workspace", "workspace_id"),
+        Index("ix_integrations_field_mapping_template_connection", "connection_id"),
+        # One template per (connection, name) — re-saving a name upserts.
+        Index(
+            "uq_integrations_field_mapping_template_connection_name",
+            "connection_id",
+            "name",
+            unique=True,
+        ),
+        # At most one default template per connection (partial unique index).
+        Index(
+            "uq_integrations_field_mapping_template_connection_default",
+            "connection_id",
+            unique=True,
+            postgresql_where=text("is_default"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_workspace.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("integrations_connection.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Human label for the template (e.g. "Opportunity defaults").
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+
+    # The provider object this template's mapping targets (e.g. "Opportunity").
+    target_object: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Snapshot of the field map + constants captured at save time (same shape as
+    # FieldMapping). Applying a template copies these onto the per-target mapping.
+    field_map: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    constants: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+    # The one template auto-applied for this connection when no per-target
+    # FieldMapping exists yet. At most one default per connection.
+    is_default: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false")
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

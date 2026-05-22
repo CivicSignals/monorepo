@@ -32,9 +32,11 @@ own providers analogously.
 from __future__ import annotations
 
 import abc
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import cast
+from urllib.parse import quote
 
 import httpx
 
@@ -407,7 +409,8 @@ def is_registered(kind: IntegrationProviderKind) -> bool:
 # (create-or-update by external id for K4 idempotency), and scope-aware error
 # mapping. The HTTP layer is the injected ``httpx.AsyncClient`` so tests mock the
 # Salesforce REST transport (no live org).
-# TODO K3 (HubSpot) / L1 (Slack): register their own providers analogously.
+# K3 (HubSpot) registers its own provider analogously (see below); L1 (Slack)
+# registers a non-CRM provider for channel selection.
 
 # Salesforce REST API version we pin requests to (path segment, e.g. /v60.0/).
 SALESFORCE_API_VERSION = "v60.0"
@@ -717,6 +720,342 @@ class SalesforceProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
         )
 
 
+# --- HubSpot provider (K3) ----------------------------------------------------
+# K3 mirrors the Salesforce connector (K2) for HubSpot: object discovery (CRM v3
+# schemas), writable-property discovery (CRM v3 properties), and create-or-update
+# push of a **Deal** — or a configurable **custom object** — over the CRM v3 REST
+# API, using the prior ``external_id`` to upsert idempotently (the K4 seam).
+# HubSpot is standard OAuth2 authorization-code (the mixin handles exchange /
+# refresh). Unlike Salesforce there is no per-org instance host: every REST call
+# targets the fixed ``api.hubapi.com`` API base, so no ``instance_url`` is needed.
+# The HTTP layer is the injected ``httpx.AsyncClient`` so tests mock the HubSpot
+# REST transport (no live portal). Token material is never logged (§4.2).
+
+# HubSpot OAuth + CRM v3 hosts.
+HUBSPOT_AUTHORIZE_URL = "https://app.hubspot.com/oauth/authorize"
+HUBSPOT_TOKEN_URL = "https://api.hubapi.com/oauth/v1/token"
+HUBSPOT_API_BASE = "https://api.hubapi.com"
+# CRM REST version segment we pin requests to (e.g. /crm/v3/objects/deals).
+HUBSPOT_CRM_VERSION = "v3"
+# The default push target when a connection has no explicit target configured.
+# HubSpot's Deal object's plural API name is ``deals`` (used in the object path).
+HUBSPOT_DEFAULT_OBJECT = "deals"
+
+# Default scopes: CRM read/write for objects + schemas. ``oauth`` is implicitly
+# granted. Discovery (schemas/properties) is covered by ``crm.objects.*`` +
+# ``crm.schemas.*`` read scopes; a deal create/update needs the deals write scope.
+HUBSPOT_DEFAULT_SCOPES: tuple[str, ...] = (
+    "crm.objects.deals.read",
+    "crm.objects.deals.write",
+    "crm.objects.custom.read",
+    "crm.objects.custom.write",
+    "crm.schemas.deals.read",
+    "crm.schemas.custom.read",
+)
+
+# Standard HubSpot CRM object type names whose schemas the discovery endpoint
+# does not return (it only lists custom objects + a subset), so we always offer
+# the well-known standard objects the connector can push to.
+HUBSPOT_STANDARD_OBJECTS: tuple[tuple[str, str], ...] = (
+    ("deals", "Deal"),
+    ("contacts", "Contact"),
+    ("companies", "Company"),
+    ("tickets", "Ticket"),
+)
+
+
+@register_provider
+class HubSpotProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
+    """The HubSpot CRM connector (K3; mirrors K2 Salesforce, doc 03 F12).
+
+    OAuth2 authorization-code (the mixin handles exchange/refresh); ``push``
+    creates or updates a HubSpot **Deal** — or a configurable **custom object** —
+    over the CRM v3 REST API, using the prior ``external_id`` to upsert
+    idempotently (the K4 seam). Discovery lists the portal's pushable objects
+    (standard + custom) and their writable properties so the field-mapping UI can
+    populate. Vendor errors map onto the scope-aware :class:`PushErrorCode`
+    taxonomy. Token material is never logged (threat-model §4.2).
+
+    Unlike Salesforce there is no per-org ``instance_url``: every REST call
+    targets the fixed ``api.hubapi.com`` host. The non-secret portal id (``hub_id``)
+    is captured in ``provider_account`` for the UI to label the connection.
+
+    Config-gated: ``HUBSPOT_CLIENT_ID`` / ``HUBSPOT_CLIENT_SECRET`` (the route
+    returns a clear 422 when unset, like the other providers).
+    """
+
+    kind = IntegrationProviderKind.HUBSPOT
+    supports_discovery = True
+
+    def oauth_config(self) -> OAuthConfig:
+        return OAuthConfig(
+            authorize_url=HUBSPOT_AUTHORIZE_URL,
+            token_url=HUBSPOT_TOKEN_URL,
+            scopes=HUBSPOT_DEFAULT_SCOPES,
+            client_id=self.settings.hubspot_client_id,
+            client_secret=self.settings.hubspot_client_secret,
+        )
+
+    def parse_token_response(self, body: dict[str, object]) -> TokenSet:
+        """Map the HubSpot token body, capturing the non-secret portal id.
+
+        HubSpot returns ``access_token`` / ``refresh_token`` / ``expires_in`` (and
+        a ``hub_id`` on some responses); the base mixin handles the tokens +
+        expiry. The portal id (``hub_id``) is non-secret and persisted in
+        ``provider_account`` for the UI; the API base is fixed so it is not
+        required to route REST calls (unlike Salesforce's ``instance_url``).
+        """
+        tokens = super().parse_token_response(body)
+        account: dict[str, object] = {}
+        hub_id = body.get("hub_id")
+        if isinstance(hub_id, str | int):
+            account["hub_id"] = str(hub_id)
+        hub_domain = body.get("hub_domain")
+        if isinstance(hub_domain, str):
+            account["hub_domain"] = hub_domain
+        if not account:
+            return tokens
+        return TokenSet(
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            expires_at=tokens.expires_at,
+            scopes=tokens.scopes,
+            provider_account=account,
+        )
+
+    # -- HTTP helpers --------------------------------------------------------
+
+    def _auth_headers(self, access_token: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    async def _request(
+        self,
+        *,
+        method: str,
+        url: str,
+        access_token: str,
+        json_body: dict[str, object] | None = None,
+    ) -> httpx.Response:
+        """Issue a HubSpot CRM v3 REST call, mapping transport errors to typed.
+
+        Network failures become ``transient``; an HTTP error status is mapped via
+        :meth:`_raise_for_status`. Token material lives only in the request
+        header, never in raised messages.
+        """
+        try:
+            resp = await self.http.request(
+                method,
+                url,
+                headers=self._auth_headers(access_token),
+                json=json_body,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(PushErrorCode.TRANSIENT, "HubSpot request failed") from exc
+        return resp
+
+    def _raise_for_status(self, resp: httpx.Response, *, context: str) -> None:
+        """Raise a scope-aware :class:`ProviderError` for a non-2xx response.
+
+        HubSpot returns a JSON error envelope ``{message, category, correlationId,
+        errors:[…]}``; we surface ``message`` and the ``correlationId`` (the
+        portal-side request trace shown in the K5 recovery UI). ``category`` such
+        as ``VALIDATION_ERROR`` refines the HTTP-status → typed-error mapping.
+        """
+        if resp.is_success:
+            return
+        code = map_http_status_to_error_code(resp.status_code)
+        message = f"HubSpot {context} returned {resp.status_code}"
+        detail: dict[str, object] | None = None
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            detail = {k: body[k] for k in ("message", "category", "errors") if k in body}
+            msg = body.get("message")
+            if isinstance(msg, str) and msg:
+                message = msg
+            # A VALIDATION_ERROR category is a non-retryable payload problem even
+            # when HubSpot returns it with a 400/409 (already ``validation``).
+            if body.get("category") == "VALIDATION_ERROR":
+                code = PushErrorCode.VALIDATION
+        correlation_id = resp.headers.get("x-hubspot-correlation-id")
+        if correlation_id is None and isinstance(body, dict):
+            cid = body.get("correlationId")
+            if isinstance(cid, str):
+                correlation_id = cid
+        raise ProviderError(
+            code,
+            message,
+            provider_response_id=correlation_id,
+            response={"status_code": resp.status_code, "detail": detail},
+        )
+
+    # -- Discovery -----------------------------------------------------------
+
+    async def discover_objects(
+        self, *, access_token: str, provider_account: dict[str, object]
+    ) -> list[ObjectDescriptor]:
+        """List the HubSpot objects this connection can push to (K3).
+
+        Always offers the well-known standard objects (Deal/Contact/Company/
+        Ticket) the connector supports, then appends the portal's custom objects
+        from the CRM v3 schemas API. The field-mapping UI uses this to populate
+        the object dropdown.
+        """
+        objects: list[ObjectDescriptor] = [
+            ObjectDescriptor(name=name, label=label, custom=False)
+            for name, label in HUBSPOT_STANDARD_OBJECTS
+        ]
+        url = f"{HUBSPOT_API_BASE}/crm/{HUBSPOT_CRM_VERSION}/schemas"
+        resp = await self._request(method="GET", url=url, access_token=access_token)
+        self._raise_for_status(resp, context="schemas")
+        body = resp.json()
+        results = body.get("results") if isinstance(body, dict) else None
+        seen = {o.name for o in objects}
+        if isinstance(results, list):
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                # Custom objects expose ``name`` (the object type's API name) and
+                # ``labels.plural`` / ``labels.singular`` for display.
+                name = entry.get("fullyQualifiedName") or entry.get("name")
+                if not isinstance(name, str) or name in seen:
+                    continue
+                labels = entry.get("labels")
+                label = name
+                if isinstance(labels, dict):
+                    plural = labels.get("plural") or labels.get("singular")
+                    if isinstance(plural, str) and plural:
+                        label = plural
+                objects.append(ObjectDescriptor(name=name, label=label, custom=True))
+                seen.add(name)
+        return objects
+
+    async def describe_object(
+        self, *, access_token: str, provider_account: dict[str, object], object_name: str
+    ) -> list[FieldDescriptor]:
+        """List the writable properties on ``object_name`` (CRM v3 properties) (K3).
+
+        Returns the non-read-only, non-calculated properties so the mapping UI only
+        offers properties it can actually write; HubSpot does not flag a property
+        ``createable``/``updateable`` separately (a writable property is writable on
+        both), so both flags mirror the writable check. ``required`` reflects the
+        HubSpot ``required`` flag (rare for deal properties).
+        """
+        obj = object_name.replace("/", "")
+        url = f"{HUBSPOT_API_BASE}/crm/{HUBSPOT_CRM_VERSION}/properties/{obj}"
+        resp = await self._request(method="GET", url=url, access_token=access_token)
+        self._raise_for_status(resp, context=f"properties {object_name}")
+        body = resp.json()
+        results = body.get("results") if isinstance(body, dict) else None
+        fields: list[FieldDescriptor] = []
+        if isinstance(results, list):
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str):
+                    continue
+                # Skip properties we can never write: read-only, HubSpot-calculated,
+                # or system fields (``hs_`` calculated). ``modificationMetadata``
+                # carries the authoritative read-only flag when present.
+                if entry.get("calculated") or entry.get("hidden"):
+                    continue
+                mod = entry.get("modificationMetadata")
+                if isinstance(mod, dict) and mod.get("readOnlyValue") is True:
+                    continue
+                label = entry.get("label")
+                fields.append(
+                    FieldDescriptor(
+                        name=name,
+                        label=label if isinstance(label, str) else name,
+                        type=str(entry.get("type", "string")),
+                        required=bool(entry.get("required", False)),
+                        createable=True,
+                        updateable=True,
+                    )
+                )
+        return fields
+
+    # -- Push (create-or-update Deal / custom object) ------------------------
+
+    def _object_name(self, target: str) -> str:
+        """Resolve the HubSpot object API name from a push target.
+
+        ``target`` is the provider-qualified target (e.g. ``hubspot.deals`` or
+        ``hubspot.deal``, or a custom object's fully-qualified name). The bare
+        object name maps to the CRM object path segment (``deals`` by default);
+        the canonical ``deal``/``deals`` alias resolves to ``deals``.
+        """
+        _, _, obj = target.partition(".")
+        obj = obj.strip()
+        if not obj:
+            return HUBSPOT_DEFAULT_OBJECT
+        if obj.lower() in ("deal", "deals"):
+            return HUBSPOT_DEFAULT_OBJECT
+        return obj
+
+    async def push(self, *, access_token: str, request: PushRequest) -> PushResult:
+        """Create or update a HubSpot object from the mapped payload (K3).
+
+        ``request.payload`` is the already-mapped, secret-free body of HubSpot
+        property → value pairs (the field-mapping service shapes it). HubSpot wraps
+        property values in a ``{"properties": {...}}` envelope. When
+        ``request.external_id`` is present the push is an idempotent PATCH update
+        (the K4 seam); otherwise it is a POST create. The new/updated record id is
+        returned as ``external_id``. Vendor errors map to scope-aware codes.
+        """
+        object_name = self._object_name(request.target)
+        objects_base = f"{HUBSPOT_API_BASE}/crm/{HUBSPOT_CRM_VERSION}/objects/{object_name}"
+
+        # Strip control keys (e.g. ``__provider_account__`` injected by the push
+        # runner — HubSpot needs no instance host); only field/value pairs go up,
+        # wrapped in HubSpot's ``properties`` envelope. Values are stringified by
+        # HubSpot itself; we pass them through as-is.
+        properties = {k: v for k, v in request.payload.items() if not k.startswith("__")}
+        json_body: dict[str, object] = {"properties": properties}
+
+        if request.external_id:
+            # Idempotent update of the previously-created record (K4 upsert seam).
+            url = f"{objects_base}/{request.external_id}"
+            resp = await self._request(
+                method="PATCH", url=url, access_token=access_token, json_body=json_body
+            )
+            self._raise_for_status(resp, context=f"update {object_name}")
+            correlation_id = resp.headers.get("x-hubspot-correlation-id")
+            return PushResult(
+                external_id=request.external_id,
+                response={"id": request.external_id, "updated": True},
+                provider_response_id=correlation_id,
+                created=False,
+            )
+
+        # Create a new record.
+        resp = await self._request(
+            method="POST", url=objects_base, access_token=access_token, json_body=json_body
+        )
+        self._raise_for_status(resp, context=f"create {object_name}")
+        result_body = resp.json() if resp.content else {}
+        new_id = result_body.get("id") if isinstance(result_body, dict) else None
+        if not isinstance(new_id, str):
+            raise ProviderError(
+                PushErrorCode.UNKNOWN,
+                "HubSpot create returned no record id",
+                response={"keys": sorted(result_body) if isinstance(result_body, dict) else []},
+            )
+        return PushResult(
+            external_id=new_id,
+            response={"id": new_id},
+            provider_response_id=resp.headers.get("x-hubspot-correlation-id"),
+            created=True,
+        )
+
+
 # --- Slack provider (L1) -------------------------------------------------------
 # Slack OAuth v2 (oauth.v2.access), bot token, channel listing.  The HTTP layer
 # is the injected httpx.AsyncClient (no live Slack calls in tests).  Token
@@ -725,6 +1064,12 @@ class SalesforceProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
 SLACK_OAUTH_AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
 SLACK_OAUTH_TOKEN_URL = "https://slack.com/api/oauth.v2.access"
 SLACK_CONVERSATIONS_LIST_URL = "https://slack.com/api/conversations.list"
+SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
+
+# Block Kit ``action_id``s carried on the alert's interactive buttons (L2). A
+# future Slack interactions webhook (out of scope here) dispatches on these.
+SLACK_ACTION_DISMISS = "cs_signal_dismiss"
+SLACK_ACTION_PUSH_CRM = "cs_signal_push_crm"
 
 # Default scopes: bot token needs channels:read (list channels) + chat:write
 # (send messages — consumed by L2).  chat:write.public is added so the bot can
@@ -746,6 +1091,168 @@ class SlackChannel:
     is_member: bool = False
 
 
+def _slack_signal_url(web_base_url: str, signal_id: str | None) -> str:
+    """Deep link to a signal's detail page (mirrors the H4 digest convention).
+
+    Uses the operator-configured web app base (``Settings.web_base_url``) and the
+    same ``/signals/{id}`` G2 route the digest emails / feed link to, so a Slack
+    alert and an email digest point a recipient at the same page.
+    """
+    base = web_base_url.rstrip("/")
+    if not signal_id:
+        return f"{base}/feed"
+    return f"{base}/signals/{quote(str(signal_id), safe='')}"
+
+
+def build_slack_signal_blocks(
+    signal: dict[str, object],
+    *,
+    workspace_id: str,
+    web_base_url: str,
+) -> list[dict[str, object]]:
+    """Build a compact Block Kit message for a signal alert (L2; pure function).
+
+    Renders the signal as a section (title + a context line of type · entity ·
+    score · date), an optional summary section, a "View signal" link button, and
+    an ``actions`` block with **Dismiss** and **Push to CRM** buttons. The action
+    buttons carry the signal + workspace ids in their ``value`` (JSON) and a stable
+    ``action_id`` (:data:`SLACK_ACTION_DISMISS` / :data:`SLACK_ACTION_PUSH_CRM`) so
+    a future Slack interactions webhook can dispatch on them without re-fetching
+    context. All optional fields are tolerated (a signal with only a title still
+    renders a valid message).
+
+    ``signal`` keys mirror the H4 digest payload (``signal_id``, ``title``,
+    ``signal_type``, ``entity``, ``score``, ``occurred_at``, ``summary``); every
+    field is optional except that an empty title falls back to "Untitled signal".
+    """
+    signal_id_raw = signal.get("signal_id") or signal.get("id")
+    signal_id = str(signal_id_raw) if signal_id_raw is not None else None
+    title = signal.get("title")
+    title_text = str(title) if isinstance(title, str) and title.strip() else "Untitled signal"
+
+    # Context line: human signal-type label · entity · score · date — each part is
+    # omitted when its source field is missing, so a sparse signal still renders.
+    context_parts: list[str] = []
+    signal_type = signal.get("signal_type")
+    if isinstance(signal_type, str) and signal_type:
+        context_parts.append(_slack_signal_type_label(signal_type))
+    entity = signal.get("entity")
+    if isinstance(entity, str) and entity:
+        context_parts.append(entity)
+    score = signal.get("score")
+    if isinstance(score, int | float):
+        context_parts.append(f"Score {round(float(score))}")
+    occurred_at = signal.get("occurred_at") or signal.get("date")
+    if isinstance(occurred_at, str) and occurred_at:
+        # Show just the date portion when an ISO timestamp is supplied.
+        context_parts.append(occurred_at.split("T", 1)[0])
+
+    url = _slack_signal_url(web_base_url, signal_id)
+
+    blocks: list[dict[str, object]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{_slack_escape(title_text)}*"},
+        }
+    ]
+    if context_parts:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": _slack_escape(" · ".join(context_parts))}],
+            }
+        )
+
+    summary = signal.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": _slack_escape(summary.strip())},
+            }
+        )
+
+    # Carry the ids on each action so the (future) interactions webhook can act
+    # without re-deriving context from the message.
+    value = json.dumps({"signal_id": signal_id, "workspace_id": workspace_id})
+    blocks.append(
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View signal"},
+                    "url": url,
+                    "action_id": "cs_signal_view",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Dismiss"},
+                    "style": "danger",
+                    "action_id": SLACK_ACTION_DISMISS,
+                    "value": value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Push to CRM"},
+                    "style": "primary",
+                    "action_id": SLACK_ACTION_PUSH_CRM,
+                    "value": value,
+                },
+            ],
+        }
+    )
+    return blocks
+
+
+def _slack_signal_type_label(signal_type: str) -> str:
+    """Title-case a raw ``signal_type`` (``rfp_posted`` → ``RFP Posted``).
+
+    Mirrors ``notifications.templates.signal_type_label`` so the Slack alert and
+    the digest email label a signal type identically; kept local to avoid a
+    cross-module import (modules call each other only via ``services``).
+    """
+    words = [w for w in signal_type.replace("-", "_").split("_") if w]
+    initialisms = {"rfp", "rfi", "rfq", "icp"}
+    return " ".join(w.upper() if w in initialisms else w.capitalize() for w in words)
+
+
+def _slack_escape(text: str) -> str:
+    """Escape the three characters Slack treats specially in mrkdwn/plain text.
+
+    Slack requires ``&``, ``<`` and ``>`` to be HTML-entity-escaped in message
+    text (signal titles/entities/summaries are ingest-controlled third-party
+    content), per the Slack message-formatting docs.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# Slack Web API ``ok=false`` error strings → the scope-aware typed code (L2). The
+# HTTP status is always 200 for these, so the error string is the only signal.
+_SLACK_AUTH_ERRORS = frozenset(
+    {"invalid_auth", "not_authed", "token_revoked", "account_inactive", "token_expired"}
+)
+_SLACK_PERMISSION_ERRORS = frozenset(
+    {"missing_scope", "not_allowed_token_type", "restricted_action", "not_in_channel"}
+)
+_SLACK_NOT_FOUND_ERRORS = frozenset({"channel_not_found", "is_archived"})
+
+
+def _slack_error_to_code(error: str) -> PushErrorCode:
+    """Map a Slack ``chat.postMessage`` ``error`` string to a typed push code (L2)."""
+    if error in _SLACK_AUTH_ERRORS:
+        return PushErrorCode.AUTH
+    if error in _SLACK_PERMISSION_ERRORS:
+        return PushErrorCode.PERMISSION
+    if error in _SLACK_NOT_FOUND_ERRORS:
+        return PushErrorCode.NOT_FOUND
+    if error in ("rate_limited", "ratelimited"):
+        return PushErrorCode.RATE_LIMITED
+    if error in ("msg_too_long", "no_text", "invalid_blocks", "invalid_arguments"):
+        return PushErrorCode.VALIDATION
+    return PushErrorCode.UNKNOWN
+
+
 @register_provider
 class SlackProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
     """The Slack workspace-install connector (L1).
@@ -760,9 +1267,11 @@ class SlackProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
     ``list_channels`` method (called by the L1 routes) rather than the K2
     discovery interface (which is object/field-level, not channel-level).
 
-    ``push`` is a L2 seam: the L1 task is connection + channel selection only.
-    L2 lands the formatted message send; ``push`` raises ``NotImplementedError``
-    here to make accidental routing obvious.
+    ``push`` (L2) posts a compact Block Kit signal alert to the selected channel
+    via ``chat.postMessage``; the message carries Dismiss / Push-to-CRM action
+    buttons (the formatter is :func:`build_slack_signal_blocks`). Slack returns
+    ``ok: false`` with an ``error`` string on failure, which maps onto the
+    scope-aware :class:`PushErrorCode` taxonomy.
 
     Config-gated: ``SLACK_CLIENT_ID`` / ``SLACK_CLIENT_SECRET`` (no-op /
     ``provider_not_configured`` when unset, like other providers).
@@ -942,17 +1451,84 @@ class SlackProvider(OAuth2AuthorizationCodeMixin, IntegrationProvider):
         return channels
 
     async def push(self, *, access_token: str, request: PushRequest) -> PushResult:
-        """L2 seam: send a formatted Slack message (not yet implemented in L1).
+        """Post a compact Block Kit signal alert to the selected channel (L2).
 
-        L1 is connection + channel selection only; L2 lands the message format
-        and the actual ``chat.postMessage`` call.  Raising here makes accidental
-        routing obvious without silently dropping the push.
+        The push runner shapes ``request.payload`` as the signal fields (mirroring
+        the H4 digest payload — ``signal_id``/``title``/``signal_type``/``entity``/
+        ``score``/``occurred_at``/``summary``) plus two control keys it strips
+        before formatting: ``__channel__`` (the selected Slack channel id, required;
+        falls back to ``request.target``) and ``__workspace_id__`` (carried into the
+        action-button values). The message is built by
+        :func:`build_slack_signal_blocks` (title, context, summary, View/Dismiss/
+        Push-to-CRM buttons) and posted via ``chat.postMessage``.
 
-        # TODO L2: implement Slack push (chat.postMessage to the selected channel).
+        Slack always answers ``200`` with an ``{ok, error?}`` envelope; we map a
+        falsey ``ok`` onto the scope-aware :class:`PushErrorCode` taxonomy (auth
+        errors → ``needs_reauth`` upstream). The posted message ``ts`` is returned
+        as ``external_id`` so a re-push could ``chat.update`` it (K4 seam).
+
+        # TODO L2-interactions: a Slack interactions webhook endpoint
+        # (``/integrations/slack/interactions``) is out of scope here; it will verify
+        # the Slack request signature and dispatch on the Dismiss / Push-to-CRM
+        # ``action_id``s (SLACK_ACTION_DISMISS / SLACK_ACTION_PUSH_CRM), reading the
+        # signal/workspace ids from the button ``value``.
         """
-        raise NotImplementedError(
-            "Slack push (chat.postMessage) is implemented in L2. "
-            "L1 covers connection + channel selection only."
+        payload = dict(request.payload)
+        channel = payload.pop("__channel__", None) or request.target
+        if not isinstance(channel, str) or not channel:
+            raise ProviderError(
+                PushErrorCode.VALIDATION,
+                "Slack push requires a target channel (none selected)",
+            )
+        workspace_id_raw = payload.pop("__workspace_id__", "")
+        workspace_id = str(workspace_id_raw) if workspace_id_raw is not None else ""
+        # Strip any remaining control keys; what's left is the signal payload.
+        signal = {k: v for k, v in payload.items() if not k.startswith("__")}
+
+        blocks = build_slack_signal_blocks(
+            signal,
+            workspace_id=workspace_id,
+            web_base_url=self.settings.web_base_url,
+        )
+        title = signal.get("title")
+        # ``text`` is the notification/fallback summary (push notifications, screen
+        # readers, clients that can't render blocks).
+        fallback = f"New signal: {title}" if isinstance(title, str) and title else "New signal"
+        body: dict[str, object] = {"channel": channel, "text": fallback, "blocks": blocks}
+
+        try:
+            resp = await self.http.post(
+                SLACK_POST_MESSAGE_URL,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                PushErrorCode.TRANSIENT, "Slack chat.postMessage unreachable"
+            ) from exc
+        if resp.status_code >= 400:
+            raise ProviderError(
+                map_http_status_to_error_code(resp.status_code),
+                f"Slack chat.postMessage returned {resp.status_code}",
+                response={"status_code": resp.status_code},
+            )
+        result = resp.json()
+        if not result.get("ok"):
+            error = result.get("error", "unknown_error")
+            raise ProviderError(
+                _slack_error_to_code(str(error)),
+                f"Slack chat.postMessage failed: {error}",
+                response={"error": error},
+            )
+        ts = result.get("ts")
+        # ``ts`` (the message timestamp) doubles as its id for a future chat.update.
+        return PushResult(
+            external_id=ts if isinstance(ts, str) else None,
+            response={"channel": result.get("channel"), "ts": ts},
+            created=True,
         )
 
 

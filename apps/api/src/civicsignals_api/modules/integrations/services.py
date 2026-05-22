@@ -65,6 +65,7 @@ from .models import (
     Connection,
     ConnectionStatus,
     FieldMapping,
+    FieldMappingTemplate,
     IntegrationProviderKind,
     PushErrorCode,
     PushIdempotency,
@@ -687,6 +688,168 @@ async def delete_field_mapping(session: AsyncSession, mapping: FieldMapping) -> 
 
 
 # ---------------------------------------------------------------------------
+# Field-mapping templates / per-connection defaults (K6)
+# ---------------------------------------------------------------------------
+# K6 lets an admin save the *current* mapping as a named, reusable template per
+# connection (optionally the connection default), list a connection's templates,
+# and apply one back onto a target's live FieldMapping. All workspace-scoped (B5)
+# and connection-scoped so a caller can never reach another tenant's template.
+
+
+class TemplateNotFoundError(IntegrationError):
+    """A template lookup/apply targeted a template not in this workspace (K6)."""
+
+
+async def list_field_mapping_templates(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID
+) -> list[FieldMappingTemplate]:
+    """List a connection's saved field-mapping templates (workspace-scoped, K6).
+
+    Defaults are surfaced first, then alphabetically by name, so the UI can show
+    the connection default at the top of the apply menu.
+    """
+    result = await session.execute(
+        select(FieldMappingTemplate)
+        .where(
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+        )
+        .order_by(
+            FieldMappingTemplate.is_default.desc(),
+            FieldMappingTemplate.name.asc(),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def get_field_mapping_template(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID, template_id: UUID
+) -> FieldMappingTemplate | None:
+    """Return one template scoped to (workspace, connection), or ``None`` (K6).
+
+    Scoping by workspace **and** connection (not just id) is the isolation guard:
+    a guessed template id from another tenant/connection never resolves.
+    """
+    result = await session.execute(
+        select(FieldMappingTemplate).where(
+            FieldMappingTemplate.id == template_id,
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_default_field_mapping_template(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID
+) -> FieldMappingTemplate | None:
+    """Return the connection's default template, or ``None`` (K6)."""
+    result = await session.execute(
+        select(FieldMappingTemplate).where(
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+            FieldMappingTemplate.is_default.is_(True),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_template_by_name(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID, name: str
+) -> FieldMappingTemplate | None:
+    result = await session.execute(
+        select(FieldMappingTemplate).where(
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+            FieldMappingTemplate.name == name,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def save_field_mapping_template(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    name: str,
+    target_object: str,
+    field_map: dict[str, object],
+    constants: dict[str, object] | None = None,
+    is_default: bool = False,
+) -> FieldMappingTemplate:
+    """Save the current mapping as a named template for a connection (K6). Caller commits.
+
+    Upserts by ``(connection, name)`` — re-saving the same name replaces its
+    snapshot. When ``is_default`` is requested, any *other* default template for
+    the connection is cleared first so the "at most one default per connection"
+    invariant holds (mirrored by the partial unique index for safety).
+    """
+    if is_default:
+        # Clear any existing default on this connection before flagging this one,
+        # so the partial unique index never trips on the same flush.
+        existing_default = await get_default_field_mapping_template(
+            session, workspace_id=workspace_id, connection_id=connection_id
+        )
+        if existing_default is not None and existing_default.name != name:
+            existing_default.is_default = False
+            await session.flush()
+
+    template = await _get_template_by_name(
+        session, workspace_id=workspace_id, connection_id=connection_id, name=name
+    )
+    if template is None:
+        template = FieldMappingTemplate(
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            name=name,
+            target_object=target_object,
+            field_map=dict(field_map),
+            constants=dict(constants or {}),
+            is_default=is_default,
+        )
+        session.add(template)
+    else:
+        template.target_object = target_object
+        template.field_map = dict(field_map)
+        template.constants = dict(constants or {})
+        template.is_default = is_default
+    await session.flush()
+    return template
+
+
+async def apply_field_mapping_template(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    template: FieldMappingTemplate,
+) -> FieldMapping:
+    """Apply a template onto the connection's live mapping for its target (K6). Caller commits.
+
+    Copies the template's ``field_map``/``constants`` onto the per-target
+    :class:`FieldMapping` (upserting by ``target_object``) so the next push uses
+    the saved blueprint. Returns the resulting live mapping.
+    """
+    return await upsert_field_mapping(
+        session,
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+        target_object=template.target_object,
+        field_map=dict(template.field_map),
+        constants=dict(template.constants),
+    )
+
+
+async def delete_field_mapping_template(
+    session: AsyncSession, template: FieldMappingTemplate
+) -> None:
+    """Delete a saved template. Caller commits (K6)."""
+    await session.delete(template)
+    await session.flush()
+
+
+# ---------------------------------------------------------------------------
 # Apply a field mapping to a source object → provider payload (K2)
 # ---------------------------------------------------------------------------
 
@@ -978,6 +1141,23 @@ async def push_source(
         connection_id=connection.id,
         target_object=object_name,
     )
+    # K6: if no per-target mapping is configured yet, fall back to the
+    # connection's default template (when it targets this object) so a saved
+    # default auto-applies without the caller first materialising a mapping.
+    if mapping is None and field_map_override is None:
+        default_template = await get_default_field_mapping_template(
+            session,
+            workspace_id=connection.workspace_id,
+            connection_id=connection.id,
+        )
+        if default_template is not None and default_template.target_object == object_name:
+            mapping = FieldMapping(
+                workspace_id=connection.workspace_id,
+                connection_id=connection.id,
+                target_object=object_name,
+                field_map=dict(default_template.field_map),
+                constants=dict(default_template.constants),
+            )
     if field_map_override is not None:
         # An inline override is applied on top of the saved mapping (or alone).
         override = FieldMapping(
@@ -1180,6 +1360,228 @@ async def list_push_log(
     items = rows[:limit]
     next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
     return PushLogPage(items=items, next_cursor=next_cursor)
+
+
+# ---------------------------------------------------------------------------
+# K5: push-failure recovery (list failures, inline diagnosis, retry)
+# ---------------------------------------------------------------------------
+
+# The push-log states that need operator/recovery-UI attention: a ``failed`` row
+# is waiting on the retry sweeper but can be retried immediately by an operator;
+# a ``dead_letter`` row has exhausted retries (or hit a non-retryable error) and
+# *only* a manual retry (after a fix / reconnect) will clear it.
+PUSH_FAILURE_STATUSES: tuple[PushStatus, ...] = (PushStatus.FAILED, PushStatus.DEAD_LETTER)
+
+
+@dataclass(frozen=True, slots=True)
+class PushErrorDiagnosis:
+    """A human-readable diagnosis of a failed push, derived from its error code (K5).
+
+    ``cause`` is a short operator-facing explanation; ``recommended_action`` tells
+    the recovery UI what to suggest; ``retryable`` reflects whether retrying the
+    same payload could plausibly succeed (``False`` for validation/permission/
+    not-found, which need a fix first); ``needs_reauth`` flags credential failures
+    that require reconnecting the integration before a retry can work.
+    """
+
+    code: PushErrorCode
+    cause: str
+    recommended_action: str
+    retryable: bool
+    needs_reauth: bool
+
+
+# Static, provider-agnostic diagnosis per scope-aware error code (K5). The
+# recovery UI renders ``cause`` inline and branches its CTA on ``needs_reauth`` /
+# ``retryable``. Mirrors the routing the push runner already does on these codes.
+_ERROR_DIAGNOSES: dict[PushErrorCode, PushErrorDiagnosis] = {
+    PushErrorCode.AUTH: PushErrorDiagnosis(
+        code=PushErrorCode.AUTH,
+        cause="The connection's credentials are invalid or expired.",
+        recommended_action="Reconnect the integration, then retry.",
+        retryable=True,
+        needs_reauth=True,
+    ),
+    PushErrorCode.PERMISSION: PushErrorDiagnosis(
+        code=PushErrorCode.PERMISSION,
+        cause="The connection's token lacks the scope/permission for this object.",
+        recommended_action="Reconnect with the required permissions, then retry.",
+        retryable=False,
+        needs_reauth=True,
+    ),
+    PushErrorCode.RATE_LIMITED: PushErrorDiagnosis(
+        code=PushErrorCode.RATE_LIMITED,
+        cause="The provider rate-limited the request.",
+        recommended_action="Wait a moment and retry.",
+        retryable=True,
+        needs_reauth=False,
+    ),
+    PushErrorCode.VALIDATION: PushErrorDiagnosis(
+        code=PushErrorCode.VALIDATION,
+        cause="The provider rejected the payload (a required field is missing or invalid).",
+        recommended_action="Fix the field mapping, then retry.",
+        retryable=False,
+        needs_reauth=False,
+    ),
+    PushErrorCode.NOT_FOUND: PushErrorDiagnosis(
+        code=PushErrorCode.NOT_FOUND,
+        cause="The target object no longer exists in the provider.",
+        recommended_action="Check the target object, then retry.",
+        retryable=False,
+        needs_reauth=False,
+    ),
+    PushErrorCode.TRANSIENT: PushErrorDiagnosis(
+        code=PushErrorCode.TRANSIENT,
+        cause="The provider had a transient error (5xx or network failure).",
+        recommended_action="Retry; it usually resolves on its own.",
+        retryable=True,
+        needs_reauth=False,
+    ),
+    PushErrorCode.UNKNOWN: PushErrorDiagnosis(
+        code=PushErrorCode.UNKNOWN,
+        cause="The push failed for an unclassified reason.",
+        recommended_action="Inspect the push-log entry, then retry.",
+        retryable=True,
+        needs_reauth=False,
+    ),
+}
+
+
+def diagnose_push_error(code: PushErrorCode | None) -> PushErrorDiagnosis | None:
+    """Return the human-readable diagnosis for a push-log error code (K5).
+
+    ``None`` when the row carries no typed error (e.g. it has not failed yet).
+    Pure lookup so the route + UI can render an inline cause without re-deriving
+    the branching the push runner already encodes.
+    """
+    if code is None:
+        return None
+    return _ERROR_DIAGNOSES.get(code, _ERROR_DIAGNOSES[PushErrorCode.UNKNOWN])
+
+
+async def get_push_log(
+    session: AsyncSession, workspace_id: UUID, push_log_id: UUID
+) -> PushLog | None:
+    """Return one push-log row scoped to ``workspace_id`` (K5), or ``None``.
+
+    Workspace-scoped (B5) so a recovery-UI link / retry cannot reach another
+    tenant's push-log entry even with a guessed id.
+    """
+    result = await session.execute(
+        select(PushLog).where(
+            PushLog.id == push_log_id,
+            PushLog.workspace_id == workspace_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_failed_pushes(
+    session: AsyncSession,
+    workspace_id: UUID,
+    *,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    connection_id: UUID | None = None,
+) -> PushLogPage:
+    """Return a cursor-paginated, newest-first page of *failed* pushes (K5).
+
+    The recovery surface only wants rows needing attention, so this narrows the
+    push-log to :data:`PUSH_FAILURE_STATUSES` (``failed`` + ``dead_letter``).
+    Scoped to ``workspace_id``; optional ``connection_id`` narrows further.
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    stmt = (
+        select(PushLog)
+        .where(
+            PushLog.workspace_id == workspace_id,
+            PushLog.status.in_(PUSH_FAILURE_STATUSES),
+        )
+        .order_by(PushLog.id.desc())
+    )
+    if connection_id is not None:
+        stmt = stmt.where(PushLog.connection_id == connection_id)
+    if cursor is not None:
+        stmt = stmt.where(PushLog.id < _decode_cursor(cursor))
+    stmt = stmt.limit(limit + 1)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
+    return PushLogPage(items=items, next_cursor=next_cursor)
+
+
+async def retry_push_log(
+    session: AsyncSession,
+    *,
+    connection: Connection,
+    log: PushLog,
+    settings: Settings | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> PushLog:
+    """Re-attempt a failed push, routing through the K4 idempotent path (K5).
+
+    Rebuilds the :class:`PushRequest` from the *stored* push-log row — the already
+    mapped, secret-free ``request`` payload, its ``target`` and ``idempotency_key``
+    — so the retry replays exactly what was attempted (no re-mapping, no need to
+    re-supply the source). A fresh push-log row is appended (the log stays an
+    append-only audit; the original failed row is left untouched as evidence).
+
+    **Idempotency (K4 reuse):** before pushing, the canonical
+    ``(connection_id, idempotency_key) → external_id`` mapping is looked up in
+    :class:`PushIdempotency`. If a prior push of the same logical record actually
+    succeeded — even one whose push-log row recorded a failure (e.g. the provider
+    created the object but the response timed out) — its ``external_id`` is passed
+    to the provider so the retry routes through the *update* path and never
+    duplicates the CRM object. On success the mapping is upserted, same as
+    :func:`push_source`. Never raises on a provider failure — the outcome lives in
+    the returned (new) log row. The caller commits.
+    """
+    settings = settings or get_settings()
+
+    resolved_key = log.idempotency_key
+    prior_external_id: str | None = None
+    if resolved_key:
+        prior = await _get_push_idempotency(
+            session, connection_id=connection.id, idempotency_key=resolved_key
+        )
+        if prior is not None:
+            prior_external_id = prior.external_id
+
+    payload = dict(log.request)
+    retry_log = await create_push_log(
+        session,
+        workspace_id=log.workspace_id,
+        connection_id=connection.id,
+        target=log.target,
+        request=payload,
+        signal_id=log.signal_id,
+        pipeline_item_id=log.pipeline_item_id,
+        idempotency_key=resolved_key,
+    )
+    request = PushRequest(
+        target=log.target,
+        payload=payload,
+        idempotency_key=resolved_key,
+        external_id=prior_external_id,
+    )
+    result_log = await execute_push(
+        session,
+        connection=connection,
+        log=retry_log,
+        request=request,
+        settings=settings,
+        http_client=http_client,
+    )
+    if result_log.status == PushStatus.SUCCESS and resolved_key and result_log.external_id:
+        await _upsert_push_idempotency(
+            session,
+            connection_id=connection.id,
+            idempotency_key=resolved_key,
+            external_id=result_log.external_id,
+        )
+    return result_log
 
 
 # ---------------------------------------------------------------------------

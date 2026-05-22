@@ -1,15 +1,20 @@
-// Salesforce connection + field-mapping UI (K2; doc 04 J3/F-2, doc 08 §3.6).
+// HubSpot connection + field-mapping UI (K3; mirrors SalesforceSettings, doc 08 §3.6).
 //
-// Admin-only settings island: connect Salesforce (OAuth redirect), then per
-// connection pick a target object (from discovery), map signal/pipeline-item
-// fields onto the object's writable fields (rows populated from discovery), and
-// save the mapping. TanStack Query owns all server state (doc 06 §2).
+// Admin-only settings island: connect HubSpot (OAuth redirect), then per
+// connection pick a target object (from discovery — Deal by default, plus
+// custom objects), map signal/pipeline-item fields onto the object's writable
+// properties (rows populated from discovery, including custom properties), and
+// save the mapping. The push framework upserts by external id (K4 idempotent).
+// All server state lives in TanStack Query (doc 06 §2); the connection +
+// field-mapping + discovery + push endpoints are provider-generic, so this
+// component reuses the same hooks as Salesforce — only the provider id, default
+// object, and HubSpot-specific copy differ.
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { FieldMappingTemplates } from "@/components/integrations/field-mapping-templates";
 import {
-  useConnectSalesforce,
+  useConnectHubspot,
   useConnections,
   useDisconnect,
   useFieldMappings,
@@ -32,16 +37,16 @@ const SOURCE_FIELDS: { value: string; label: string }[] = [
   { value: "signal.fields.due_at", label: "Due date" },
 ];
 
-export function SalesforceSettings({
+export function HubspotSettings({
   workspaceId,
 }: {
   workspaceId: string | undefined;
 }) {
   const connections = useConnections(workspaceId);
-  const salesforceConnections = useMemo(
+  const hubspotConnections = useMemo(
     () =>
       (connections.data ?? []).filter(
-        (c) => c.provider === "salesforce" && c.status !== "revoked",
+        (c) => c.provider === "hubspot" && c.status !== "revoked",
       ),
     [connections.data],
   );
@@ -49,23 +54,23 @@ export function SalesforceSettings({
   if (!workspaceId) {
     return (
       <p className="text-sm text-muted-foreground">
-        Select or create a workspace first to manage Salesforce.
+        Select or create a workspace first to manage HubSpot.
       </p>
     );
   }
 
   return (
-    <div className="space-y-6" data-testid="salesforce-settings">
+    <div className="space-y-6" data-testid="hubspot-settings">
       <ConnectCard workspaceId={workspaceId} />
       {connections.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading connections…</p>
-      ) : salesforceConnections.length === 0 ? (
+      ) : hubspotConnections.length === 0 ? (
         <p className="text-sm text-muted-foreground" data-testid="no-connections">
-          No Salesforce connection yet. Connect one above to map fields and push
+          No HubSpot connection yet. Connect one above to map properties and push
           signals.
         </p>
       ) : (
-        salesforceConnections.map((conn) => (
+        hubspotConnections.map((conn) => (
           <ConnectionPanel
             key={conn.id}
             workspaceId={workspaceId}
@@ -78,8 +83,8 @@ export function SalesforceSettings({
 }
 
 function ConnectCard({ workspaceId }: { workspaceId: string }) {
-  const [name, setName] = useState("Salesforce production");
-  const connect = useConnectSalesforce(workspaceId);
+  const [name, setName] = useState("HubSpot production");
+  const connect = useConnectHubspot(workspaceId);
 
   function onConnect() {
     connect.mutate(name, {
@@ -93,10 +98,9 @@ function ConnectCard({ workspaceId }: { workspaceId: string }) {
 
   return (
     <div className="rounded-lg border p-4" data-testid="connect-card">
-      <h2 className="text-lg font-semibold">Connect Salesforce</h2>
+      <h2 className="text-lg font-semibold">Connect HubSpot</h2>
       <p className="mt-1 text-sm text-muted-foreground">
-        Authorize CivicSignals to create and update records in your Salesforce
-        org.
+        Authorize CivicSignals to create and update deals in your HubSpot portal.
       </p>
       <div className="mt-3 flex gap-2">
         <input
@@ -107,7 +111,7 @@ function ConnectCard({ workspaceId }: { workspaceId: string }) {
         />
         <button
           type="button"
-          data-testid="connect-salesforce-btn"
+          data-testid="connect-hubspot-btn"
           disabled={connect.isPending || name.trim().length === 0}
           onClick={onConnect}
           className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-50"
@@ -117,8 +121,8 @@ function ConnectCard({ workspaceId }: { workspaceId: string }) {
       </div>
       {connect.isError ? (
         <p role="alert" className="mt-2 text-sm text-destructive">
-          Could not start the Salesforce connection. Check that the integration
-          is configured.
+          Could not start the HubSpot connection. Check that the integration is
+          configured.
         </p>
       ) : null}
     </div>
@@ -181,7 +185,7 @@ function ConnectionPanel({
           htmlFor={`object-${connection.id}`}
           className="block text-sm font-medium"
         >
-          Salesforce object
+          HubSpot object
         </label>
         <select
           id={`object-${connection.id}`}
@@ -191,9 +195,7 @@ function ConnectionPanel({
           onChange={(e) => setTargetObject(e.target.value)}
         >
           {(objects.data ?? []).length === 0 ? (
-            <option value={targetObject || ""}>
-              {targetObject || "Opportunity"}
-            </option>
+            <option value={targetObject || ""}>{targetObject || "deals"}</option>
           ) : (
             (objects.data ?? []).map((o) => (
               <option key={o.name} value={o.name}>
@@ -261,21 +263,21 @@ function FieldMappingEditor({
 
   return (
     <div className="mt-4" data-testid="field-mapping-editor">
-      <h4 className="text-sm font-semibold">Field mapping</h4>
+      <h4 className="text-sm font-semibold">Property mapping</h4>
       <p className="text-sm text-muted-foreground">
-        Map each Salesforce field to a signal value.
+        Map each HubSpot property (including custom properties) to a signal value.
       </p>
       {fields.isLoading ? (
-        <p className="mt-2 text-sm text-muted-foreground">Loading fields…</p>
+        <p className="mt-2 text-sm text-muted-foreground">Loading properties…</p>
       ) : (fields.data ?? []).length === 0 ? (
         <p className="mt-2 text-sm text-muted-foreground" data-testid="no-fields">
-          No writable fields discovered for this object.
+          No writable properties discovered for this object.
         </p>
       ) : (
         <table className="mt-2 w-full text-sm">
           <thead>
             <tr className="text-left text-muted-foreground">
-              <th className="py-1">Salesforce field</th>
+              <th className="py-1">HubSpot property</th>
               <th className="py-1">Signal value</th>
             </tr>
           </thead>

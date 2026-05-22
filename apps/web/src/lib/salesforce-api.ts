@@ -81,10 +81,46 @@ export interface PushLogEntry {
   created_at: string;
 }
 
+// K5: a failed push-log row plus its inline diagnosis (human-readable cause +
+// CTA flags) so the recovery UI can branch reconnect-vs-retry without re-deriving
+// the error category client-side.
+export interface PushDiagnosis {
+  code: string;
+  cause: string;
+  recommended_action: string;
+  retryable: boolean;
+  needs_reauth: boolean;
+}
+
+export interface PushFailureEntry extends PushLogEntry {
+  diagnosis: PushDiagnosis | null;
+}
+
 export interface FieldMappingInput {
   target_object: string;
   field_map: Record<string, string>;
   constants?: Record<string, unknown>;
+}
+
+// K6: a saved, named field-mapping template (per-connection default/blueprint).
+export interface FieldMappingTemplate {
+  id: string;
+  connection_id: string;
+  name: string;
+  target_object: string;
+  field_map: Record<string, string>;
+  constants: Record<string, unknown>;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FieldMappingTemplateInput {
+  name: string;
+  target_object: string;
+  field_map: Record<string, string>;
+  constants?: Record<string, unknown>;
+  is_default?: boolean;
 }
 
 export interface PushInput {
@@ -149,6 +185,26 @@ export function connectSalesforce(
       provider: "salesforce",
       name,
       default_targets: ["Opportunity"],
+    }),
+    token,
+    workspaceId,
+  });
+}
+
+// K3: start the HubSpot OAuth flow. Mirrors connectSalesforce — the API surface
+// is provider-generic, so only the provider id + default target object differ
+// (HubSpot's Deal object's plural API name is "deals").
+export function connectHubspot(
+  token: string,
+  workspaceId: string,
+  name: string,
+): Promise<ConnectionCreated> {
+  return request<ConnectionCreated>("/integrations/connections", {
+    method: "POST",
+    body: JSON.stringify({
+      provider: "hubspot",
+      name,
+      default_targets: ["deals"],
     }),
     token,
     workspaceId,
@@ -237,6 +293,61 @@ export function deleteFieldMapping(
   );
 }
 
+// ---- Field-mapping templates / per-connection defaults (K6) ----
+
+export async function listFieldMappingTemplates(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+): Promise<FieldMappingTemplate[]> {
+  const body = await request<{ data: FieldMappingTemplate[] }>(
+    `/integrations/connections/${connectionId}/field-mapping-templates`,
+    { token, workspaceId },
+  );
+  return body.data;
+}
+
+export function saveFieldMappingTemplate(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+  input: FieldMappingTemplateInput,
+): Promise<FieldMappingTemplate> {
+  return request<FieldMappingTemplate>(
+    `/integrations/connections/${connectionId}/field-mapping-templates`,
+    {
+      method: "POST",
+      body: JSON.stringify(input),
+      token,
+      workspaceId,
+    },
+  );
+}
+
+export function applyFieldMappingTemplate(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+  templateId: string,
+): Promise<FieldMapping> {
+  return request<FieldMapping>(
+    `/integrations/connections/${connectionId}/field-mapping-templates/${templateId}/apply`,
+    { method: "POST", token, workspaceId },
+  );
+}
+
+export function deleteFieldMappingTemplate(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+  templateId: string,
+): Promise<void> {
+  return request<void>(
+    `/integrations/connections/${connectionId}/field-mapping-templates/${templateId}`,
+    { method: "DELETE", token, workspaceId },
+  );
+}
+
 // ---- Push ----
 
 export async function pushSignal(
@@ -253,6 +364,40 @@ export async function pushSignal(
       token,
       workspaceId,
     },
+  );
+  return body.push_log;
+}
+
+// ---- Push-failure recovery (K5) ----
+
+// List recent failed/dead-letter pushes for the workspace, each with an inline
+// diagnosis. Optionally narrowed to one connection. (RequireMember on the API.)
+export async function listPushFailures(
+  token: string,
+  workspaceId: string,
+  connectionId?: string,
+): Promise<PushFailureEntry[]> {
+  const qs = connectionId
+    ? `?connection_id=${encodeURIComponent(connectionId)}`
+    : "";
+  const body = await request<{ data: PushFailureEntry[] }>(
+    `/integrations/push-log/failures${qs}`,
+    { token, workspaceId },
+  );
+  return body.data;
+}
+
+// Retry a failed push by its push-log id. Routes through the K4 idempotent path
+// server-side, so a retry of a push that already succeeded won't duplicate the
+// CRM object. Resolves with the fresh push-log row recording the new attempt.
+export async function retryPush(
+  token: string,
+  workspaceId: string,
+  pushLogId: string,
+): Promise<PushLogEntry> {
+  const body = await request<{ push_log: PushLogEntry }>(
+    `/integrations/push-log/${pushLogId}/retry`,
+    { method: "POST", token, workspaceId },
   );
   return body.push_log;
 }

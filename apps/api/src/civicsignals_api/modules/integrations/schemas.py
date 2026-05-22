@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
@@ -12,6 +13,7 @@ from .models import (
     Connection,
     ConnectionStatus,
     FieldMapping,
+    FieldMappingTemplate,
     IntegrationProviderKind,
     PushErrorCode,
     PushLog,
@@ -93,6 +95,9 @@ class PushLogOut(BaseModel):
     target: str
     status: PushStatus
     external_id: str | None = None
+    # The (secret-redacted) request payload shaped for the provider. Surfaced so
+    # the recovery UI can show what was sent (model stores it redacted already).
+    request: dict[str, Any] = Field(default_factory=dict)
     error: PushErrorOut | None = None
     attempt_count: int
     retry_at: datetime | None = None
@@ -116,6 +121,7 @@ class PushLogOut(BaseModel):
             target=log.target,
             status=log.status,
             external_id=log.external_id,
+            request=dict(log.request or {}),
             error=error,
             attempt_count=log.attempt_count,
             retry_at=log.retry_at,
@@ -128,6 +134,61 @@ class PushLogPageOut(BaseModel):
     """Cursor-paginated push-log page (doc 08 §3.6)."""
 
     data: list[PushLogOut]
+    next_cursor: str | None = None
+
+
+# --- Push-failure recovery (K5) ---------------------------------------------
+
+
+class PushDiagnosisOut(BaseModel):
+    """A human-readable diagnosis of a failed push (K5 recovery UI).
+
+    Derived from the row's scope-aware error code: ``cause`` is the inline
+    explanation, ``recommended_action`` the suggested next step, and the booleans
+    drive the recovery UI's CTA (reconnect vs retry).
+    """
+
+    code: PushErrorCode
+    cause: str
+    recommended_action: str
+    retryable: bool
+    needs_reauth: bool
+
+
+class PushFailureOut(PushLogOut):
+    """A failed push-log row plus its inline diagnosis (K5).
+
+    Extends :class:`PushLogOut` with a derived ``diagnosis`` so the recovery UI
+    can render a human-readable cause + CTA without re-deriving the error
+    branching client-side. ``diagnosis`` is ``None`` only for rows with no typed
+    error (which the failure list never returns, but the type stays optional).
+    """
+
+    diagnosis: PushDiagnosisOut | None = None
+
+    @classmethod
+    def from_orm_log_with_diagnosis(cls, log: PushLog) -> PushFailureOut:
+        # Local import avoids a schemas → services import cycle at module load.
+        from .services import diagnose_push_error
+
+        base = PushLogOut.from_orm_log(log)
+        diag = diagnose_push_error(log.error_code)
+        diagnosis: PushDiagnosisOut | None = None
+        if diag is not None:
+            diagnosis = PushDiagnosisOut(
+                code=diag.code,
+                cause=diag.cause,
+                recommended_action=diag.recommended_action,
+                retryable=diag.retryable,
+                needs_reauth=diag.needs_reauth,
+            )
+        return cls(**base.model_dump(), diagnosis=diagnosis)
+
+
+class PushFailurePageOut(BaseModel):
+    """Cursor-paginated page of failed pushes with inline diagnosis (K5)."""
+
+    data: list[PushFailureOut]
     next_cursor: str | None = None
 
 
@@ -204,6 +265,52 @@ class FieldMappingList(BaseModel):
     """GET .../field-mappings response — a connection's mappings (K2)."""
 
     data: list[FieldMappingOut]
+
+
+# --- Field-mapping templates / per-connection defaults (K6) -----------------
+
+TEMPLATE_NAME_MAX_LEN = 160
+
+
+class FieldMappingTemplateSave(BaseModel):
+    """Body for saving the current mapping as a named template/default (K6).
+
+    Captures the field map + constants the UI is editing under ``name``. Set
+    ``is_default`` to make it the connection's auto-applied default. Upserts by
+    ``(connection, name)`` — re-saving a name replaces its snapshot.
+    """
+
+    name: str = Field(min_length=1, max_length=TEMPLATE_NAME_MAX_LEN)
+    target_object: str = Field(min_length=1, max_length=TARGET_OBJECT_MAX_LEN)
+    field_map: dict[str, str] = Field(default_factory=dict)
+    constants: dict[str, object] = Field(default_factory=dict)
+    is_default: bool = False
+
+
+class FieldMappingTemplateOut(BaseModel):
+    """A saved field-mapping template (K6)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    connection_id: UUID
+    name: str
+    target_object: str
+    field_map: dict[str, object]
+    constants: dict[str, object]
+    is_default: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm_template(cls, template: FieldMappingTemplate) -> FieldMappingTemplateOut:
+        return cls.model_validate(template)
+
+
+class FieldMappingTemplateList(BaseModel):
+    """GET .../field-mapping-templates response — a connection's templates (K6)."""
+
+    data: list[FieldMappingTemplateOut]
 
 
 # --- Push a signal / pipeline-item (K2) -------------------------------------

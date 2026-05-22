@@ -47,7 +47,11 @@ def upgrade() -> None:
         sa.Column(
             "extraction_status",
             sa.Enum(
-                "pending", "running", "done", "failed", "skipped",
+                "pending",
+                "running",
+                "done",
+                "failed",
+                "skipped",
                 name="foia_attachment_extraction_status",
                 native_enum=False,
             ),

@@ -50,7 +50,7 @@ from civicsignals_api import events
 from civicsignals_api.config import Settings, get_settings
 from civicsignals_api.db import get_session
 from civicsignals_api.modules.admin import services as admin_services
-from civicsignals_api.modules.auth.dependencies import RequireAdmin
+from civicsignals_api.modules.auth.dependencies import RequireAdmin, RequireMember
 from civicsignals_api.problems import ProblemException
 
 from . import services
@@ -65,8 +65,13 @@ from .schemas import (
     FieldDiscoveryOut,
     FieldMappingList,
     FieldMappingOut,
+    FieldMappingTemplateList,
+    FieldMappingTemplateOut,
+    FieldMappingTemplateSave,
     FieldMappingUpsert,
     ObjectDiscoveryOut,
+    PushFailureOut,
+    PushFailurePageOut,
     PushLogOut,
     PushLogPageOut,
     PushOut,
@@ -507,6 +512,145 @@ async def delete_field_mapping(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+# --- Field-mapping templates / per-connection defaults (K6) -----------------
+# Saving/applying a reusable mapping template is workspace *data* work (not
+# workspace administration), so — like the K5 recovery surface — these gate on
+# RequireMember rather than RequireAdmin.
+
+
+async def _require_connection_member(
+    workspace_id: uuid.UUID, session: AsyncSession, connection_id: uuid.UUID
+) -> Connection:
+    connection = await services.get_connection(session, workspace_id, connection_id)
+    if connection is None:
+        raise _not_found()
+    return connection
+
+
+@router.get(
+    "/connections/{connection_id}/field-mapping-templates",
+    response_model=FieldMappingTemplateList,
+    summary="List a connection's saved field-mapping templates (member and up)",
+)
+async def list_field_mapping_templates(
+    connection_id: uuid.UUID, ctx: RequireMember, session: SessionDep
+) -> FieldMappingTemplateList:
+    """List the connection's saved field-mapping templates (default first) (K6)."""
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    templates = await services.list_field_mapping_templates(
+        session, workspace_id=ctx.workspace_id, connection_id=connection_id
+    )
+    return FieldMappingTemplateList(
+        data=[FieldMappingTemplateOut.from_orm_template(t) for t in templates]
+    )
+
+
+@router.post(
+    "/connections/{connection_id}/field-mapping-templates",
+    response_model=FieldMappingTemplateOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Save the current mapping as a named template/default (member and up)",
+)
+async def save_field_mapping_template(
+    connection_id: uuid.UUID,
+    body: FieldMappingTemplateSave,
+    ctx: RequireMember,
+    session: SessionDep,
+) -> FieldMappingTemplateOut:
+    """Save the current field mapping as a reusable template for the connection (K6).
+
+    Upserts by ``(connection, name)``. When ``is_default`` is set, this becomes
+    the connection's auto-applied default (any prior default is cleared).
+    """
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    template = await services.save_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        name=body.name,
+        target_object=body.target_object,
+        field_map=dict(body.field_map),
+        constants=dict(body.constants),
+        is_default=body.is_default,
+    )
+    await session.commit()
+    await session.refresh(template)
+    return FieldMappingTemplateOut.from_orm_template(template)
+
+
+@router.post(
+    "/connections/{connection_id}/field-mapping-templates/{template_id}/apply",
+    response_model=FieldMappingOut,
+    summary="Apply a saved template onto the connection's live mapping (member and up)",
+)
+async def apply_field_mapping_template(
+    connection_id: uuid.UUID,
+    template_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+) -> FieldMappingOut:
+    """Apply a saved template onto the connection's per-target field mapping (K6).
+
+    Copies the template's field map + constants onto the live
+    :class:`FieldMapping` for the template's target object. ``404`` when the
+    template is not in this workspace/connection.
+    """
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    template = await services.get_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        template_id=template_id,
+    )
+    if template is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Template not found",
+            detail="No such field-mapping template in this workspace.",
+        )
+    mapping = await services.apply_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        template=template,
+    )
+    await session.commit()
+    await session.refresh(mapping)
+    return FieldMappingOut.from_orm_mapping(mapping)
+
+
+@router.delete(
+    "/connections/{connection_id}/field-mapping-templates/{template_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a saved field-mapping template (member and up)",
+)
+async def delete_field_mapping_template(
+    connection_id: uuid.UUID,
+    template_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+) -> Response:
+    """Delete a saved field-mapping template (K6)."""
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    template = await services.get_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        template_id=template_id,
+    )
+    if template is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Template not found",
+            detail="No such field-mapping template in this workspace.",
+        )
+    await services.delete_field_mapping_template(session, template)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # --- Push a signal / pipeline-item to the provider (K2) ---------------------
 
 
@@ -606,6 +750,134 @@ async def list_push_log(
         data=[PushLogOut.from_orm_log(log) for log in page.items],
         next_cursor=page.next_cursor,
     )
+
+
+# --- Push-failure recovery (K5) ---------------------------------------------
+# Inline diagnosis + retry, building on the push-log + the K4 idempotent push.
+# These read/write workspace data (not workspace *administration*), so they gate
+# on RequireMember rather than RequireAdmin.
+
+
+@router.get(
+    "/push-log/failures",
+    response_model=PushFailurePageOut,
+    summary="List recent failed pushes with inline diagnosis (member and up)",
+)
+async def list_push_failures(
+    ctx: RequireMember,
+    session: SessionDep,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = services.DEFAULT_LIMIT,
+    connection_id: Annotated[
+        uuid.UUID | None, Query(description="Filter by connection id.")
+    ] = None,
+) -> PushFailurePageOut:
+    """Return a cursor-paginated, newest-first page of failed/dead-letter pushes (K5).
+
+    The recovery surface only lists rows needing attention (``failed`` +
+    ``dead_letter``). Each row carries a derived ``diagnosis`` (human-readable
+    cause + recommended action) so the UI can branch its CTA (reconnect vs
+    retry). Scoped to the active workspace; optional ``connection_id`` narrows.
+    """
+    try:
+        page = await services.list_failed_pushes(
+            session,
+            ctx.workspace_id,
+            cursor=cursor,
+            limit=limit,
+            connection_id=connection_id,
+        )
+    except ValueError as exc:
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="bad_request",
+            title="Invalid cursor",
+            detail="The supplied cursor is malformed.",
+        ) from exc
+
+    return PushFailurePageOut(
+        data=[PushFailureOut.from_orm_log_with_diagnosis(log) for log in page.items],
+        next_cursor=page.next_cursor,
+    )
+
+
+@router.post(
+    "/push-log/{push_log_id}/retry",
+    response_model=PushOut,
+    summary="Retry a failed push (idempotent — won't duplicate) (member and up)",
+)
+async def retry_push(
+    push_log_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> PushOut:
+    """Re-attempt a failed push, routing through the K4 idempotent path (K5).
+
+    Replays the stored push-log row's payload/target/idempotency-key against the
+    connection's provider and appends a fresh push-log row (the original failed
+    row is preserved as audit). Because it reuses the K4 idempotency registry, a
+    retry of a push that actually succeeded externally routes through the
+    provider's update path and does **not** create a duplicate CRM object.
+
+    ``404`` when the push-log entry (or its connection) is not in this workspace,
+    or when the entry is not in a failed/dead-letter state. The retry never
+    raises on a provider failure — the typed error lives in the returned (new)
+    push-log row so the recovery UI can re-diagnose it.
+    """
+    log = await services.get_push_log(session, ctx.workspace_id, push_log_id)
+    if log is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Push-log entry not found",
+            detail="No such push-log entry in this workspace.",
+        )
+    if log.status not in services.PUSH_FAILURE_STATUSES:
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="not_retryable",
+            title="Push is not in a failed state",
+            detail=(
+                "Only failed or dead-letter pushes can be retried; this entry is "
+                f"'{log.status.value}'."
+            ),
+        )
+
+    connection = await services.get_connection(session, ctx.workspace_id, log.connection_id)
+    if connection is None:
+        # The connection was disconnected (push-log rows survive deletion).
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Connection not found",
+            detail="The connection for this push was disconnected; reconnect it to retry.",
+        )
+
+    retry_log = await services.retry_push_log(
+        session,
+        connection=connection,
+        log=log,
+        settings=settings,
+    )
+    await session.commit()
+    await session.refresh(retry_log)
+
+    try:
+        await events.publish(
+            events.INTEGRATION_PUSH_RECORDED,
+            {
+                "workspace_id": str(ctx.workspace_id),
+                "connection_id": str(connection.id),
+                "push_log_id": str(retry_log.id),
+                "retry_of": str(log.id),
+                "status": retry_log.status.value,
+            },
+        )
+    except Exception:
+        logger.warning("integration_push_retry_recorded_event_failed")
+
+    return PushOut(push_log=PushLogOut.from_orm_log(retry_log))
 
 
 # ---------------------------------------------------------------------------

@@ -107,69 +107,8 @@ def _seed_connection(workspace_id: str) -> str:
     return str(new_id)
 
 
-# ---------------------------------------------------------------------------
-# Mock Salesforce REST transport injected via services.default_http_client
-# ---------------------------------------------------------------------------
-
-
-def _salesforce_handler(request: httpx.Request) -> httpx.Response:
-    path = request.url.path
-    if path.endswith("/sobjects"):
-        return httpx.Response(
-            200,
-            json={
-                "sobjects": [
-                    {"name": "Opportunity", "label": "Opportunity", "createable": True},
-                    {
-                        "name": "Civic_Signal__c",
-                        "label": "Civic Signal",
-                        "createable": True,
-                        "custom": True,
-                    },
-                    {"name": "ReadOnly", "label": "RO", "createable": False},
-                ]
-            },
-        )
-    if path.endswith("/describe"):
-        return httpx.Response(
-            200,
-            json={
-                "fields": [
-                    {
-                        "name": "Name",
-                        "label": "Name",
-                        "type": "string",
-                        "createable": True,
-                        "updateable": True,
-                        "nillable": False,
-                    },
-                    {
-                        "name": "Amount",
-                        "label": "Amount",
-                        "type": "currency",
-                        "createable": True,
-                        "updateable": True,
-                        "nillable": True,
-                    },
-                ]
-            },
-        )
-    if request.method == "POST":
-        return httpx.Response(201, json={"id": "0061T00000ABCDE", "success": True})
-    if request.method == "PATCH":
-        return httpx.Response(204)
-    return httpx.Response(404, json=[{"message": "not found"}])
-
-
-@pytest.fixture
-def salesforce_http(monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Mock the Salesforce REST transport (a fresh client per service call)."""
-    monkeypatch.setattr(
-        services,
-        "default_http_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(_salesforce_handler)),
-    )
-    yield
+# The mock Salesforce REST transport (``salesforce_http`` fixture + handler) now
+# lives in ``conftest.py`` so the K6 template auto-apply-on-push test can share it.
 
 
 # ---------------------------------------------------------------------------
