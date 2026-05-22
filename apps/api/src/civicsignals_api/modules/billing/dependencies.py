@@ -1,4 +1,4 @@
-"""FastAPI dependency factories for plan-based feature gating (N2).
+"""FastAPI dependency factories for plan-based feature gating (N2) and limit enforcement (N4).
 
 These dependencies are the seam N4 (limit enforcement) and feature-gated routes
 use. They compose on top of ``require_workspace`` (B5) so:
@@ -12,20 +12,19 @@ use. They compose on top of ``require_workspace`` (B5) so:
 
 Usage in a route::
 
-    from civicsignals_api.modules.billing.dependencies import require_feature
-    from civicsignals_api.modules.billing.plans import Feature
+    from civicsignals_api.modules.billing.dependencies import require_feature, require_within_limit
+    from civicsignals_api.modules.billing.plans import Feature, Dimension
 
-    @router.get("/smart-search")
+    @router.post("/smart-search")
     async def smart_search(
         ctx: RequireMember,
-        _: Annotated[None, Depends(require_feature(Feature.SMART_SEARCH))],
+        _feature: Annotated[None, Depends(require_feature(Feature.SMART_SEARCH))],
+        _quota: Annotated[None, Depends(require_within_limit(Dimension.SMART_SEARCHES_PER_MONTH))],
         ...
     ) -> ...:
         ...
 
 The dependency returns ``None`` on success so routes ignore the return value.
-Leave a ``# TODO N4`` comment on routes that should also enforce metered quotas
-once N4 lands (the feature gate is necessary but not sufficient for quota enforcement).
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import CurrentWorkspace, WorkspaceContext
 from civicsignals_api.modules.billing import services as billing_services
-from civicsignals_api.modules.billing.plans import Feature
+from civicsignals_api.modules.billing.plans import Dimension, Feature
 from civicsignals_api.problems import ProblemException
 
 
@@ -65,7 +64,8 @@ def require_feature(
     the workspace's effective plan does not include ``feature``.
 
     The dependency only checks *feature availability* on the plan; quota
-    (e.g. "20 smart searches / month") is enforced separately by N4.
+    (e.g. "20 smart searches / month") is enforced separately by N4's
+    :func:`require_within_limit`.
 
     Example::
 
@@ -85,5 +85,41 @@ def require_feature(
         plan = await billing_services.get_workspace_plan(session, ctx.workspace_id)
         if not billing_services.plan_allows(plan, feature):
             raise _plan_feature_required(feature)
+
+    return _check
+
+
+def require_within_limit(
+    dimension: Dimension,
+) -> Callable[[WorkspaceContext, AsyncSession], Awaitable[None]]:
+    """Build a FastAPI dependency that enforces a hard quota limit (N4).
+
+    Raises ``429 Too Many Requests`` (RFC 7807 ``limit_exceeded``) when the
+    workspace's current-period usage for ``dimension`` is at or above 100% of
+    its plan cap.  Unlimited dimensions (``plan_limit`` returns ``None``) are
+    always allowed.
+
+    This dependency should be added to any write endpoint that consumes a metered
+    quota (smart searches, contact exports, AI runs, API request metering, etc.).
+    Pair it with :func:`require_feature` when the feature is also plan-gated.
+
+    Example::
+
+        _limit = require_within_limit(Dimension.SMART_SEARCHES_PER_MONTH)
+
+        @router.post("/smart-search")
+        async def smart_search(
+            ctx: RequireMember,
+            _quota: Annotated[None, Depends(_limit)],
+        ) -> ...:
+            # record_usage AFTER the action so we count successful calls.
+            ...
+    """
+
+    async def _check(
+        ctx: CurrentWorkspace,
+        session: Annotated[AsyncSession, Depends(get_session)],
+    ) -> None:
+        await billing_services.enforce_limit(session, ctx.workspace_id, dimension)
 
     return _check

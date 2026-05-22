@@ -27,11 +27,13 @@ N3 implements:
   - :func:`refresh_seats_usage` — update billing_usage seats snapshot for a workspace.
   - :func:`record_ai_run` — hook called by the LLM gateway accountant (N3 integration).
 
+N4 implements:
+  - :func:`get_limit_states` — compute per-dimension LimitState for a workspace+period.
+  - :func:`enforce_limit` — raise RFC 7807 429 when a dimension is at/over 100%.
+
 All Stripe network calls are mediated through the ``StripeClient`` protocol so
 tests can inject a mock without hitting the Stripe API.
 
-# TODO N4: add ``check_limit(workspace_id, metric)`` for hard limits (reads record_usage
-#   output and plan_limit to enforce soft 80% banner + hard 429).
 # TODO N5: add ``create_checkout_session`` / ``change_plan`` for self-serve flow.
 # TODO LC-13: provision real STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET.
 """
@@ -440,8 +442,8 @@ async def apply_invoice_payment_failed(
     subscription status after its retry schedule concludes), not by this handler
     directly.
 
-    # TODO N4: when status becomes past_due/read_only, enforce export/push limits
-    #   via billing.services.check_limit.
+    # NOTE N4: when status becomes past_due/read_only, callers should gate
+    #   export/push via billing.services.enforce_limit (N4 implemented).
     """
     stripe_sub_id: str | None = stripe_invoice_obj.get("subscription")
     if not stripe_sub_id:
@@ -652,9 +654,7 @@ async def get_seats_count(session: AsyncSession, workspace_id: uuid.UUID) -> int
     from sqlalchemy import text
 
     row = await session.execute(
-        text(
-            "SELECT COUNT(*) FROM accounts_member WHERE workspace_id = :ws_id"
-        ),
+        text("SELECT COUNT(*) FROM accounts_member WHERE workspace_id = :ws_id"),
         {"ws_id": str(workspace_id)},
     )
     return int(row.scalar_one())
@@ -703,8 +703,8 @@ async def record_ai_run(
 
         await billing_services.record_ai_run(session, workspace_id=uuid.UUID(workspace_id))
 
-    # TODO N4: when ``ai_runs_per_month`` usage reaches the plan limit, raise a
-    #   429 via ``check_limit`` before dispatching the next LLM call.
+    # NOTE N4: callers should call enforce_limit(Dimension.AI_RUNS_PER_MONTH)
+    #   before dispatching the LLM call, then call record_ai_run on success.
     """
     await record_usage(session, workspace_id, Dimension.AI_RUNS_PER_MONTH, delta, period=period)
 
@@ -712,6 +712,7 @@ async def record_ai_run(
 # ---------------------------------------------------------------------------
 # N3: API-request metering hook
 # ---------------------------------------------------------------------------
+
 
 # NOTE: Full per-request metering middleware is intentionally deferred.
 # Incrementing billing_usage on every authenticated HTTP request would add a
@@ -748,3 +749,111 @@ async def record_api_requests(
     await record_usage(
         session, workspace_id, Dimension.API_REQUESTS_PER_MONTH, delta, period=period
     )
+
+
+# ---------------------------------------------------------------------------
+# N4: Limit-state computation + hard enforcement
+# ---------------------------------------------------------------------------
+
+# Threshold at which the soft-limit banner is shown (inclusive).
+SOFT_LIMIT_PCT: float = 80.0
+# Threshold at which hard 429 enforcement triggers (inclusive).
+HARD_LIMIT_PCT: float = 100.0
+
+
+async def get_limit_states(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    *,
+    period: date | None = None,
+) -> dict[str, tuple[int, int | None, float | None, str]]:
+    """Return per-dimension limit info for N4 enforcement / banner rendering (N4).
+
+    Returns a mapping of :class:`Dimension` string value → 4-tuple:
+        (used, limit, pct, state)
+    where ``state`` is one of ``"ok"``, ``"warning"`` (≥ 80%), or
+    ``"exceeded"`` (≥ 100%).  ``limit`` is ``None`` when unlimited;
+    ``pct`` is ``None`` when unlimited.
+
+    Callers import :class:`~civicsignals_api.modules.billing.schemas.LimitState`
+    for the string values; we return raw strings here to avoid a circular import
+    between services and schemas.
+
+    This is cheap: one ``get_usage`` call + plan-limit lookups from code.
+    """
+    p = period or current_period()
+    effective_plan = await get_workspace_plan(session, workspace_id)
+    usage_map = await get_usage(session, workspace_id, period=p)
+
+    result: dict[str, tuple[int, int | None, float | None, str]] = {}
+    for dim in Dimension:
+        used = usage_map.get(dim.value, 0)
+        limit = plan_limit(effective_plan, dim)
+        pct: float | None = None
+        if limit is not None and limit > 0:
+            pct = round(used / limit * 100, 1)
+
+        if pct is None:
+            state = "ok"  # unlimited
+        elif pct >= HARD_LIMIT_PCT:
+            state = "exceeded"
+        elif pct >= SOFT_LIMIT_PCT:
+            state = "warning"
+        else:
+            state = "ok"
+
+        result[dim.value] = (used, limit, pct, state)
+    return result
+
+
+async def enforce_limit(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    dimension: Dimension,
+    *,
+    period: date | None = None,
+) -> None:
+    """Raise RFC 7807 429 when ``dimension`` usage is at or over the plan cap (N4).
+
+    Called before a metered action (e.g. AI run, smart search, contact export)
+    to gate hard-limit enforcement.  If usage is already at or above 100% of the
+    plan cap a :class:`~civicsignals_api.problems.ProblemException` with status
+    429 is raised — callers should *not* catch this; FastAPI's problem handler
+    will serialize it as ``application/problem+json``.
+
+    No-op for unlimited dimensions (``plan_limit`` returns ``None``).
+
+    Example usage in a route::
+
+        await billing_services.enforce_limit(session, workspace_id, Dimension.AI_RUNS_PER_MONTH)
+        await billing_services.record_ai_run(session, workspace_id)
+
+    Or via the :func:`~civicsignals_api.modules.billing.dependencies.require_within_limit`
+    FastAPI dependency, which wraps this call.
+    """
+    from civicsignals_api.problems import ProblemException
+
+    p = period or current_period()
+    effective_plan = await get_workspace_plan(session, workspace_id)
+    limit = plan_limit(effective_plan, dimension)
+
+    if limit is None:
+        # Unlimited dimension — always allow.
+        return
+
+    usage_map = await get_usage(session, workspace_id, period=p)
+    used = usage_map.get(dimension.value, 0)
+
+    if used >= limit:
+        pct = round(used / limit * 100, 1) if limit > 0 else 100.0
+        raise ProblemException(
+            status=429,
+            code="limit_exceeded",
+            title="Plan limit reached",
+            detail=(
+                f"Your workspace has used {used}/{limit} ({pct}%) of the "
+                f"'{dimension.value}' limit for this billing period. "
+                "Upgrade your plan at /billing/upgrade to continue."
+            ),
+            headers={"Retry-After": "0"},
+        )
