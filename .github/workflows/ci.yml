@@ -1,6 +1,12 @@
-# CI pipeline (TODO A3). Runs on every PR and on push to main; gates merges.
-# Jobs: lint, typecheck, test, security-scan, license-check, recipe-fixtures,
-# plus an optional e2e-smoke placeholder for QA-1 to fill in.
+# CI pipeline (A3 + QA-1). Runs on every PR and on push to main; gates merges.
+# Jobs: lint, typecheck, test, e2e-smoke (Playwright smoke subset), security-scan,
+# license-check, recipe-fixtures.
+#
+# e2e-smoke: runs the @smoke-tagged Playwright specs (smoke.spec.ts) on every PR
+# against a `next build && next start` web process. QA-1 fills this job.
+# CUF-1..CUF-9 fixme scaffolds will be enabled as the feature tasks merge.
+#
+# Nightly full e2e suite lives in .github/workflows/e2e-nightly.yml (QA-1).
 #
 # Toolchain: uv (Python 3.12) + pnpm 9 (Node 22), both with frozen lockfiles.
 # Caches: uv, pnpm store, and Turborepo. See CLAUDE.md "Commands".
@@ -148,20 +154,54 @@ jobs:
         run: pnpm --filter @civicsignals/web test
 
   # ---------------------------------------------------------------------------
-  # E2E smoke (Playwright). Placeholder wired now, filled by QA-1 (CUF-1..9).
-  # Non-blocking: it always succeeds until QA-1 adds real specs.
+  # E2E smoke (Playwright — QA-1). Runs @smoke-tagged specs on every PR.
+  # Covers the static marketing surface that exists today (landing page, /pricing,
+  # nav, 404). CUF-1..9 fixme scaffolds auto-skip until feature tasks merge.
+  #
+  # Blocking: the smoke subset targets reliable, stable pages. If it becomes
+  # flaky, investigate the root cause rather than setting continue-on-error.
   # ---------------------------------------------------------------------------
   e2e-smoke:
-    name: E2E smoke (placeholder)
+    name: E2E smoke
     runs-on: ubuntu-latest
-    # Non-blocking until QA-1 adds real Playwright specs; flip this off then.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Placeholder
-        run: |
-          echo "Playwright smoke is wired here by QA-1 (doc 11 §2, CUF-1..9)."
-          echo "# TODO QA-1: bring up the stack, run 'pnpm --filter @civicsignals/web e2e'."
+
+      - name: Set up Node + pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      # Build the Next.js app so `next start` serves the production bundle.
+      # Using `next start` (not `next dev`) keeps the smoke suite fast and
+      # representative of what real users hit.
+      - name: Build web app
+        run: pnpm --filter @civicsignals/web build
+
+      # Install only Chromium (the smoke project target). Firefox + Safari are
+      # added by QA-5 (browser matrix). --with-deps installs OS-level libs.
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Run the smoke project (grep: @smoke). The Playwright config starts the
+      # web server automatically via the webServer block; PLAYWRIGHT_START_CMD
+      # overrides the default `pnpm dev` to use the pre-built standalone output
+      # (Next.js 15 with output: standalone produces .next/standalone/apps/web/server.js).
+      - name: Run Playwright smoke specs
+        working-directory: apps/web
+        env:
+          CI: "true"
+          PLAYWRIGHT_START_CMD: "node .next/standalone/apps/web/server.js"
+        run: pnpm e2e:smoke
+
+      # Always upload traces/screenshots on failure so they're downloadable
+      # from the GH Actions run page even if the job fails.
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-smoke-report
+          path: apps/web/playwright-report/
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Security scan: gitleaks + Trivy secrets gate (hard); Trivy vuln/misconfig (report).
