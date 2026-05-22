@@ -55,3 +55,23 @@ test: ## Run all tests via Turborepo
 .PHONY: typecheck
 typecheck: ## Type-check everything via Turborepo
 	pnpm typecheck
+
+.PHONY: notice
+notice: ## Regenerate NOTICE.md from the API runtime dependency tree (TODO A3)
+	./scripts/gen-notice.sh
+
+.PHONY: check-notice
+check-notice: ## Fail if NOTICE.md is stale or a disallowed license appears (TODO A3)
+	./scripts/gen-notice.sh --check
+
+.PHONY: check-recipes
+check-recipes: ## Validate recipes against the JSON Schema + replay golden fixtures (TODO A3)
+	@bash -euo pipefail -c '\
+		shopt -s nullglob; \
+		recipes=(recipes/*/recipe.yml); \
+		if [ $${#recipes[@]} -eq 0 ]; then echo "no recipes to validate"; else \
+			uvx --from "check-jsonschema==0.37.2" check-jsonschema \
+				--schemafile packages/recipe-schema/schema/recipe.schema.json \
+				"$${recipes[@]}"; \
+		fi'
+	cd apps/api && uv run python -m civicsignals_api.modules.recipes.cli

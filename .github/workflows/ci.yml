@@ -1,0 +1,285 @@
+# CI pipeline (TODO A3). Runs on every PR and on push to main; gates merges.
+# Jobs: lint, typecheck, test, security-scan, license-check, recipe-fixtures,
+# plus an optional e2e-smoke placeholder for QA-1 to fill in.
+#
+# Toolchain: uv (Python 3.12) + pnpm 9 (Node 22), both with frozen lockfiles.
+# Caches: uv, pnpm store, and Turborepo. See CLAUDE.md "Commands".
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs for the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Turborepo remote cache is off (no token); local cache keyed below is enough.
+  TURBO_TELEMETRY_DISABLED: "1"
+  DO_NOT_TRACK: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint: ruff (Python) + eslint via next lint (web).
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node + pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Set up uv (Python)
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      - name: Install API deps
+        working-directory: apps/api
+        run: uv sync --frozen
+
+      - name: ruff check (Python)
+        working-directory: apps/api
+        run: uv run ruff check .
+
+      - name: eslint (web)
+        run: pnpm --filter @civicsignals/web lint
+
+  # ---------------------------------------------------------------------------
+  # Typecheck: mypy --strict (Python) + tsc --noEmit (web).
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node + pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Set up uv (Python)
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      - name: Install API deps
+        working-directory: apps/api
+        run: uv sync --frozen
+
+      - name: mypy (Python)
+        working-directory: apps/api
+        run: uv run mypy src
+
+      - name: tsc (web)
+        run: pnpm --filter @civicsignals/web typecheck
+
+  # ---------------------------------------------------------------------------
+  # Test: pytest (with Postgres 16 + pgvector and Redis service containers, so
+  # DB/queue-backed tests run unchanged as they land) + vitest (web).
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: civic
+          POSTGRES_PASSWORD: civic
+          POSTGRES_DB: civicsignals_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U civic"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Tests connect directly to the service Postgres (no PgBouncer in CI).
+      DATABASE_URL: postgresql+asyncpg://civic:civic@localhost:5432/civicsignals_test
+      DATABASE_DIRECT_URL: postgresql+asyncpg://civic:civic@localhost:5432/civicsignals_test
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      ENVIRONMENT: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node + pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Set up uv (Python)
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      - name: Install API deps
+        working-directory: apps/api
+        run: uv sync --frozen
+
+      - name: pytest (Python)
+        working-directory: apps/api
+        run: uv run pytest -q
+
+      - name: vitest (web)
+        run: pnpm --filter @civicsignals/web test
+
+  # ---------------------------------------------------------------------------
+  # E2E smoke (Playwright). Placeholder wired now, filled by QA-1 (CUF-1..9).
+  # Non-blocking: it always succeeds until QA-1 adds real specs.
+  # ---------------------------------------------------------------------------
+  e2e-smoke:
+    name: E2E smoke (placeholder)
+    runs-on: ubuntu-latest
+    # Non-blocking until QA-1 adds real Playwright specs; flip this off then.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Placeholder
+        run: |
+          echo "Playwright smoke is wired here by QA-1 (doc 11 §2, CUF-1..9)."
+          echo "# TODO QA-1: bring up the stack, run 'pnpm --filter @civicsignals/web e2e'."
+
+  # ---------------------------------------------------------------------------
+  # Security scan: gitleaks + Trivy secrets gate (hard); Trivy vuln/misconfig (report).
+  # ---------------------------------------------------------------------------
+  security-scan:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks scans full history when fetch-depth is 0.
+          fetch-depth: 0
+
+      # Hard gate on secrets baked into the repo (defense-in-depth with gitleaks).
+      - name: Trivy secret scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          format: table
+
+      # Dependency vulns + IaC/Dockerfile misconfigs surface as a non-blocking
+      # report: workspace deps (Next/React/etc.) and the infra scaffold are owned
+      # by their own epics (not A3), so we report fixable CRITICAL/HIGH here
+      # without blocking merges on a pre-existing bump.
+      # TODO A3/A6: route this SARIF to GitHub code scanning once enabled.
+      - name: Trivy vuln + misconfig report (non-blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+          format: table
+
+      - name: gitleaks secret scan
+        # Run the pinned binary directly: gitleaks-action@v2 gates org accounts
+        # behind a paid GITLEAKS_LICENSE, which we don't want as a merge blocker.
+        # The tarball is verified against the published SHA256 before execution so
+        # this merge-gating step can't run a tampered binary.
+        env:
+          GITLEAKS_VERSION: "8.21.2"
+          GITLEAKS_SHA256: "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba"
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "/tmp/${tarball}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  /tmp/${tarball}" | sha256sum -c -
+          tar -xzf "/tmp/${tarball}" -C /tmp gitleaks
+          /tmp/gitleaks detect --source . --redact --no-banner --verbose
+
+  # ---------------------------------------------------------------------------
+  # License check: regenerate NOTICE.md from the API runtime deps, fail on drift
+  # or on a disallowed license (doc 11 §8). See scripts/gen-notice.sh.
+  # ---------------------------------------------------------------------------
+  license-check:
+    name: License check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (Python)
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      - name: Validate NOTICE.md + license policy
+        run: ./scripts/gen-notice.sh --check
+
+  # ---------------------------------------------------------------------------
+  # Recipe fixtures: validate every recipe against the JSON Schema and replay
+  # golden fixtures (doc 18 §3.3). Replay is guarded — it passes until the D1
+  # runner exists (see scripts/replay_fixtures.py).
+  # ---------------------------------------------------------------------------
+  recipe-fixtures:
+    name: Recipe fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv (Python)
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      # Defense-in-depth: validate raw recipe YAML against the canonical
+      # draft-07 schema in packages/recipe-schema (the shared TS/Python source of
+      # truth) before the runner — catches schema drift independently of the API.
+      - name: Validate recipes against JSON Schema
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          recipes=(recipes/*/recipe.yml)
+          if [ ${#recipes[@]} -eq 0 ]; then
+            echo "no recipes to validate"
+            exit 0
+          fi
+          uvx --from "check-jsonschema==0.37.2" check-jsonschema \
+            --schemafile packages/recipe-schema/schema/recipe.schema.json \
+            "${recipes[@]}"
+
+      - name: Install API deps (recipe runner)
+        working-directory: apps/api
+        run: uv sync --frozen
+
+      # Replay every recipe's golden fixtures through the D1 lifecycle runner and
+      # diff against the committed *.expected.json (doc 18 §3.3). Exit is non-zero
+      # on any extraction divergence (recipe/connector/prompt drift).
+      - name: Replay golden fixtures
+        working-directory: apps/api
+        run: uv run python -m civicsignals_api.modules.recipes.cli

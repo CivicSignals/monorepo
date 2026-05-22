@@ -1,0 +1,35 @@
+# Composite action: set up Node 22 + pnpm 9, restore the pnpm store and
+# Turborepo cache, and install workspace deps with a frozen lockfile.
+# Shared by the lint / typecheck / test jobs (TODO A3).
+name: Setup Node + pnpm
+description: Install Node 22 and pnpm 9, cache the pnpm store + Turborepo, and run a frozen install.
+
+runs:
+  using: composite
+  steps:
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 9.12.0
+
+    - name: Install Node
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: .nvmrc
+        cache: pnpm
+
+    # Turborepo cache (A3 deliverable). Today's jobs run package-scoped commands
+    # (pnpm --filter ...), so this is largely a no-op; it pays off the moment a
+    # job switches to Turbo-driven tasks (pnpm lint/typecheck/test). Restore/save
+    # is cheap, so we keep it wired per the A3 spec.
+    - name: Cache Turborepo
+      uses: actions/cache@v4
+      with:
+        path: .turbo
+        key: turbo-${{ runner.os }}-${{ github.sha }}
+        restore-keys: |
+          turbo-${{ runner.os }}-
+
+    - name: Install workspace deps
+      shell: bash
+      run: pnpm install --frozen-lockfile
