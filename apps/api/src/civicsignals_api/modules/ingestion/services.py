@@ -30,10 +30,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.modules.recipes import services as recipes_services
 from civicsignals_api.modules.recipes.services import (
     CanonicalRecord,
+    Clock,
     Fetcher,
+    LLMFieldExtractor,
+    load_recipe,
 )
 
 from . import storage as storage_module
+from .connectors import connector_for
 from .models import RawDocument
 from .schemas import RawDocumentRef, StoredRawDocument
 from .storage import RawDocumentStorage
@@ -44,14 +48,49 @@ def crawl_recipe(
     fetcher: Fetcher,
     seed_urls: Sequence[str],
 ) -> list[CanonicalRecord]:
-    """Run one recipe's full lifecycle (doc 18 §2; TODO D4 schedules this).
+    """Run one recipe's full lifecycle with an explicitly supplied fetcher.
 
-    Thin delegation to the recipes module's runner. The ``fetcher`` is supplied
-    by the connector selected for the recipe (TODO D6); raw-document persistence
-    to S3 wraps the fetch step via :func:`store_raw_document` (D3), wired into the
-    crawl loop in TODO D4.
+    Thin delegation to the recipes module's runner — used when the caller already
+    has a fetcher (e.g. the headless-browser path, D2, or a test). For the normal
+    path that selects the connector from the recipe's ``connector`` field, use
+    :func:`crawl_recipe_with_connector` (D6). Raw-document persistence to S3 wraps
+    the fetch step via :func:`store_raw_document` (D3), wired into the crawl loop
+    in TODO D4.
     """
     return recipes_services.run_recipe(recipe_id, fetcher, seed_urls)
+
+
+def crawl_recipe_with_connector(
+    recipe_id: str,
+    seed_urls: Sequence[str],
+    *,
+    clock: Clock | None = None,
+    llm_extractor: LLMFieldExtractor | None = None,
+) -> list[CanonicalRecord]:
+    """Select the recipe's connector (D6) and run its full lifecycle (doc 18 §2).
+
+    Loads + validates the recipe, resolves the connector named by its ``connector``
+    field, builds that connector's :class:`Fetcher`, runs the connector's
+    source-type-specific ``discover`` (RSS expands the feed to per-item pointers, a
+    paginated API to per-page pointers, ``bulk_download`` short-circuits when the
+    file is unchanged, …), then drives ``fetch -> extract -> normalize`` through the
+    recipes runner — which still owns robots.txt + politeness, version pinning, and
+    the ordered extract fallback chain (doc 18 §2.2, §3.4). This is the entry point
+    the scheduler/ingest worker uses (TODO D4 wires the raw-doc persistence loop +
+    crawl-run bookkeeping on top).
+    """
+    recipe = load_recipe(recipe_id)
+    connector = connector_for(recipe, clock=clock)
+    fetcher = connector.build_fetcher()
+    try:
+        pointers = connector.discover(seed_urls)
+        return recipes_services.run_pointers(
+            recipe, fetcher, pointers, clock=clock, llm_extractor=llm_extractor
+        )
+    finally:
+        close = getattr(fetcher, "close", None)
+        if callable(close):
+            close()
 
 
 async def store_raw_document(
@@ -249,6 +288,7 @@ __all__ = [
     "RawDocumentStorage",
     "StoredRawDocument",
     "crawl_recipe",
+    "crawl_recipe_with_connector",
     "get_raw_document",
     "list_raw_document_refs",
     "store_raw_document",

@@ -97,6 +97,26 @@ def run_recipe(
     return runner.run(seed_urls)
 
 
+def run_pointers(
+    recipe: Recipe,
+    fetcher: Fetcher,
+    pointers: Sequence[SourcePointer],
+    *,
+    clock: Clock | None = None,
+    llm_extractor: LLMFieldExtractor | None = None,
+) -> list[CanonicalRecord]:
+    """Run ``fetch -> extract -> normalize`` over connector-discovered pointers.
+
+    The cross-module seam the ingestion connectors (D6) use: a connector computes
+    the source-type-specific pointer set via its own ``discover`` and the runner
+    drives the rest of the lifecycle (robots/politeness, version pinning, the
+    ordered extract fallback chain). Keeps ``discover`` connector-owned without the
+    recipes module importing ingestion (doc 06 §3).
+    """
+    runner = RecipeRunner(recipe, fetcher, clock=clock, llm_extractor=llm_extractor)
+    return runner.run_pointers(pointers)
+
+
 def run_recipe_file(
     path: str | Path,
     fetcher: Fetcher,
@@ -257,6 +277,7 @@ __all__ = [
     "render_recipe",
     "replay_fixture",
     "replay_recipe",
+    "run_pointers",
     "run_recipe",
     "run_recipe_file",
     "scaffold_recipe",

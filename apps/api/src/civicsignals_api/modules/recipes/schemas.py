@@ -143,6 +143,12 @@ class Recipe(BaseModel):
     schedule: dict[str, str] = Field(default_factory=dict)
     fetch: FetchPolicy = Field(default_factory=FetchPolicy)
     prefilter: str = "classifier"
+    # Per-connector configuration block (doc 18 §1, §5 wave 1; TODO D6). Kept as a
+    # raw mapping here so the recipes module stays connector-agnostic — the
+    # ingestion ``connectors`` package owns the per-connector config models and
+    # parses ``connector_config[connector]`` into them when it dispatches. The
+    # canonical JSON Schema in ``packages/recipe-schema`` validates the shape.
+    connector_config: dict[str, object] = Field(default_factory=dict)
     fields: dict[str, FieldSpec] = Field(default_factory=dict)
     signal_types: list[str] = Field(default_factory=list)
 
