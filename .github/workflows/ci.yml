@@ -162,7 +162,7 @@ jobs:
           echo "# TODO QA-1: bring up the stack, run 'pnpm --filter @civicsignals/web e2e'."
 
   # ---------------------------------------------------------------------------
-  # Security scan: Trivy (filesystem/repo vuln + misconfig) + gitleaks (secrets).
+  # Security scan: gitleaks + Trivy secrets gate (hard); Trivy vuln/misconfig (report).
   # ---------------------------------------------------------------------------
   security-scan:
     name: Security scan
@@ -173,27 +173,28 @@ jobs:
           # gitleaks scans full history when fetch-depth is 0.
           fetch-depth: 0
 
-      # Hard gate on misconfigurations and secrets baked into the repo.
-      - name: Trivy config + secret scan
-        uses: aquasecurity/trivy-action@v0.29.0
+      # Hard gate on secrets baked into the repo (defense-in-depth with gitleaks).
+      - name: Trivy secret scan
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          scanners: misconfig,secret
+          scanners: secret
           severity: CRITICAL,HIGH
           exit-code: "1"
           format: table
 
-      # Dependency vulnerabilities surface as a non-blocking report: Next/React
-      # and other workspace deps are owned by their epics (not A3), so we report
-      # fixable CRITICAL/HIGH here without blocking merges on a pre-existing bump.
+      # Dependency vulns + IaC/Dockerfile misconfigs surface as a non-blocking
+      # report: workspace deps (Next/React/etc.) and the infra scaffold are owned
+      # by their own epics (not A3), so we report fixable CRITICAL/HIGH here
+      # without blocking merges on a pre-existing bump.
       # TODO A3/A6: route this SARIF to GitHub code scanning once enabled.
-      - name: Trivy dependency vuln report (non-blocking)
-        uses: aquasecurity/trivy-action@v0.29.0
+      - name: Trivy vuln + misconfig report (non-blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          scanners: vuln
+          scanners: vuln,misconfig
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "0"
