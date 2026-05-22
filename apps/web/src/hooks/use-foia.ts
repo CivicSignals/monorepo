@@ -29,6 +29,9 @@ import {
   type FoiaRequestUpdate,
   type FoiaRequestTransition,
   type FoiaTemplateList,
+  type FoiaAttachmentRead,
+  type FoiaAttachmentPage,
+  type FoiaAttachmentSignalRef,
   FOIA_PAGE_LIMIT,
   listFoiaRequests,
   getFoiaRequest,
@@ -37,6 +40,9 @@ import {
   transitionFoiaRequest,
   listFoiaRequestEvents,
   listFoiaTemplates,
+  uploadFoiaAttachment,
+  listFoiaAttachments,
+  listAttachmentSignals,
 } from "@/lib/foia-api";
 import { useSessionStore } from "@/store/session";
 import { useUiStore } from "@/store/ui";
@@ -62,6 +68,11 @@ export const foiaKeys = {
   requestEvents: (workspaceId: string | null, requestId: string) =>
     [...foiaKeys.requestDetail(workspaceId, requestId), "events"] as const,
   templates: () => [...foiaKeys.all, "templates"] as const,
+  // M3: attachments
+  attachments: (workspaceId: string | null, requestId: string) =>
+    [...foiaKeys.requestDetail(workspaceId, requestId), "attachments"] as const,
+  attachmentSignals: (workspaceId: string | null, requestId: string, attachmentId: string) =>
+    [...foiaKeys.attachments(workspaceId, requestId), attachmentId, "signals"] as const,
 };
 
 // ---- useFoiaRequests: infinite scroll list ----
@@ -203,5 +214,64 @@ export function useTransitionFoiaRequest(requestId: string) {
         queryKey: foiaKeys.requestEvents(workspaceId, requestId),
       });
     },
+  });
+}
+
+// ---- M3: Attachment hooks ----
+
+/** Fetch all attachments for a FOIA request (non-paginated for UI simplicity). */
+export function useFoiaAttachments(requestId: string | undefined) {
+  const { token, workspaceId } = useAuth();
+  return useQuery<FoiaAttachmentPage>({
+    queryKey: foiaKeys.attachments(workspaceId, requestId ?? ""),
+    queryFn: () => {
+      if (!token || !workspaceId || !requestId) return Promise.resolve({ items: [], next_cursor: null });
+      return listFoiaAttachments(token, workspaceId, requestId);
+    },
+    enabled: token !== null && workspaceId !== null && requestId !== undefined && requestId !== "",
+  });
+}
+
+/** Upload a response PDF and enqueue extraction; invalidates the attachment list. */
+export function useUploadFoiaAttachment(requestId: string) {
+  const { token, workspaceId } = useAuth();
+  const queryClient = useQueryClient();
+
+  return useMutation<FoiaAttachmentRead, Error, File>({
+    mutationFn: (file) => {
+      if (!token || !workspaceId) return Promise.reject(new Error("not authenticated"));
+      return uploadFoiaAttachment(token, workspaceId, requestId, file);
+    },
+    onSuccess: () => {
+      // Invalidate the attachments list and the parent request (status may have changed).
+      void queryClient.invalidateQueries({
+        queryKey: foiaKeys.attachments(workspaceId, requestId),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: foiaKeys.requestDetail(workspaceId, requestId),
+      });
+    },
+  });
+}
+
+/** Fetch signals linked to a FOIA attachment. */
+export function useFoiaAttachmentSignals(
+  requestId: string | undefined,
+  attachmentId: string | undefined,
+) {
+  const { token, workspaceId } = useAuth();
+  return useQuery<FoiaAttachmentSignalRef[]>({
+    queryKey: foiaKeys.attachmentSignals(workspaceId, requestId ?? "", attachmentId ?? ""),
+    queryFn: () => {
+      if (!token || !workspaceId || !requestId || !attachmentId) return Promise.resolve([]);
+      return listAttachmentSignals(token, workspaceId, requestId, attachmentId);
+    },
+    enabled:
+      token !== null &&
+      workspaceId !== null &&
+      requestId !== undefined &&
+      requestId !== "" &&
+      attachmentId !== undefined &&
+      attachmentId !== "",
   });
 }

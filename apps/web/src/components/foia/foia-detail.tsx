@@ -10,6 +10,8 @@ import { useFoiaRequest, useFoiaEvents } from "@/hooks/use-foia";
 import { FoiaStatusBadge } from "@/components/foia/foia-status-badge";
 import { FoiaTimeline } from "@/components/foia/foia-timeline";
 import { FoiaTransitionControls } from "@/components/foia/foia-transition-controls";
+import { FoiaAttachmentUpload } from "@/components/foia/foia-attachment-upload";
+import { FoiaAttachmentList } from "@/components/foia/foia-attachment-list";
 import { ProblemError } from "@/lib/auth-api";
 import type { FoiaStatus } from "@/lib/foia-api";
 
@@ -143,6 +145,23 @@ export function FoiaDetail({ id }: FoiaDetailProps) {
           requestId={req.id}
           currentStatus={req.status as FoiaStatus}
         />
+      </section>
+
+      {/* M3: Response document upload */}
+      <section aria-label="Upload response document">
+        <h2 className="mb-3 text-base font-semibold">Upload response document</h2>
+        <p className="mb-3 text-sm text-muted-foreground">
+          Upload the agency&apos;s response PDF or other file. It will be sent through the
+          extraction pipeline automatically; resulting signals will appear below once
+          extraction completes.
+        </p>
+        <FoiaAttachmentUpload requestId={req.id} />
+      </section>
+
+      {/* M3: Attachments list */}
+      <section aria-label="Response documents">
+        <h2 className="mb-3 text-base font-semibold">Response documents</h2>
+        <FoiaAttachmentList requestId={req.id} />
       </section>
 
       {/* Timeline */}

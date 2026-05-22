@@ -90,6 +90,8 @@ from .models import (
     DEFAULT_REMINDER_DAYS,
     DEFAULT_REMINDER_INTERVAL_DAYS,
     DEFAULT_REMINDER_MAX,
+    FoiaAttachment,
+    FoiaAttachmentExtractionStatus,
     FoiaRequest,
     FoiaRequestEvent,
     FoiaRequestStatus,
@@ -1044,5 +1046,241 @@ async def mark_reminded(
 
     req.last_reminded_at = _now
     req.reminder_count = req.reminder_count + 1
+    await session.flush()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# M3 — Attachment upload + extraction (foia_attachment)
+# ---------------------------------------------------------------------------
+
+#: Pseudo-recipe id used when a FOIA upload is stored via D3.  FOIA uploads
+#: are not driven by a scraped recipe; this slug identifies the source type in
+#: the provenance row so extraction / analytics can distinguish them.
+FOIA_UPLOAD_RECIPE_ID = "foia_upload"
+
+
+class FoiaAttachmentNotFoundError(LookupError):
+    """Raised when a FOIA attachment does not exist or belongs to another request."""
+
+    def __init__(self, attachment_id: uuid.UUID) -> None:
+        self.attachment_id = attachment_id
+        super().__init__(f"FOIA attachment {attachment_id} not found.")
+
+
+async def upload_attachment(
+    session: AsyncSession,
+    storage: Any,
+    *,
+    foia_request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    uploaded_by: uuid.UUID,
+    filename: str,
+    content_type: str,
+    content: bytes,
+) -> FoiaAttachment:
+    """Upload a FOIA response document and trigger extraction (M3).
+
+    Steps:
+    1. Validate the FOIA request exists and belongs to the workspace.
+    2. Store the bytes via :func:`ingestion.services.store_raw_document` (D3).
+       The provenance metadata carries ``source=foia_upload`` and the
+       ``foia_request_id`` so extraction and analytics can trace signals back.
+    3. Create a :class:`FoiaAttachment` row linking the request and raw document.
+    4. Enqueue the extraction pipeline via
+       :func:`extraction.services.enqueue_extraction` (E1).
+    5. Record the extraction job id on the attachment.
+    6. Transition the request to ``response`` status when it is in ``ack`` status
+       (uploading a response doc implies a response has arrived).  Transitions from
+       other statuses are left for the user to advance manually.
+
+    Raises :exc:`FoiaRequestNotFoundError` if the request is not found.
+    """
+    from civicsignals_api.modules.extraction import services as extraction_services
+    from civicsignals_api.modules.ingestion import services as ingestion_services
+
+    # 1. Validate the request exists and is workspace-scoped.
+    req = await get_request(session, request_id=foia_request_id, workspace_id=workspace_id)
+
+    # 2. Store raw bytes via D3.  Provenance metadata links back to the request.
+    raw_doc = await ingestion_services.store_raw_document(
+        session,
+        storage,
+        content=content,
+        recipe_id=FOIA_UPLOAD_RECIPE_ID,
+        connector="manual_upload",
+        source_url=f"foia_upload://{foia_request_id}/{filename}",
+        content_type=content_type,
+        metadata={
+            "source": "foia_upload",
+            "foia_request_id": str(foia_request_id),
+            "filename": filename,
+        },
+    )
+
+    # 3. Create the attachment row (extraction_status starts as ``pending``).
+    attachment = FoiaAttachment(
+        foia_request_id=foia_request_id,
+        raw_document_id=raw_doc.id,
+        filename=filename,
+        content_type=content_type,
+        uploaded_by=uploaded_by,
+        extraction_status=FoiaAttachmentExtractionStatus.PENDING.value,
+    )
+    session.add(attachment)
+    await session.flush()  # give the attachment its PK before enqueuing
+
+    # 4. Enqueue extraction (E1 seam).
+    job = await extraction_services.enqueue_extraction(
+        session,
+        raw_doc.id,
+        recipe_id=FOIA_UPLOAD_RECIPE_ID,
+    )
+
+    # 5. Record the extraction job id on the attachment.
+    attachment.extraction_job_id = job.id
+    await session.flush()
+
+    # 6. Auto-transition ack → response when a response document is uploaded.
+    import contextlib
+
+    if req.status == FoiaRequestStatus.ACK.value:
+        with contextlib.suppress(FoiaIllegalTransitionError):
+            await transition_request(
+                session,
+                request_id=foia_request_id,
+                workspace_id=workspace_id,
+                actor_id=uploaded_by,
+                new_status=FoiaRequestStatus.RESPONSE,
+                response_notes=f"Response document uploaded: {filename}",
+            )
+
+    return attachment
+
+
+async def list_attachments(
+    session: AsyncSession,
+    *,
+    foia_request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> tuple[list[FoiaAttachment], str | None]:
+    """Cursor-paginated list of attachments for a FOIA request (M3).
+
+    Validates workspace access before listing. Ordered by uploaded_at ascending
+    (oldest first — attachments arrive in document order).
+
+    Raises :exc:`FoiaRequestNotFoundError` if the request is not found.
+    """
+    # Ownership check.
+    await get_request(session, request_id=foia_request_id, workspace_id=workspace_id)
+
+    limit = max(1, min(limit, MAX_LIMIT))
+
+    stmt = select(FoiaAttachment).where(FoiaAttachment.foia_request_id == foia_request_id)
+
+    if cursor is not None:
+        after_id = _decode_cursor(cursor)
+        stmt = stmt.where(FoiaAttachment.id > after_id)
+
+    stmt = stmt.order_by(FoiaAttachment.id).limit(limit + 1)
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
+    return items, next_cursor
+
+
+async def get_attachment(
+    session: AsyncSession,
+    *,
+    attachment_id: uuid.UUID,
+    foia_request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> FoiaAttachment:
+    """Fetch one attachment, verifying it belongs to the workspace/request (M3).
+
+    Raises :exc:`FoiaRequestNotFoundError` if the request is not found.
+    Raises :exc:`FoiaAttachmentNotFoundError` if the attachment is not found.
+    """
+    # Workspace check.
+    await get_request(session, request_id=foia_request_id, workspace_id=workspace_id)
+
+    stmt = select(FoiaAttachment).where(
+        FoiaAttachment.id == attachment_id,
+        FoiaAttachment.foia_request_id == foia_request_id,
+    )
+    att = (await session.execute(stmt)).scalar_one_or_none()
+    if att is None:
+        raise FoiaAttachmentNotFoundError(attachment_id)
+    return att
+
+
+async def list_attachment_signals(
+    session: AsyncSession,
+    *,
+    attachment_id: uuid.UUID,
+    foia_request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> list[Any]:
+    """Return the signals produced by a FOIA attachment (M3).
+
+    Signals link back to the attachment via ``signals_signal.raw_document_ids``
+    which contains the attachment's ``raw_document_id``.  This avoids a
+    cross-module FK by querying the JSONB array with ``@>`` containment (the
+    ``ingestion_raw_document_content_hash_idx`` + the signals entity index keeps
+    this cheap for the typical case of a handful of signals per upload).
+
+    Returns a list of :class:`signals.models.Signal` ORM rows.  The route layer
+    converts them to :class:`FoiaAttachmentSignalRef` response shapes.
+    """
+    from sqlalchemy import cast
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    from civicsignals_api.modules.signals.models import Signal
+
+    att = await get_attachment(
+        session,
+        attachment_id=attachment_id,
+        foia_request_id=foia_request_id,
+        workspace_id=workspace_id,
+    )
+    raw_doc_id_str = str(att.raw_document_id)
+
+    # Filter signals whose ``raw_document_ids`` JSONB array contains the
+    # attachment's raw_document_id (stored as a UUID string in the array).
+    stmt = (
+        select(Signal)
+        .where(
+            Signal.raw_document_ids.cast(JSONB).contains(
+                cast([raw_doc_id_str], JSONB)
+            )
+        )
+        .order_by(Signal.observed_at.desc())
+        .limit(100)  # cap; pagination not needed for the typical count
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    return rows
+
+
+async def update_attachment_extraction_status(
+    session: AsyncSession,
+    *,
+    attachment_id: uuid.UUID,
+    new_status: FoiaAttachmentExtractionStatus,
+) -> bool:
+    """Update the extraction_status on a FoiaAttachment (M3 worker callback).
+
+    Called by the extraction worker (or a future webhook) when the pipeline
+    completes or fails.  No workspace check — this is a system-level update.
+
+    Returns True if the row was found and updated, False if not found.
+    """
+    att = await session.get(FoiaAttachment, attachment_id)
+    if att is None:
+        return False
+    att.extraction_status = new_status.value
     await session.flush()
     return True

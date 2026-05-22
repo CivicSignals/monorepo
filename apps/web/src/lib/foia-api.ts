@@ -255,3 +255,105 @@ export function listFoiaRequestEvents(
     { token, workspaceId },
   );
 }
+
+// ---- M3: Attachment shapes (mirrors foia/schemas.py FoiaAttachmentRead) ----
+
+export type FoiaAttachmentExtractionStatus =
+  | "pending"
+  | "running"
+  | "done"
+  | "failed"
+  | "skipped";
+
+export interface FoiaAttachmentRead {
+  id: string;
+  foia_request_id: string;
+  raw_document_id: string;
+  extraction_job_id: string | null;
+  filename: string;
+  content_type: string;
+  uploaded_by: string;
+  uploaded_at: string;
+  extraction_status: FoiaAttachmentExtractionStatus;
+}
+
+export interface FoiaAttachmentPage {
+  items: FoiaAttachmentRead[];
+  next_cursor: string | null;
+}
+
+export interface FoiaAttachmentSignalRef {
+  id: string;
+  signal_type: string;
+  title: string;
+  summary: string;
+  confidence: number | null;
+  status: string;
+  observed_at: string;
+}
+
+// ---- M3: Attachment API functions (workspace-scoped) ----
+
+/** Upload a response document to a FOIA request (multipart/form-data).
+ *
+ * Uses a raw fetch rather than `request()` so that Content-Type is NOT
+ * forced to application/json — the browser sets the correct
+ * multipart/form-data boundary automatically when FormData is the body.
+ */
+export async function uploadFoiaAttachment(
+  token: string,
+  workspaceId: string,
+  requestId: string,
+  file: File,
+): Promise<FoiaAttachmentRead> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+
+  const headers = new Headers();
+  headers.set("Accept", "application/json");
+  headers.set("Authorization", `Bearer ${token}`);
+  headers.set("X-Workspace-Id", workspaceId);
+  // No Content-Type: browser sets multipart/form-data with boundary.
+
+  const res = await fetch(
+    `${API_BASE_URL}/foia/requests/${encodeURIComponent(requestId)}/attachments`,
+    { method: "POST", body: form, headers },
+  );
+  if (!res.ok) {
+    const problem = (await res.json().catch(() => ({
+      type: "about:blank",
+      title: res.statusText,
+      status: res.status,
+    }))) as Problem;
+    throw new ProblemError(problem);
+  }
+  return (await res.json()) as FoiaAttachmentRead;
+}
+
+/** List attachments for a FOIA request (cursor-paginated). */
+export function listFoiaAttachments(
+  token: string,
+  workspaceId: string,
+  requestId: string,
+  cursor?: string,
+): Promise<FoiaAttachmentPage> {
+  const params = new URLSearchParams({ limit: "25" });
+  if (cursor) params.set("cursor", cursor);
+  return request<FoiaAttachmentPage>(
+    `/foia/requests/${encodeURIComponent(requestId)}/attachments?${params.toString()}`,
+    { token, workspaceId },
+  );
+}
+
+/** List signals linked to a FOIA attachment. */
+export function listAttachmentSignals(
+  token: string,
+  workspaceId: string,
+  requestId: string,
+  attachmentId: string,
+): Promise<FoiaAttachmentSignalRef[]> {
+  return request<FoiaAttachmentSignalRef[]>(
+    `/foia/requests/${encodeURIComponent(requestId)}/attachments/${encodeURIComponent(attachmentId)}/signals`,
+    { token, workspaceId },
+  );
+}
