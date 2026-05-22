@@ -7,8 +7,8 @@ JSON. CI replays these on every PR so a recipe author (or a connector / prompt
 change) can't silently break extraction.
 
 The expected-JSON shape is the projection of an :class:`ExtractedDocument` that
-matters for regression: ``signal_type``, ``extraction_method``, ``degraded``,
-``fields``.
+matters for regression: ``signal_types`` (the recipe's declared list),
+``extraction_method``, ``degraded``, ``fields``.
 """
 
 from __future__ import annotations

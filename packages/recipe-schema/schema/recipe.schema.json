@@ -54,7 +54,7 @@
           "type": "number",
           "minimum": 0,
           "default": 0,
-          "description": "Random extra delay (0..jitter) added to each politeness wait to avoid lockstep request patterns."
+          "description": "Random extra delay (0..jitter) added before every request (independent of the politeness wait) to avoid lockstep request patterns across recipes."
         },
         "user_agent": {
           "type": "string",

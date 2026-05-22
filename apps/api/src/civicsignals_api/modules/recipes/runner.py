@@ -343,8 +343,10 @@ class RecipeRunner:
 
     # -- politeness ---------------------------------------------------------
     def _apply_politeness(self, host: str) -> None:
-        """Sleep so consecutive same-host fetches are >= politeness_seconds apart,
-        plus up to ``jitter_seconds`` of random extra delay (doc 18 §2.2)."""
+        """Space same-host fetches >= ``politeness_seconds`` apart, then add up to
+        ``jitter_seconds`` of random delay before *every* request (independent of
+        the politeness wait, including the first) to avoid lockstep patterns
+        (doc 18 §2.2)."""
         policy = self.recipe.fetch
         last = self._last_fetch_at.get(host)
         if last is not None:
