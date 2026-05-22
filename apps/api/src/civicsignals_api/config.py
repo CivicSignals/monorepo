@@ -76,6 +76,22 @@ class Settings(BaseSettings):
 
     api_v1_prefix: str = Field(default="/api/v1")
 
+    # ---------------------------------------------------------------------------
+    # Stripe billing (N1).  All optional — empty/unset means billing is inactive.
+    # Live keys are provisioned by LC-13 (external Stripe account setup).
+    # ``stripe_price_id_*`` are the Stripe price IDs for each self-serve plan;
+    # populated by LC-13 / N2 when price objects are created in Stripe dashboard.
+    # ---------------------------------------------------------------------------
+    # TODO LC-13: set STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET from Stripe dashboard.
+    # TODO N2: add per-plan price IDs once plan definitions land.
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    # Self-serve Stripe price ids (set by LC-13/N2; empty by default so tests pass
+    # without a real Stripe account).
+    stripe_price_id_solo: str | None = None
+    stripe_price_id_starter: str | None = None
+    stripe_price_id_pro: str | None = None
+
     # Recipe DSL + runner (doc 18 §3). Both default to the monorepo layout
     # (discovered by walking up from the installed package) and can be overridden
     # in containers where the repo root sits elsewhere.
