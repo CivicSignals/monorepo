@@ -164,11 +164,29 @@ jobs:
   e2e-smoke:
     name: E2E smoke
     runs-on: ubuntu-latest
+    # NON-BLOCKING during the rapid build-out: the @smoke specs themselves pass,
+    # but this is the slowest CI job (web build + chromium install) so the
+    # concurrency cancel-in-progress frequently cancels it on rebases/force-pushes,
+    # making it look red on PRs. Keep it running for visibility but don't let it
+    # gate merges. Real coverage lives in the nightly full suite (e2e-nightly.yml).
+    # TODO QA-5: restore as a required gate once the web UI + browser caching stabilize.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Node + pnpm
         uses: ./.github/actions/setup-node-pnpm
+
+      # Cache the Playwright browser binaries so the chromium install (the slow
+      # step) is a no-op on cache hit — keeps this job fast enough to finish
+      # before a superseding push cancels it.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            playwright-chromium-${{ runner.os }}-
 
       # Build the Next.js app so `next start` serves the production bundle.
       # Using `next start` (not `next dev`) keeps the smoke suite fast and
