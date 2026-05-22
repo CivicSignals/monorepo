@@ -216,6 +216,38 @@ def _create_workspace(client: Any, token: str, name: str = "Test WS") -> dict[st
     return resp.json()  # type: ignore[no-any-return]
 
 
+def _write_audit_events(actions_and_kwargs: list[dict[str, Any]]) -> None:
+    """Write audit events using a fresh NullPool engine (avoids event-loop conflicts).
+
+    ``asyncio.run()`` creates a new event loop; using the module-level ``SessionLocal``
+    (which may be bound to TestClient's internal loop) causes 'Future attached to a
+    different loop'.  A fresh ``NullPool`` engine is loop-agnostic.
+    """
+    import os
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from civicsignals_api.modules.admin import services as admin_svc
+
+    dsn = os.environ.get("DATABASE_DIRECT_URL") or os.environ.get("DATABASE_URL")
+    if not dsn:
+        pytest.skip("no DSN")
+
+    async def _run() -> None:
+        engine = create_async_engine(dsn, poolclass=NullPool)
+        try:
+            factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+            async with factory() as session:
+                for kwargs in actions_and_kwargs:
+                    await admin_svc.record_audit_event(session, **kwargs)
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
 def test_list_audit_events_requires_auth(client: Any) -> None:
     resp = client.get(AUDIT_EVENTS)
     assert resp.status_code == 401
@@ -271,27 +303,13 @@ def test_list_audit_events_owner_can_read(client: Any) -> None:
 
 def test_list_audit_events_workspace_scoped(client: Any) -> None:
     """Audit events from workspace A do not appear in workspace B's log."""
-    import asyncio as _asyncio
-
-    from civicsignals_api.db import SessionLocal
-    from civicsignals_api.modules.admin import services as admin_svc
-
     token_a = _signup(client, "ws-a@example.com")
     token_b = _signup(client, "ws-b@example.com")
     ws_a = _create_workspace(client, token_a, "Workspace A")
     ws_b = _create_workspace(client, token_b, "Workspace B")
 
     # Write an audit event directly to workspace A.
-    async def _write() -> None:
-        async with SessionLocal() as session:
-            await admin_svc.record_audit_event(
-                session,
-                action="test.event_a",
-                workspace_id=uuid.UUID(ws_a["id"]),
-            )
-            await session.commit()
-
-    _asyncio.run(_write())
+    _write_audit_events([{"action": "test.event_a", "workspace_id": uuid.UUID(ws_a["id"])}])
 
     # Workspace A owner sees the event.
     resp_a = client.get(
@@ -329,25 +347,12 @@ def test_audit_events_append_only_no_mutation_endpoints(client: Any) -> None:
 @pytest.mark.parametrize("limit,expected", [(1, 1), (2, 2)])
 def test_audit_events_cursor_pagination(client: Any, limit: int, expected: int) -> None:
     """Cursor pagination returns the correct page sizes."""
-    import asyncio as _asyncio
-
-    from civicsignals_api.db import SessionLocal
-    from civicsignals_api.modules.admin import services as admin_svc
-
     token = _signup(client, f"paginate-{limit}@example.com")
     ws = _create_workspace(client, token, f"Page WS {limit}")
     ws_id = uuid.UUID(ws["id"])
 
     # Write 3 events for this workspace.
-    async def _write() -> None:
-        async with SessionLocal() as session:
-            for i in range(3):
-                await admin_svc.record_audit_event(
-                    session, action=f"test.page_{i}", workspace_id=ws_id
-                )
-            await session.commit()
-
-    _asyncio.run(_write())
+    _write_audit_events([{"action": f"test.page_{i}", "workspace_id": ws_id} for i in range(3)])
 
     resp = client.get(
         f"{AUDIT_EVENTS}?limit={limit}",
@@ -374,24 +379,16 @@ def test_audit_events_cursor_pagination(client: Any, limit: int, expected: int) 
 
 def test_audit_events_filter_by_action(client: Any) -> None:
     """``?action=`` filter returns only matching events."""
-    import asyncio as _asyncio
-
-    from civicsignals_api.db import SessionLocal
-    from civicsignals_api.modules.admin import services as admin_svc
-
     token = _signup(client, "filter-action@example.com")
     ws = _create_workspace(client, token, "Filter WS")
     ws_id = uuid.UUID(ws["id"])
 
-    async def _write() -> None:
-        async with SessionLocal() as session:
-            await admin_svc.record_audit_event(session, action="auth.login", workspace_id=ws_id)
-            await admin_svc.record_audit_event(
-                session, action="member.role_changed", workspace_id=ws_id
-            )
-            await session.commit()
-
-    _asyncio.run(_write())
+    _write_audit_events(
+        [
+            {"action": "auth.login", "workspace_id": ws_id},
+            {"action": "member.role_changed", "workspace_id": ws_id},
+        ]
+    )
 
     resp = client.get(
         f"{AUDIT_EVENTS}?action=auth.login",
@@ -405,11 +402,6 @@ def test_audit_events_filter_by_action(client: Any) -> None:
 
 def test_audit_events_filter_by_actor(client: Any) -> None:
     """``?actor_user_id=`` filter returns only events by that actor."""
-    import asyncio as _asyncio
-
-    from civicsignals_api.db import SessionLocal
-    from civicsignals_api.modules.admin import services as admin_svc
-
     token = _signup(client, "filter-actor@example.com")
     ws = _create_workspace(client, token, "Actor Filter WS")
     ws_id = uuid.UUID(ws["id"])
@@ -417,20 +409,12 @@ def test_audit_events_filter_by_actor(client: Any) -> None:
     actor_id = uuid.uuid4()
     other_id = uuid.uuid4()
 
-    async def _write() -> None:
-        async with SessionLocal() as session:
-            await admin_svc.record_audit_event(
-                session, action="auth.login", workspace_id=ws_id, actor_user_id=actor_id
-            )
-            await admin_svc.record_audit_event(
-                session,
-                action="auth.login",
-                workspace_id=ws_id,
-                actor_user_id=other_id,
-            )
-            await session.commit()
-
-    _asyncio.run(_write())
+    _write_audit_events(
+        [
+            {"action": "auth.login", "workspace_id": ws_id, "actor_user_id": actor_id},
+            {"action": "auth.login", "workspace_id": ws_id, "actor_user_id": other_id},
+        ]
+    )
 
     resp = client.get(
         f"{AUDIT_EVENTS}?actor_user_id={actor_id}",
