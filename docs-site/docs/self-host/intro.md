@@ -7,47 +7,40 @@ slug: /self-host/intro
 
 # Self-hosting CivicSignals
 
-CivicSignals is fully open-source (AGPL-3.0) and designed to be self-hosted. The production stack is the same `docker-compose` configuration used in development — there's no cloud-only lock-in.
-
-<!-- TODO Q4: Replace this stub with full self-host documentation. See task Q4 in TODO.md.
-  Planned sections:
-  - Quickstart (single VPS, docker-compose, 15 minutes to running)
-  - Production deployment (Hetzner/DigitalOcean sizing, nginx, TLS, nightly backups)
-  - Upgrade guide (how to pull new images and run migrations safely)
-  - Hardening (firewall, least-privilege service accounts, Postgres auth)
-  - Backup & restore (pg_dump + Backblaze B2 or S3, point-in-time recovery)
-  - Configuration reference (all environment variables)
-  Requires Q4 dependency tasks: O1 (signed images), O2 (docker-compose.yml quickstart).
--->
-
-## What's coming (Q4)
-
-Full self-host documentation is planned for **Q4 — Self-host docs**, after the following prerequisites land:
-
-- **O1** — Multi-arch Docker images (amd64 + arm64), signed with cosign
-- **O2** — `docker-compose.yml` quickstart with persistent volumes and seeded admin user
-
-Once those are ready, Q4 will document:
-
-1. **Quickstart** — get a running instance in 15 minutes on a single VPS
-2. **Production deployment** — sizing, nginx reverse proxy, Let's Encrypt TLS
-3. **Upgrade path** — pull new images, run migrations, verify health
-4. **Hardening** — firewall rules, service account hardening, secrets management
-5. **Backup & restore** — automated nightly backups, tested restore procedure
+CivicSignals is fully open-source (AGPL-3.0) and designed to be self-hosted. The production stack is the same `docker-compose` configuration used by the CivicSignals team — there is no cloud-only lock-in.
 
 ## Stack overview
 
-The self-host stack runs six process types from a single Docker image, selected via `docker-entrypoint.sh`:
+The self-host stack runs six process types from a single Docker image (`ghcr.io/civicsignals/api`), selected by `docker-entrypoint.sh`:
 
 | Process | Role |
 |---|---|
 | `api` | uvicorn — the FastAPI HTTP server |
-| `worker_ingest` | Celery — ingestion queue |
+| `worker_ingest` | Celery — ingestion queue (fetches URLs per recipe) |
 | `worker_extract` | Celery — extraction + LLM queue |
 | `worker_score` | Celery — signal scoring queue |
 | `worker_notify` | Celery — notifications queue |
 | `scheduler` | Celery Beat — cron scheduler (singleton) |
 
-Supporting services: **Postgres 16 + pgvector**, **Redis**, **MinIO** (S3-compatible), **PgBouncer** (connection pooling).
+Supporting infrastructure: **Postgres 16 + pgvector**, **Redis**, **MinIO** (S3-compatible object storage), **PgBouncer** (connection pooling in transaction mode), **nginx** (reverse proxy, TLS termination).
 
-See the [infrastructure directory](https://github.com/CivicSignals/monorepo/tree/main/infra) for the full compose configuration.
+## Documentation in this section
+
+| Page | What it covers |
+|---|---|
+| [Quickstart](./quickstart.md) | 3-command Docker Compose install on a single Linux server |
+| [Production](./production.md) | Server sizing, TLS with Let's Encrypt, nginx configuration, the six process types, PgBouncer connection modes |
+| [Configuration](./configuration.md) | Every environment variable, scope, default, and production requirements |
+| [Upgrade](./upgrade.md) | How to pull new images and run Alembic migrations safely; version compatibility matrix |
+| [Hardening](./hardening.md) | Firewall rules, secrets management, non-root containers, TLS, Redis auth |
+| [Backup & Restore](./backup.md) | `pg_dump` procedures, off-site shipping with rclone, restore steps, PITR notes |
+| [Kubernetes / Helm](./kubernetes.md) | Helm chart quick start (bundled datastores) and production (external managed datastores), scaling, secrets management |
+
+## Source files
+
+The infrastructure lives in the [`infra/`](https://github.com/CivicSignals/monorepo/tree/main/infra) directory of the monorepo:
+
+- `infra/docker-compose.yml` — production single-host compose file
+- `infra/.env.example` — environment variable template (copy to `infra/.env`)
+- `infra/nginx/nginx.conf` — nginx reverse proxy configuration
+- `infra/helm/civicsignals/` — Helm chart for Kubernetes deployments
