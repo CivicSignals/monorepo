@@ -30,6 +30,9 @@ INTEGRATION_CONNECTION_DELETED = "integration.connection.deleted"
 INTEGRATION_PUSH_FAILED = "integration.push.failed"
 # K2: emitted after every push attempt (success or failure) is recorded.
 INTEGRATION_PUSH_RECORDED = "integration.push.recorded"
+# F6: emitted after an ICP is created, updated (patched), or its active state
+# changes so the backfill listener can kick off the sync+async rescore.
+ICP_CHANGED = "icp.changed"
 
 Handler = Callable[[dict[str, Any]], Awaitable[None]]
 
