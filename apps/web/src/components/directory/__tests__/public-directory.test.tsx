@@ -249,6 +249,35 @@ describe("Public directory page: rendering", () => {
     expect(screen.getByText(/temporarily unavailable/i)).toBeTruthy();
   });
 
+  it("renders a well-formed JSON-LD @graph (WebSite + BreadcrumbList) (P3)", async () => {
+    vi.doMock("@/lib/public-entities-api", () => ({
+      fetchPublicEntities: vi.fn().mockResolvedValue({
+        items: [makeEntity({ id: "ent-001" })],
+        next_cursor: null,
+      }),
+      fetchPublicEntity: vi.fn(),
+      fetchPublicEntityChildren: vi.fn(),
+      fetchAllEntityIdsForSitemap: vi.fn().mockResolvedValue([]),
+      DIRECTORY_REVALIDATE_SECONDS: 300,
+      SITEMAP_ENTITY_LIMIT: 1000,
+    }));
+
+    const { default: PublicDirectoryPage } = await import("@/app/directory/page");
+    const jsx = await (PublicDirectoryPage as () => Promise<React.ReactElement>)();
+    const { container } = render(jsx);
+
+    const script = container.querySelector(
+      'script[type="application/ld+json"]',
+    );
+    expect(script).not.toBeNull();
+    const data = JSON.parse(script!.textContent ?? "{}");
+    const types = (data["@graph"] as Array<{ "@type": string }>).map(
+      (n) => n["@type"],
+    );
+    expect(types).toContain("WebSite");
+    expect(types).toContain("BreadcrumbList");
+  });
+
   it("directory rows link to /directory/[id]", async () => {
     vi.doMock("@/lib/public-entities-api", () => ({
       fetchPublicEntities: vi.fn().mockResolvedValue({

@@ -67,7 +67,10 @@ jobs:
 
       - name: Run schemathesis contract tests
         working-directory: apps/api
-        # -k contract selects only tests/test_contract.py tests.
+        # Select the contract suite by PATH, not `-k contract`: the keyword
+        # filter also swept in unrelated DB-backed tests whose parametrize IDs
+        # contain "contract" (e.g. signal types contract_awarded/contract_expiring),
+        # which error here because this job has no Postgres service.
         # --no-cov keeps the run fast; coverage is collected in the main test job.
         # -v shows each parametrized operation so CI logs are easy to read.
-        run: uv run pytest -k contract -v --no-cov
+        run: uv run pytest tests/test_contract.py -v --no-cov
