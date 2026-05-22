@@ -28,7 +28,7 @@
     },
     "schedule": {
       "type": "object",
-      "description": "Per-recipe cadence. The scheduler (TODO D4) reads `cron`; the runner's fetch step reads `fetch.politeness_seconds` to space same-host requests (doc 18 §2.2).",
+      "description": "Per-recipe cadence. The scheduler (D4) reads `cron` to decide when each recipe is due (plus a per-recipe jitter window so same-cron recipes don't fire in lockstep); the runner's fetch step reads `fetch.politeness_seconds` to space same-host requests (doc 18 §2.2, §6).",
       "additionalProperties": false,
       "properties": {
         "cron": { "type": "string", "description": "cron expression for the scheduled run cadence" }

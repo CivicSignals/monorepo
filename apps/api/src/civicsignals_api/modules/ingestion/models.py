@@ -12,6 +12,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -115,4 +116,65 @@ class RawDocument(Base):
         # cursor (created_at, id) via ``services.list_raw_document_refs``; this
         # composite index makes that scan an index range, not a seq scan.
         Index("ingestion_raw_document_created_at_id_idx", "created_at", "id"),
+    )
+
+
+class RecipeSchedule(Base):
+    """Per-recipe scheduling run-state for the cadence dispatcher (D4; doc 18 §3, §6).
+
+    The ``scheduler`` process (Celery beat, a leader-elected singleton — doc 06 §8,
+    doc 18 §6.1) runs the ``ingestion.dispatch_due_recipes`` beat task every minute.
+    Each tick it loads the active recipes (YAML under ``recipes/``) and, for each,
+    decides whether it is *due* by comparing ``now`` against this row's
+    ``next_run_at`` (computed from the recipe's ``schedule.cron`` plus a per-recipe
+    deterministic jitter window, doc 18 §6.4 "adaptive scheduling"). A due recipe is
+    enqueued as ``ingestion.crawl_recipe`` on the ``ingest`` queue and its
+    ``last_*`` / ``next_run_at`` are advanced here so the next tick doesn't re-fire
+    it (doc 06 §8 per-recipe cadence ~5 min to 24 h).
+
+    Keyed by the recipe **slug string** — recipes are versioned YAML, there is no
+    ``recipes_recipe`` table, and ingestion does not FK across the module boundary
+    (doc 06 §3; same convention as ``ingestion_raw_document.recipe_id``). The pinned
+    ``recipe_version`` last dispatched is recorded for provenance (doc 18 §3.5).
+    """
+
+    __tablename__ = "ingestion_recipe_schedule"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+
+    # Recipe slug — the dispatcher's identity for a recipe (doc 18 §3.5). One
+    # schedule row per recipe (UNIQUE) so ``next_run_at`` is unambiguous.
+    recipe_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The pinned recipe_version last dispatched (provenance, doc 18 §3.5).
+    recipe_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    # The recipe's cron expression as last seen — recorded so an edit to the
+    # recipe's cadence is observable and the next due-time can be recomputed.
+    cron: Mapped[str | None] = mapped_column(String(255))
+
+    # When the dispatcher last enqueued a crawl for this recipe (NULL = never run).
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The earliest wall-clock time the next crawl may be enqueued. The due check is
+    # ``now >= next_run_at`` (a NULL/absent row means due immediately). Includes the
+    # per-recipe jitter offset so recipes sharing a cron don't fire in lockstep.
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Operator pause switch (doc 18 §3.2 auto-pause / manual pause): a paused recipe
+    # is skipped by the dispatcher but its past signals stay visible (doc 18 §3.2).
+    paused: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        # One schedule row per recipe — the get-or-create the dispatcher upserts on.
+        UniqueConstraint("recipe_id", name="ingestion_recipe_schedule_recipe_uq"),
+        # The dispatcher scans for due rows by ``next_run_at <= now`` each tick.
+        Index("ingestion_recipe_schedule_next_run_idx", "next_run_at"),
     )

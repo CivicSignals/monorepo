@@ -38,8 +38,8 @@ from civicsignals_api.modules.recipes.services import (
 
 from . import storage as storage_module
 from .connectors import connector_for
-from .models import RawDocument
-from .schemas import RawDocumentRef, StoredRawDocument
+from .models import RawDocument, RecipeSchedule
+from .schemas import RawDocumentRef, RecipeScheduleState, StoredRawDocument
 from .storage import RawDocumentStorage
 
 
@@ -262,6 +262,109 @@ async def list_raw_document_refs(
     ]
 
 
+# ----------------------------------------------------------------------------
+# Recipe schedule run-state (D4; doc 18 §3, §6 — the cadence dispatcher's state)
+# ----------------------------------------------------------------------------
+
+
+async def get_or_create_recipe_schedule(
+    session: AsyncSession,
+    recipe_id: str,
+    *,
+    recipe_version: int = 1,
+    cron: str | None = None,
+) -> RecipeScheduleState:
+    """Get-or-create the ``ingestion_recipe_schedule`` row for ``recipe_id`` (D4).
+
+    Idempotent on the recipe slug (UNIQUE ``ingestion_recipe_schedule_recipe_uq``):
+    the dispatcher sees a recipe for the first time on a fresh deployment and this
+    seeds its run-state row (``last_run_at``/``next_run_at`` NULL = due immediately,
+    doc 18 §6). ``ON CONFLICT DO NOTHING`` + re-select makes two scheduler instances
+    racing to create the same row safe. The caller owns the transaction.
+    """
+    existing = await _find_schedule(session, recipe_id)
+    if existing is not None:
+        return RecipeScheduleState.model_validate(existing)
+
+    stmt = (
+        pg_insert(RecipeSchedule)
+        .values(
+            id=uuid.uuid4(),
+            recipe_id=recipe_id,
+            recipe_version=recipe_version,
+            cron=cron,
+        )
+        .on_conflict_do_nothing(constraint="ingestion_recipe_schedule_recipe_uq")
+        .returning(RecipeSchedule.id)
+    )
+    inserted_id = (await session.execute(stmt)).scalar_one_or_none()
+    if inserted_id is None:
+        # Lost the race; the conflicting row now exists — re-select it.
+        existing = await _find_schedule(session, recipe_id)
+        assert existing is not None
+        return RecipeScheduleState.model_validate(existing)
+    row = await session.get(RecipeSchedule, inserted_id)
+    assert row is not None
+    return RecipeScheduleState.model_validate(row)
+
+
+async def list_recipe_schedules(session: AsyncSession) -> list[RecipeScheduleState]:
+    """List all recipe schedule run-state rows (the dispatcher's bulk read)."""
+    rows = (await session.execute(select(RecipeSchedule))).scalars().all()
+    return [RecipeScheduleState.model_validate(row) for row in rows]
+
+
+async def mark_recipe_dispatched(
+    session: AsyncSession,
+    recipe_id: str,
+    *,
+    last_run_at: datetime,
+    next_run_at: datetime,
+    recipe_version: int | None = None,
+    cron: str | None = None,
+) -> RecipeScheduleState:
+    """Advance a recipe's run-state after its crawl was enqueued (D4).
+
+    Records ``last_run_at`` = the dispatch time and ``next_run_at`` = the next due
+    time (already jittered) so the recipe isn't re-fired on the next tick (doc 06 §8
+    per-recipe cadence). Optionally refreshes the pinned version + cron last seen.
+    Creates the row if absent (the very first dispatch). Caller owns the transaction.
+    """
+    row = await _find_schedule(session, recipe_id)
+    if row is None:
+        await get_or_create_recipe_schedule(
+            session, recipe_id, recipe_version=recipe_version or 1, cron=cron
+        )
+        row = await _find_schedule(session, recipe_id)
+        assert row is not None
+    row.last_run_at = last_run_at
+    row.next_run_at = next_run_at
+    if recipe_version is not None:
+        row.recipe_version = recipe_version
+    if cron is not None:
+        row.cron = cron
+    await session.flush()
+    return RecipeScheduleState.model_validate(row)
+
+
+async def set_recipe_paused(
+    session: AsyncSession, recipe_id: str, *, paused: bool
+) -> RecipeScheduleState:
+    """Pause/unpause a recipe (doc 18 §3.2). Past signals stay visible either way."""
+    await get_or_create_recipe_schedule(session, recipe_id)
+    row = await _find_schedule(session, recipe_id)
+    assert row is not None
+    row.paused = paused
+    await session.flush()
+    return RecipeScheduleState.model_validate(row)
+
+
+async def _find_schedule(session: AsyncSession, recipe_id: str) -> RecipeSchedule | None:
+    return (
+        await session.execute(select(RecipeSchedule).where(RecipeSchedule.recipe_id == recipe_id))
+    ).scalar_one_or_none()
+
+
 def _to_schema(row: RawDocument, *, deduped: bool) -> StoredRawDocument:
     return StoredRawDocument(
         id=row.id,
@@ -286,10 +389,15 @@ __all__ = [
     "Fetcher",
     "RawDocumentRef",
     "RawDocumentStorage",
+    "RecipeScheduleState",
     "StoredRawDocument",
     "crawl_recipe",
     "crawl_recipe_with_connector",
+    "get_or_create_recipe_schedule",
     "get_raw_document",
     "list_raw_document_refs",
+    "list_recipe_schedules",
+    "mark_recipe_dispatched",
+    "set_recipe_paused",
     "store_raw_document",
 ]

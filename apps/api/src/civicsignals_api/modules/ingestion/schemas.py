@@ -51,3 +51,22 @@ class StoredRawDocument(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
     # True when the row already existed and was returned as-is (no new insert).
     deduped: bool = False
+
+
+class RecipeScheduleState(BaseModel):
+    """The scheduler's run-state for one recipe (``ingestion_recipe_schedule``; D4).
+
+    Read by the cadence dispatcher each beat tick to decide whether a recipe is due
+    (``now >= next_run_at``) and written back after a crawl is enqueued (advancing
+    ``last_run_at`` / ``next_run_at``). Exposed as a Pydantic view so the dispatcher
+    + tests don't reach into the ORM model across the module boundary (doc 06 §3).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    recipe_id: str
+    recipe_version: int
+    cron: str | None = None
+    last_run_at: datetime | None = None
+    next_run_at: datetime | None = None
+    paused: bool = False

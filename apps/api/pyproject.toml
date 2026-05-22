@@ -41,6 +41,11 @@ dependencies = [
     # them and the Docker images install with `uv sync --no-dev` (no extras).
     "jsonschema>=4.23",
     "beautifulsoup4>=4.12",
+    # Recipe scheduler cadence (D4). croniter evaluates a recipe's `schedule.cron`
+    # against an injectable base time so due-calculation is deterministic + unit
+    # testable (Celery's own crontab.is_due is wall-clock coupled). Tiny, pure
+    # Python; lives in core because the `scheduler` process runs the lean image.
+    "croniter>=3.0",
     # Stripe billing SDK (N1). Version pinned to major for API stability.
     "stripe>=11.0",
     # Observability (A6). All three are config-gated: Sentry is a no-op when
@@ -175,6 +180,11 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # stripe SDK ships partial/no py.typed; ignore missing stubs (N1).
 module = ["stripe.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# croniter ships no py.typed marker (the recipe scheduler's cron evaluator, D4).
+module = ["croniter.*"]
 ignore_missing_imports = true
 
 # ----------------------------------------------------------------------------
