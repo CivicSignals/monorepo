@@ -1,8 +1,8 @@
 // FoiaAttachmentUpload — file picker + upload trigger for M3 response documents.
 //
-// Accepts any file type (PDF, DOCX, HTML…) and uploads it to the FOIA request
-// via the multipart POST endpoint. Shows a spinner during upload, a success
-// message on completion, and an error alert on failure.
+// Accepts response-document file types: PDF, DOCX, HTML, plain text, EML, MSG.
+// Uploads to the FOIA request via the multipart POST endpoint. Shows a spinner
+// during upload, a success message on completion, and an error alert on failure.
 
 "use client";
 

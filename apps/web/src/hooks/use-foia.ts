@@ -219,7 +219,7 @@ export function useTransitionFoiaRequest(requestId: string) {
 
 // ---- M3: Attachment hooks ----
 
-/** Fetch all attachments for a FOIA request (non-paginated for UI simplicity). */
+/** Fetch the first page of attachments for a FOIA request (up to 25; non-paginated for UI simplicity). */
 export function useFoiaAttachments(requestId: string | undefined) {
   const { token, workspaceId } = useAuth();
   return useQuery<FoiaAttachmentPage>({

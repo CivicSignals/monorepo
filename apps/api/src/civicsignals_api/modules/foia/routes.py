@@ -43,6 +43,7 @@ Errors follow RFC 7807 ``application/problem+json`` via
 
 from __future__ import annotations
 
+import functools
 import uuid
 from typing import Annotated
 
@@ -466,11 +467,14 @@ def _attachment_not_found(attachment_id: uuid.UUID) -> ProblemException:
     )
 
 
+@functools.lru_cache(maxsize=1)
 def _get_storage() -> object:
-    """Return the RawDocumentStorage for the current process (D3 seam).
+    """Return the RawDocumentStorage singleton for this process (D3 seam).
 
     Imported lazily so the storage (boto3 / S3) is not constructed during
     module import — keeps the API startup fast and lets tests inject a fake.
+    Cached via :func:`functools.lru_cache` so the boto3 S3 client is created
+    only once per process rather than on every upload request.
     """
     from civicsignals_api.modules.ingestion.storage import RawDocumentStorage
 
@@ -525,7 +529,8 @@ async def upload_attachment(
     summary="List FOIA request attachments",
     description=(
         "Return a cursor-paginated list of uploaded response documents for a FOIA request. "
-        "Ordered oldest-first by upload time."
+        "Ordered ascending by ``id`` (UUIDv7 — encodes creation time, so effectively oldest-first). "
+        "Use the ``cursor`` returned in ``next_cursor`` to fetch subsequent pages."
     ),
 )
 async def list_attachments(

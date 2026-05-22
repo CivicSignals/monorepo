@@ -1103,11 +1103,16 @@ async def upload_attachment(
     req = await get_request(session, request_id=foia_request_id, workspace_id=workspace_id)
 
     # 2. Store raw bytes via D3.  Provenance metadata links back to the request.
+    #    Use a per-request recipe_id so that the (recipe_id, content_hash)
+    #    deduplication key is scoped to this FOIA request; two different requests
+    #    uploading identical bytes get separate raw_document rows with correct
+    #    provenance rather than sharing the first request's metadata.
+    per_request_recipe_id = f"{FOIA_UPLOAD_RECIPE_ID}:{foia_request_id}"
     raw_doc = await ingestion_services.store_raw_document(
         session,
         storage,
         content=content,
-        recipe_id=FOIA_UPLOAD_RECIPE_ID,
+        recipe_id=per_request_recipe_id,
         connector="manual_upload",
         source_url=f"foia_upload://{foia_request_id}/{filename}",
         content_type=content_type,
@@ -1134,7 +1139,7 @@ async def upload_attachment(
     job = await extraction_services.enqueue_extraction(
         session,
         raw_doc.id,
-        recipe_id=FOIA_UPLOAD_RECIPE_ID,
+        recipe_id=per_request_recipe_id,
     )
 
     # 5. Record the extraction job id on the attachment.
@@ -1168,8 +1173,9 @@ async def list_attachments(
 ) -> tuple[list[FoiaAttachment], str | None]:
     """Cursor-paginated list of attachments for a FOIA request (M3).
 
-    Validates workspace access before listing. Ordered by uploaded_at ascending
-    (oldest first — attachments arrive in document order).
+    Validates workspace access before listing. Ordered by ``id`` ascending
+    (UUIDv7, which encodes creation time — effectively oldest-first). The
+    cursor is also keyset on ``id``.
 
     Raises :exc:`FoiaRequestNotFoundError` if the request is not found.
     """
