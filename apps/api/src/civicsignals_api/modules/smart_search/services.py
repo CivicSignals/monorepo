@@ -14,12 +14,19 @@ the text query (``degraded=True``) so the search box never hard-fails.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import datetime as dt
 import json
+import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, get_args
 
 import structlog
 from pydantic import ValidationError
+from sqlalchemy import bindparam, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.llm_gateway import (
     TASK_SMART_SEARCH_REWRITE,
@@ -28,12 +35,17 @@ from civicsignals_api.llm_gateway import (
     LLMResult,
     get_gateway,
 )
+from civicsignals_api.modules.signals.models import EMBEDDING_DIM, Signal
+from civicsignals_api.modules.signals.schemas import SignalRead
 
 from .schemas import (
     EntityKind,
+    FusionWeights,
     SearchFilters,
     SignalStatus,
     SignalType,
+    SmartSearchResponse,
+    SmartSearchResult,
     StructuredQuery,
 )
 
@@ -259,4 +271,420 @@ class QueryRewriter:
         return repaired
 
 
-__all__ = ["QueryRewriter", "SearchFilters", "StructuredQuery"]
+# ===========================================================================
+# Hybrid retrieval (TODO I3, doc 14 §6.2, doc 19 §7.4)
+# ===========================================================================
+#
+# Given a NL query we:
+#   1. rewrite it (I2) -> {structured filters, residual text query, keywords};
+#   2. run three retrievers over the *global* signal corpus, scoped to the
+#      structured filters as a hard intersection:
+#        (a) vector ANN  — embed the text via the gateway, cosine ANN over
+#            ``signals_signal.vector_embedding`` (I1's ivfflat index);
+#        (b) BM25 / FTS  — Postgres ``websearch_to_tsquery`` over the GIN-indexed
+#            ``to_tsvector(title || ' ' || summary)`` (this task's migration);
+#        (c) structured filter — entity/type/date/state from the rewrite.
+#   3. fuse the vector + BM25 candidate rankings with weighted reciprocal-rank
+#      fusion (RRF), intersected with the structured-filter set, and return a
+#      ranked, cursor-paginated page.
+#
+# The signal corpus is global (doc 14 §4.2); the search runs in a *workspace
+# context* (the route is behind ``require_workspace``) so per-workspace scoring
+# (F3) can boost the ranking later (the ``# TODO F3`` hook in ``_fuse``).
+
+
+# A page of pure-id fusion output is offset-paginated over a deterministic ranking,
+# so the cursor is just an opaque base64-encoded integer offset (doc 06 §5: opaque
+# cursor, never a raw offset in the URL).
+def _encode_offset_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(str(offset).encode("ascii")).decode("ascii")
+
+
+def _decode_offset_cursor(cursor: str) -> int:
+    try:
+        offset = int(base64.urlsafe_b64decode(cursor.encode("ascii")).decode("ascii"))
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid cursor") from exc
+    if offset < 0:
+        raise ValueError("invalid cursor")
+    return offset
+
+
+@dataclass(frozen=True)
+class FusedHit:
+    """One signal id with its fused score + per-retriever provenance.
+
+    Pure data — the deterministic output of :func:`fuse_rankings`, independent of
+    the DB. ``vector_rank`` / ``bm25_rank`` are 0-based ranks in each retriever's
+    list (``None`` = absent from that list). ``matched_via`` is the ordered set of
+    retrievers that surfaced this id (for the "why this result?" panel).
+    """
+
+    signal_id: uuid.UUID
+    score: float
+    matched_via: tuple[str, ...]
+    vector_rank: int | None
+    bm25_rank: int | None
+
+
+def fuse_rankings(
+    *,
+    vector_ids: Sequence[uuid.UUID],
+    bm25_ids: Sequence[uuid.UUID],
+    filter_ids: set[uuid.UUID] | None,
+    weights: FusionWeights,
+) -> list[FusedHit]:
+    """Weighted reciprocal-rank fusion of the vector + BM25 rankings (doc 14 §6.2).
+
+    Pure + deterministic so the ranking is unit-testable without a DB. Each list is
+    a ranking (most-relevant first); a signal at 0-based rank ``r`` contributes
+    ``weight / (rrf_k + r + 1)`` from that retriever. The two contributions sum to
+    the fused score. ``filter_ids`` is the structured-filter intersection: when not
+    ``None``, the fused set is restricted to it (a hard gate — a candidate that the
+    vector/BM25 retrievers surfaced but that fails the filters is dropped). When
+    ``None``, no structured filter was applied (the rewrite extracted none) and the
+    full vector-union-BM25 candidate set ranks.
+
+    Ties (equal fused score) break deterministically by signal id so pagination is
+    stable across calls. ``matched_via`` records which retrievers (and the filter)
+    contributed, surfaced to the UI.
+
+    # TODO F3: fold a per-workspace ``signals_workspace_score`` term into the fused
+    # score here (a third weighted contribution) once F3 lands — the workspace is
+    # already in scope (the route requires it).
+    """
+    k = weights.rrf_k
+
+    vec_rank = {sid: r for r, sid in enumerate(vector_ids)}
+    bm_rank = {sid: r for r, sid in enumerate(bm25_ids)}
+
+    retrieved: set[uuid.UUID] = set(vec_rank) | set(bm_rank)
+    if filter_ids is None:
+        # No structured filter: rank the full vector-union-BM25 candidate set.
+        candidates = retrieved
+    elif retrieved:
+        # Structured filter is a hard gate over the text retrievers' candidates.
+        candidates = retrieved & filter_ids
+    else:
+        # Filter-only query (no residual text → no vector/BM25 candidates): the
+        # filter set *is* the result so a pure structured query still returns rows.
+        candidates = set(filter_ids)
+
+    hits: list[FusedHit] = []
+    for sid in candidates:
+        score = 0.0
+        via: list[str] = []
+        vr = vec_rank.get(sid)
+        if vr is not None and weights.vector > 0.0:
+            score += weights.vector / (k + vr + 1)
+            via.append("vector")
+        br = bm_rank.get(sid)
+        if br is not None and weights.bm25 > 0.0:
+            score += weights.bm25 / (k + br + 1)
+            via.append("bm25")
+        if filter_ids is not None:
+            via.append("filter")
+        # A candidate may be in the filter set only (no vector/bm25 hit) when the
+        # query was filter-only; it still ranks (score 0 from fusion) so a pure
+        # structured query returns results.
+        hits.append(
+            FusedHit(
+                signal_id=sid,
+                score=score,
+                matched_via=tuple(via),
+                vector_rank=vr,
+                bm25_rank=br,
+            )
+        )
+
+    # Highest score first; stable, deterministic tiebreak on the (time-ordered) id.
+    hits.sort(key=lambda h: (-h.score, h.signal_id.bytes))
+    return hits
+
+
+class HybridRetriever:
+    """Hybrid retrieval over the global signal corpus (TODO I3, doc 14 §6.2).
+
+    Orchestrates rewrite -> {vector ANN, BM25 FTS, structured filter} -> fusion.
+    Holds the gateway (for embedding the query text) + a :class:`QueryRewriter`;
+    each ``search`` call takes a DB session so the same retriever instance serves
+    many requests.
+    """
+
+    def __init__(
+        self,
+        gateway: LLMGateway | None = None,
+        *,
+        rewriter: QueryRewriter | None = None,
+    ) -> None:
+        self._gateway = gateway or get_gateway()
+        self._rewriter = rewriter or QueryRewriter(self._gateway)
+
+    async def search(
+        self,
+        session: AsyncSession,
+        query: str,
+        *,
+        workspace_id: str | None = None,
+        extra_filters: SearchFilters | None = None,
+        top_n: int = 25,
+        candidate_limit: int = 100,
+        weights: FusionWeights | None = None,
+        cursor: str | None = None,
+    ) -> SmartSearchResponse:
+        """Run hybrid retrieval for a natural-language ``query`` (doc 14 §6.2).
+
+        1. Rewrite the NL query (I2) into structured filters + a residual text query.
+        2. Merge ``extra_filters`` (explicit UI filter chips) over the rewrite's.
+        3. Run vector ANN + BM25 FTS (both scoped to the merged filters) and a
+           structured-filter id query, then fuse.
+        4. Hydrate the top-N (after the cursor offset) into :class:`SignalRead`.
+
+        ``workspace_id`` scopes token accounting for the rewrite + query embed
+        (doc 06 §7); the signal corpus itself is global (doc 14 §4.2).
+        """
+        weights = weights or FusionWeights()
+        offset = _decode_offset_cursor(cursor) if cursor else 0
+
+        structured, _ = await self._rewriter.rewrite(query, workspace_id=workspace_id)
+        filters = _merge_filters(structured.filters, extra_filters)
+
+        # The text fed to the retrievers: the rewrite's residual text (plus surfaced
+        # keywords for a bit more BM25 recall). Falls back to the raw query when the
+        # rewrite degraded to empty text.
+        text = structured.text.strip() or query.strip()
+        fts_text = " ".join([text, *structured.keywords]).strip()
+
+        vector_ids = await self._vector_ann(
+            session, text=text, filters=filters, limit=candidate_limit, workspace_id=workspace_id
+        )
+        bm25_ids = await self._bm25(session, text=fts_text, filters=filters, limit=candidate_limit)
+        filter_ids = await self._filter_ids(session, filters, limit=candidate_limit)
+
+        fused = fuse_rankings(
+            vector_ids=vector_ids,
+            bm25_ids=bm25_ids,
+            filter_ids=filter_ids,
+            weights=weights,
+        )
+
+        page = fused[offset : offset + top_n]
+        has_more = len(fused) > offset + top_n
+        next_cursor = _encode_offset_cursor(offset + top_n) if has_more else None
+
+        results = await self._hydrate(session, page)
+        return SmartSearchResponse(
+            results=results,
+            next_cursor=next_cursor,
+            query=structured,
+            degraded=structured.degraded,
+        )
+
+    # -- retriever (a): vector ANN -------------------------------------------
+
+    async def _vector_ann(
+        self,
+        session: AsyncSession,
+        *,
+        text: str,
+        filters: SearchFilters,
+        limit: int,
+        workspace_id: str | None,
+    ) -> list[uuid.UUID]:
+        """Cosine ANN over ``signals_signal.vector_embedding`` (I1 ivfflat index).
+
+        Embeds the query text via the gateway (best-effort: an embed failure yields
+        no vector candidates rather than failing the whole search — BM25 + filters
+        still return results, doc 19 §12.1 resilience), then orders by cosine
+        distance. NULL-embedding rows are excluded (they cannot ANN-match).
+        """
+        if not text:
+            return []
+        try:
+            result = await self._gateway.embed([text], workspace_id=workspace_id)
+        except LLMError:
+            log.warning("smart_search.vector.embed_failed", exc_info=True)
+            return []
+        if not result.vectors or result.dim != EMBEDDING_DIM:
+            log.warning(
+                "smart_search.vector.embed_dim_mismatch", got=result.dim, expected=EMBEDDING_DIM
+            )
+            return []
+        query_vec = result.vectors[0]
+
+        stmt = select(Signal.id).where(Signal.vector_embedding.is_not(None))
+        stmt = _apply_filters(stmt, filters)
+        stmt = stmt.order_by(Signal.vector_embedding.cosine_distance(query_vec)).limit(limit)
+        return list((await session.execute(stmt)).scalars().all())
+
+    # -- retriever (b): BM25 / full-text -------------------------------------
+
+    async def _bm25(
+        self,
+        session: AsyncSession,
+        *,
+        text: str,
+        filters: SearchFilters,
+        limit: int,
+    ) -> list[uuid.UUID]:
+        """Postgres full-text (BM25-style ``ts_rank``) over title+summary (doc 14 §6.2).
+
+        ``websearch_to_tsquery`` parses user-style query text (quoted phrases, ``or``,
+        ``-term``) safely. Ordered by ``ts_rank`` desc; only rows that actually match
+        the tsquery are returned (the ``@@`` predicate), so this retriever is precise
+        (it contributes recall via the union with vector ANN, not noise). Uses the
+        same ``to_tsvector(title || ' ' || summary)`` expression the GIN index covers
+        so the index is used.
+        """
+        if not text:
+            return []
+        # Must match the functional GIN index expression exactly (the I3 migration
+        # ``signals_fts_gin_idx``) so the planner uses the index instead of a scan:
+        # ``to_tsvector('english', coalesce(title,'') || ' ' || coalesce(summary,''))``.
+        tsvector = func.to_tsvector(
+            "english",
+            func.coalesce(Signal.title, "")
+            .op("||")(" ")
+            .op("||")(func.coalesce(Signal.summary, "")),
+        )
+        # websearch_to_tsquery never raises on arbitrary user input (unlike
+        # to_tsquery), so untrusted query text is safe to pass directly.
+        tsquery = func.websearch_to_tsquery("english", bindparam("q_text", text))
+        stmt = select(Signal.id).where(tsvector.op("@@")(tsquery))
+        stmt = _apply_filters(stmt, filters)
+        stmt = stmt.order_by(func.ts_rank(tsvector, tsquery).desc()).limit(limit)
+        return list((await session.execute(stmt)).scalars().all())
+
+    # -- retriever (c): structured filter intersection -----------------------
+
+    async def _filter_ids(
+        self,
+        session: AsyncSession,
+        filters: SearchFilters,
+        *,
+        limit: int,
+    ) -> set[uuid.UUID] | None:
+        """The set of signal ids passing the structured filters (the hard gate).
+
+        Returns ``None`` when *no* structured filter was set — that means "do not
+        intersect" (the fused set is the full vector-union-BM25 candidates). When at
+        least one filter is set, returns the matching id set (capped) so fusion
+        intersects with it.
+
+        State filtering is intentionally **not** applied here: ``signals_signal`` has
+        no geo column of its own (geo lives on the entity, doc 07 §3); state-scoped
+        retrieval is the entity-resolution join that lands with F3/E10. The state
+        codes are still echoed back in the response's structured query.
+        # TODO E10/F3: join entities_entity for the state/geo filter.
+        """
+        if filters.is_empty():
+            return None
+        stmt = _apply_filters(select(Signal.id), filters).limit(limit)
+        rows = (await session.execute(stmt)).scalars().all()
+        return set(rows)
+
+    # -- hydrate fused ids -> read models ------------------------------------
+
+    async def _hydrate(
+        self, session: AsyncSession, page: Sequence[FusedHit]
+    ) -> list[SmartSearchResult]:
+        """Load the page's :class:`Signal` rows and zip them back onto the fused order."""
+        if not page:
+            return []
+        ids = [h.signal_id for h in page]
+        rows = (await session.execute(select(Signal).where(Signal.id.in_(ids)))).scalars().all()
+        by_id = {r.id: r for r in rows}
+        results: list[SmartSearchResult] = []
+        for hit in page:
+            row = by_id.get(hit.signal_id)
+            if row is None:  # pragma: no cover - id came from this same DB
+                continue
+            results.append(
+                SmartSearchResult(
+                    signal=SignalRead.model_validate(row),
+                    score=hit.score,
+                    matched_via=list(hit.matched_via),
+                    vector_rank=hit.vector_rank,
+                    bm25_rank=hit.bm25_rank,
+                )
+            )
+        return results
+
+
+def _merge_filters(base: SearchFilters, extra: SearchFilters | None) -> SearchFilters:
+    """Merge explicit ``extra`` filter chips over the rewrite's ``base`` filters.
+
+    List fields union (de-duplicated, order-stable); scalar fields (``min_score``,
+    the date bounds) take the explicit ``extra`` value when set, else the rewrite's.
+    The result is re-validated (so a merged backwards date range is rejected the same
+    way the rewrite's would be) — on the rare incoherent merge we fall back to the
+    explicit filters alone.
+    """
+    if extra is None:
+        return base
+
+    def _union(a: list[Any], b: list[Any]) -> list[Any]:
+        seen: dict[Any, None] = {}
+        for v in [*a, *b]:
+            seen.setdefault(v, None)
+        return list(seen)
+
+    merged = {
+        "signal_type": _union(base.signal_type, extra.signal_type),
+        "entity_kind": _union(base.entity_kind, extra.entity_kind),
+        "state": _union(base.state, extra.state),
+        "status": _union(base.status, extra.status),
+        "min_score": extra.min_score if extra.min_score is not None else base.min_score,
+        "published_at_gte": extra.published_at_gte
+        if extra.published_at_gte is not None
+        else base.published_at_gte,
+        "published_at_lt": extra.published_at_lt
+        if extra.published_at_lt is not None
+        else base.published_at_lt,
+    }
+    try:
+        return SearchFilters.model_validate(merged)
+    except ValidationError:
+        log.info("smart_search.merge_filters.incoherent", exc_info=True)
+        return extra
+
+
+def _apply_filters(stmt: Any, filters: SearchFilters) -> Any:
+    """Apply the structured filters that map to ``signals_signal`` columns.
+
+    ``signal_type`` / ``status`` are ``IN (...)`` over the row columns; the date
+    range is on ``occurred_at`` (the event time, doc 07). ``entity_kind`` / ``state``
+    require the entity join (doc 07 §3: geo + kind live on ``entities_entity``), which
+    lands with F3/E10 — they are accepted + echoed but not yet applied to the SQL.
+    ``min_score`` is the per-workspace relevance floor (F3) — also a no-op here.
+    # TODO E10/F3: join entities_entity for entity_kind/state and signals_workspace_score
+    # for min_score.
+    """
+    if filters.signal_type:
+        stmt = stmt.where(Signal.signal_type.in_(list(filters.signal_type)))
+    if filters.status:
+        stmt = stmt.where(Signal.status.in_(list(filters.status)))
+    if filters.published_at_gte is not None:
+        stmt = stmt.where(
+            Signal.occurred_at
+            >= dt.datetime.combine(filters.published_at_gte, dt.time.min, tzinfo=dt.UTC)
+        )
+    if filters.published_at_lt is not None:
+        stmt = stmt.where(
+            Signal.occurred_at
+            < dt.datetime.combine(filters.published_at_lt, dt.time.min, tzinfo=dt.UTC)
+        )
+    return stmt
+
+
+__all__ = [
+    "FusedHit",
+    "FusionWeights",
+    "HybridRetriever",
+    "QueryRewriter",
+    "SearchFilters",
+    "SmartSearchResponse",
+    "SmartSearchResult",
+    "StructuredQuery",
+    "fuse_rankings",
+]
