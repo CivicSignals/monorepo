@@ -231,6 +231,11 @@ async def upsert_contact(session: AsyncSession, inp: ContactInput) -> Contact:
 
     if canonical is not None:
         # Upsert on (entity_id, canonical_email) partial unique index.
+        # ``index_where`` matches the partial index predicate so Postgres can
+        # identify the constraint (partial indexes require the predicate to be
+        # stated in the ON CONFLICT clause — see Postgres §7.8.4).
+        from sqlalchemy import text as _text
+
         update_set = {
             k: v
             for k, v in contact_values.items()
@@ -241,8 +246,8 @@ async def upsert_contact(session: AsyncSession, inp: ContactInput) -> Contact:
             .values(**contact_values)
             .on_conflict_do_update(
                 index_elements=[Contact.entity_id, Contact.canonical_email],
+                index_where=_text("canonical_email IS NOT NULL"),
                 set_=update_set,
-                where=Contact.canonical_email.is_not(None),
             )
             .returning(Contact)
         )
