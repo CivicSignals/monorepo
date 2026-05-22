@@ -3,10 +3,11 @@
 import Link from "next/link";
 import { useSessionStore } from "@/store/session";
 import { useLogout } from "@/hooks/use-auth";
+import { WorkspaceSwitcher } from "@/components/workspaces/workspace-switcher";
 
 // Client-side auth nav: shows Sign in / Get started when signed out, and the
-// user's email + Sign out when signed in. Reads the session store (B1); becomes
-// workspace-aware in B5.
+// workspace switcher (B5) + user's email + Sign out when signed in. Reads the
+// session store (B1).
 export function AuthNav() {
   const user = useSessionStore((s) => s.user);
   const token = useSessionStore((s) => s.accessToken);
@@ -15,6 +16,9 @@ export function AuthNav() {
   if (token && user) {
     return (
       <>
+        <li className="hidden sm:block">
+          <WorkspaceSwitcher />
+        </li>
         <li
           className="hidden text-sm text-muted-foreground sm:block"
           aria-live="polite"
