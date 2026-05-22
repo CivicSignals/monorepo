@@ -232,9 +232,18 @@ def upgrade() -> None:
         ["contact_id", "is_current"],
         unique=False,
     )
+    # Idempotency: one row per (contact, title) pair — title history is
+    # append-only; re-observing the same title triggers ON CONFLICT DO NOTHING.
+    op.create_index(
+        "contacts_title_contact_title_idx",
+        "contacts_title",
+        ["contact_id", "title"],
+        unique=True,
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("contacts_title_contact_title_idx", table_name="contacts_title")
     op.drop_index("contacts_title_contact_current_idx", table_name="contacts_title")
     op.drop_index("contacts_title_contact_idx", table_name="contacts_title")
     op.drop_table("contacts_title")

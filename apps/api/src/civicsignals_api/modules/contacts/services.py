@@ -154,8 +154,13 @@ class TitleInput:
 
 
 async def get_contact(session: AsyncSession, contact_id: uuid.UUID) -> Contact | None:
-    """Fetch one contact by id, or ``None`` if it does not exist."""
-    return await session.get(Contact, contact_id)
+    """Fetch one contact by id, or ``None`` if it does not exist.
+
+    Uses ``populate_existing=True`` so the identity map is refreshed from DB
+    on every call — important after an upsert in a preceding transaction when
+    ``expire_on_commit=False`` is set (which keeps stale objects in the map).
+    """
+    return await session.get(Contact, contact_id, populate_existing=True)
 
 
 async def list_contacts_for_entity(
@@ -329,7 +334,13 @@ async def upsert_contact(session: AsyncSession, inp: ContactInput) -> Contact:
             **t_prov,
         }
         # Title history is append-only: insert and silently skip on duplicate.
-        t_stmt = pg_insert(ContactTitle).values(**t_values).on_conflict_do_nothing()
+        # The ``contacts_title_contact_title_idx`` unique index on
+        # ``(contact_id, title)`` is the conflict target.
+        t_stmt = (
+            pg_insert(ContactTitle)
+            .values(**t_values)
+            .on_conflict_do_nothing(index_elements=[ContactTitle.contact_id, ContactTitle.title])
+        )
         await session.execute(t_stmt)
 
     return contact

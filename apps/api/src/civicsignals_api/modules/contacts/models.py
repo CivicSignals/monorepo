@@ -313,4 +313,13 @@ class ContactTitle(Base):
     __table_args__ = (
         Index("contacts_title_contact_idx", "contact_id"),
         Index("contacts_title_contact_current_idx", "contact_id", "is_current"),
+        # Idempotency: one row per (contact, title) pair so re-running ingestion
+        # does not duplicate title history. Title history is append-only; the same
+        # title re-appearing triggers DO NOTHING (the source may be re-observed).
+        Index(
+            "contacts_title_contact_title_idx",
+            "contact_id",
+            "title",
+            unique=True,
+        ),
     )
