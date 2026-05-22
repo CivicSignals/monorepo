@@ -31,10 +31,13 @@ N4 implements:
   - :func:`get_limit_states` — compute per-dimension LimitState for a workspace+period.
   - :func:`enforce_limit` — raise RFC 7807 429 when a dimension is at/over 100%.
 
+N5 implements:
+  - :func:`change_plan` — upgrade/downgrade a workspace subscription via Stripe proration.
+  - :func:`create_portal_session` — create a Stripe Customer Portal session URL.
+
 All Stripe network calls are mediated through the ``StripeClient`` protocol so
 tests can inject a mock without hitting the Stripe API.
 
-# TODO N5: add ``create_checkout_session`` / ``change_plan`` for self-serve flow.
 # TODO LC-13: provision real STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET.
 """
 
@@ -84,13 +87,28 @@ class StripeCustomersResource(Protocol):
 
 
 class StripeSubscriptionsResource(Protocol):
-    """Protocol for the Stripe subscriptions resource (N1, injectable for tests)."""
+    """Protocol for the Stripe subscriptions resource (N1/N5, injectable for tests)."""
 
     def retrieve(self, subscription_id: str, **kwargs: Any) -> Any: ...
 
+    def modify(self, subscription_id: str, **kwargs: Any) -> Any: ...
+
+
+class StripeBillingPortalSessionsResource(Protocol):
+    """Protocol for the Stripe billing portal sessions resource (N5)."""
+
+    def create(self, **kwargs: Any) -> Any: ...
+
+
+class StripeBillingPortalResource(Protocol):
+    """Protocol for the Stripe billing_portal resource (N5)."""
+
+    @property
+    def sessions(self) -> StripeBillingPortalSessionsResource: ...
+
 
 class StripeClient(Protocol):
-    """Minimal Stripe client interface used by billing services (N1).
+    """Minimal Stripe client interface used by billing services (N1/N5).
 
     Only the methods actually called by this module are part of the protocol;
     tests provide a mock that satisfies it. Top-level (non-nested) protocols
@@ -102,6 +120,9 @@ class StripeClient(Protocol):
 
     @property
     def subscriptions(self) -> StripeSubscriptionsResource: ...
+
+    @property
+    def billing_portal(self) -> StripeBillingPortalResource: ...
 
 
 class _StripeCustomers:
@@ -122,6 +143,26 @@ class _StripeSubscriptions:
     def retrieve(self, subscription_id: str, **kwargs: Any) -> Any:
         return stripe_sdk.Subscription.retrieve(subscription_id, api_key=self._api_key, **kwargs)
 
+    def modify(self, subscription_id: str, **kwargs: Any) -> Any:
+        return stripe_sdk.Subscription.modify(subscription_id, api_key=self._api_key, **kwargs)
+
+
+class _StripeBillingPortalSessions:
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+
+    def create(self, **kwargs: Any) -> Any:
+        return stripe_sdk.billing_portal.Session.create(api_key=self._api_key, **kwargs)
+
+
+class _StripeBillingPortal:
+    def __init__(self, api_key: str) -> None:
+        self._sessions_res = _StripeBillingPortalSessions(api_key)
+
+    @property
+    def sessions(self) -> _StripeBillingPortalSessions:
+        return self._sessions_res
+
 
 class _DefaultStripeClient:
     """Thin wrapper around the stripe SDK configured from Settings.
@@ -133,6 +174,7 @@ class _DefaultStripeClient:
     def __init__(self, api_key: str) -> None:
         self._customers_res = _StripeCustomers(api_key)
         self._subscriptions_res = _StripeSubscriptions(api_key)
+        self._billing_portal_res = _StripeBillingPortal(api_key)
 
     @property
     def customers(self) -> _StripeCustomers:
@@ -141,6 +183,10 @@ class _DefaultStripeClient:
     @property
     def subscriptions(self) -> _StripeSubscriptions:
         return self._subscriptions_res
+
+    @property
+    def billing_portal(self) -> _StripeBillingPortal:
+        return self._billing_portal_res
 
 
 _cached_stripe_client: StripeClient | None = None
@@ -857,3 +903,184 @@ async def enforce_limit(
             ),
             headers={"Retry-After": "0"},
         )
+
+
+# ---------------------------------------------------------------------------
+# N5: Self-serve plan change + Customer Portal
+# ---------------------------------------------------------------------------
+
+# Plans that can be changed via self-serve Stripe price modification.
+# SELF_HOSTED has no Stripe subscription; ENTERPRISE is quote-driven.
+_SELF_SERVE_PLANS: frozenset[SubscriptionPlan] = frozenset(
+    {
+        SubscriptionPlan.SOLO,
+        SubscriptionPlan.STARTER,
+        SubscriptionPlan.PRO,
+    }
+)
+
+
+class PlanChangeError(Exception):
+    """Raised when a plan change cannot be performed.
+
+    Callers should catch this and convert to a RFC 7807 ``422 Unprocessable
+    Entity`` response.  The ``code`` and ``detail`` fields carry a
+    machine-readable code and a human-readable description for the frontend.
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+async def change_plan(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    target_plan: SubscriptionPlan,
+    *,
+    stripe_client: StripeClient | None = None,
+) -> BillingSubscription:
+    """Upgrade or downgrade the workspace's Stripe subscription to ``target_plan`` (N5).
+
+    Steps:
+    1. Validate ``target_plan`` is a self-serve plan (not SELF_HOSTED / ENTERPRISE).
+    2. Load the workspace's ``billing_subscription``.
+    3. Confirm the subscription has an active Stripe subscription id.
+    4. Retrieve the Stripe price id for ``target_plan`` (from Settings).
+    5. Call ``stripe.Subscription.modify`` with ``proration_behavior="create_prorations"``
+       to let Stripe handle proration for both upgrades and downgrades.
+    6. Update the local ``billing_subscription`` row (plan + stripe_price_id).
+
+    The N1 webhook handler (``customer.subscription.updated``) may also fire and
+    update the row again shortly afterwards — that is idempotent and fine; our
+    local update here ensures the frontend sees the new plan immediately without
+    waiting for the webhook delivery.
+
+    ``stripe_client`` can be injected in tests; falls back to the process singleton.
+
+    Raises:
+        :class:`PlanChangeError` — invalid target plan, no active subscription,
+            no Stripe price id configured, or the workspace is already on the
+            target plan.
+        :class:`BillingNotConfiguredError` — Stripe is not configured and no
+            client was injected (dev / self-host).
+    """
+    from civicsignals_api.modules.billing.plans import stripe_price_id_for_plan
+
+    # 1. Validate target plan.
+    if target_plan not in _SELF_SERVE_PLANS:
+        raise PlanChangeError(
+            code="invalid_target_plan",
+            detail=(
+                f"Plan '{target_plan.value}' is not available for self-serve changes. "
+                "Only solo, starter, and pro plans can be changed via this endpoint."
+            ),
+        )
+
+    # 2. Load subscription.
+    sub = await get_subscription(session, workspace_id)
+    if sub is None:
+        raise PlanChangeError(
+            code="no_subscription",
+            detail=(
+                "No billing subscription found for this workspace. "
+                "Create a subscription before changing plans."
+            ),
+        )
+
+    # 3. Must have an active Stripe subscription id.
+    if not sub.stripe_subscription_id:
+        raise PlanChangeError(
+            code="no_stripe_subscription",
+            detail=(
+                "This workspace does not have an active Stripe subscription. "
+                "Complete the checkout flow before changing plans."
+            ),
+        )
+
+    # Already on this plan.
+    if sub.plan == target_plan:
+        raise PlanChangeError(
+            code="already_on_plan",
+            detail=f"This workspace is already on the '{target_plan.value}' plan.",
+        )
+
+    # 4. Get the Stripe price id for the target plan.
+    new_price_id = stripe_price_id_for_plan(target_plan)
+    if not new_price_id:
+        raise PlanChangeError(
+            code="price_not_configured",
+            detail=(
+                f"No Stripe price ID is configured for plan '{target_plan.value}'. "
+                "Contact support or check LC-13 configuration."
+            ),
+        )
+
+    # 5. Call Stripe to modify the subscription.
+    client = stripe_client if stripe_client is not None else get_stripe_client()
+    stripe_sub = client.subscriptions.retrieve(sub.stripe_subscription_id)
+    items_data = stripe_sub.get("items", {}).get("data", [])
+    if not items_data:
+        raise PlanChangeError(
+            code="stripe_subscription_has_no_items",
+            detail="The Stripe subscription has no line items to update. Contact support.",
+        )
+    item_id: str = items_data[0]["id"]
+
+    client.subscriptions.modify(
+        sub.stripe_subscription_id,
+        items=[{"id": item_id, "price": new_price_id}],
+        proration_behavior="create_prorations",
+    )
+
+    # 6. Update local row immediately (webhook will also arrive and confirm).
+    sub.plan = target_plan
+    sub.stripe_price_id = new_price_id
+    await session.flush()
+    return sub
+
+
+async def create_portal_session(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    return_url: str,
+    *,
+    stripe_client: StripeClient | None = None,
+) -> str:
+    """Create a Stripe Customer Portal session and return the portal URL (N5).
+
+    The hosted Customer Portal lets workspace admins manage billing details,
+    payment methods, invoices, and plan changes directly in Stripe's UI
+    without CivicSignals handling payment method data.
+
+    ``return_url`` is where Stripe redirects the user after they leave the portal.
+    Typically the caller passes the billing settings page URL.
+
+    ``stripe_client`` can be injected in tests; falls back to the process singleton.
+
+    Raises:
+        :class:`PlanChangeError` — no Stripe customer found for this workspace.
+        :class:`BillingNotConfiguredError` — Stripe not configured.
+
+    # NOTE LC-13: the portal configuration (logo, colours, allowed plan switches) is
+    #   set up once in the Stripe dashboard and finalised by LC-13.
+    """
+    # Retrieve the Stripe customer id.
+    customer = await get_customer_by_workspace(session, workspace_id)
+    if customer is None:
+        raise PlanChangeError(
+            code="no_stripe_customer",
+            detail=(
+                "No Stripe customer found for this workspace. "
+                "Create a customer via POST /billing/customer first."
+            ),
+        )
+
+    client = stripe_client if stripe_client is not None else get_stripe_client()
+    portal_session = client.billing_portal.sessions.create(
+        customer=customer.stripe_customer_id,
+        return_url=return_url,
+    )
+    url: str = portal_session["url"]
+    return url
