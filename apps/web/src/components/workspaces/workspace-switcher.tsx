@@ -39,13 +39,22 @@ export function WorkspaceSwitcher() {
       ? createWorkspace.error.problem.detail
       : createWorkspace.error?.message;
 
-  async function onCreate(event: React.FormEvent) {
+  function onCreate(event: React.FormEvent) {
     event.preventDefault();
     const trimmed = name.trim();
     if (!trimmed) return;
-    await createWorkspace.mutateAsync({ name: trimmed });
-    setName("");
-    setCreating(false);
+    // Use mutate (not mutateAsync) so a rejection isn't an unhandled promise:
+    // errors surface via createWorkspace.error (rendered below), and the form
+    // only resets on success.
+    createWorkspace.mutate(
+      { name: trimmed },
+      {
+        onSuccess: () => {
+          setName("");
+          setCreating(false);
+        },
+      },
+    );
   }
 
   return (

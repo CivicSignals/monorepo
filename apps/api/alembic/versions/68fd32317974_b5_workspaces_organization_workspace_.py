@@ -85,11 +85,14 @@ def upgrade() -> None:
         sa.Column("user_id", sa.UUID(), nullable=False),
         sa.Column(
             "role",
+            # Lowercase values (owner/admin/member/viewer) — the public-API
+            # representation (doc 07 §2). The model's Enum uses values_callable
+            # to persist these same strings, matching the server_default below.
             sa.Enum(
-                "OWNER",
-                "ADMIN",
-                "MEMBER",
-                "VIEWER",
+                "owner",
+                "admin",
+                "member",
+                "viewer",
                 name="accounts_membership_role",
                 native_enum=False,
                 length=16,

@@ -184,7 +184,17 @@ class Membership(Base):
         index=True,
     )
     role: Mapped[MembershipRole] = mapped_column(
-        Enum(MembershipRole, name="accounts_membership_role", native_enum=False, length=16),
+        Enum(
+            MembershipRole,
+            name="accounts_membership_role",
+            native_enum=False,
+            length=16,
+            # Persist the lowercase ``.value`` (owner/admin/member/viewer) — the
+            # same strings the public API exposes (doc 07 §2) — rather than the
+            # enum *names*. Without this SQLAlchemy stores names (OWNER/…), which
+            # would not round-trip the lowercase ``server_default`` below.
+            values_callable=lambda enum: [member.value for member in enum],
+        ),
         nullable=False,
         server_default=MembershipRole.MEMBER.value,
     )

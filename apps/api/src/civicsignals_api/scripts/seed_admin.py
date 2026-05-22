@@ -3,14 +3,15 @@
 Invoked by the `init` process type in docker-entrypoint.sh, which runs
 Alembic migrations first then calls this script.
 
-The admin user / workspace models are implemented in task B1 (auth) and B5
-(workspace). Until those tasks are done, this script creates what it can
-(enables the pgvector extension, verifies the DB connection, and prints a
-TODO reminder) rather than inventing the auth schema.
+The admin user (B1) and workspace (B5) models are implemented, so this script
+verifies the DB connection, ensures the pgvector extension, creates the admin
+user, and gives them a default organization + workspace + owner membership
+(set as their ``last_active`` so first-run requests scope to it).
 
 Environment variables read:
   CIVICSIGNALS_ADMIN_EMAIL    — admin account email  (required for user creation)
   CIVICSIGNALS_ADMIN_PASSWORD — admin account password (required for user creation)
+  CIVICSIGNALS_WORKSPACE_NAME — default workspace name (optional; "My Workspace")
   DATABASE_DIRECT_URL         — direct Postgres URL (bypasses PgBouncer)
 
 SPDX-License-Identifier: AGPL-3.0-only
@@ -66,8 +67,8 @@ async def _async_main() -> None:
         sys.exit(1)
 
     # -------------------------------------------------------------------------
-    # Step 2: Create the initial admin user (B1 — DONE).
-    # TODO B5 — workspace model must be DONE before workspace creation works.
+    # Step 2: Create the initial admin user (B1 — DONE) and their default
+    # workspace + owner membership (B5 — DONE).
     # -------------------------------------------------------------------------
     admin_email = _require_env("CIVICSIGNALS_ADMIN_EMAIL")
     admin_password = _require_env("CIVICSIGNALS_ADMIN_PASSWORD")
@@ -88,14 +89,16 @@ async def _async_main() -> None:
     from civicsignals_api.modules.accounts import services as accounts_services
     from civicsignals_api.modules.auth import services as auth_services
 
+    workspace_name = os.environ.get("CIVICSIGNALS_WORKSPACE_NAME", "My Workspace")
+
     engine = create_async_engine(direct_url, echo=False)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as session:
-        existing = await accounts_services.get_user_by_email(session, admin_email)
-        if existing is not None:
+        admin = await accounts_services.get_user_by_email(session, admin_email)
+        if admin is not None:
             print(f"seed_admin: admin user '{admin_email}' already exists — skipping.", flush=True)
         else:
-            await accounts_services.create_user(
+            admin = await accounts_services.create_user(
                 session,
                 email=admin_email,
                 password_hash=auth_services.hash_password(admin_password),
@@ -104,10 +107,28 @@ async def _async_main() -> None:
             )
             await session.commit()
             print(f"seed_admin: created admin user '{admin_email}'.", flush=True)
+
+        # B5 — DONE: give the admin an organization + workspace + owner membership
+        # via accounts.services (never their internals, doc 06 §3). Idempotent:
+        # only create one if the admin is not already a member of any workspace,
+        # then set it as their last_active so first-run requests scope to it.
+        existing_workspaces = await accounts_services.list_workspaces_for_user(session, admin.id)
+        if existing_workspaces.items:
+            print("seed_admin: admin already has a workspace — skipping.", flush=True)
+        else:
+            workspace = await accounts_services.create_workspace(
+                session, owner=admin, name=workspace_name
+            )
+            await accounts_services.set_last_active_workspace(
+                session, user=admin, workspace_id=workspace.id
+            )
+            await session.commit()
+            print(
+                f"seed_admin: created workspace '{workspace.name}' (slug '{workspace.slug}').",
+                flush=True,
+            )
     await engine.dispose()
 
-    # TODO B5: create the admin's organization + workspace + owner membership via
-    #          accounts.services once the Workspace model exists.
     print("seed_admin: init complete.", flush=True)
 
 

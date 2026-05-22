@@ -144,3 +144,32 @@ def test_invalid_cursor_is_400(client: TestClient) -> None:
     token = _signup(client, "badcursor@example.com")
     resp = client.get(f"{WORKSPACES}?cursor=not-a-cursor", headers=_auth(token))
     assert resp.status_code == 400
+
+
+def test_role_round_trips_lowercase(client: TestClient) -> None:
+    # The membership role is persisted as its lowercase value (owner/...), so it
+    # reads back cleanly via the list/get endpoints (regression for the enum
+    # name-vs-value default mismatch).
+    token = _signup(client, "role@example.com")
+    created = client.post(WORKSPACES, json={"name": "Role WS"}, headers=_auth(token)).json()
+    assert created["role"] == "owner"
+
+    listed = client.get(WORKSPACES, headers=_auth(token)).json()
+    assert listed["items"][0]["role"] == "owner"
+    fetched = client.get(f"{WORKSPACES}/{created['id']}", headers=_auth(token)).json()
+    assert fetched["role"] == "owner"
+
+
+def test_long_name_slug_stays_within_cap(client: TestClient) -> None:
+    token = _signup(client, "longname@example.com")
+    # Within the 120-char name cap, but its slug stem exceeds the 48-char slug
+    # cap — so slugify truncates, and the collision suffix must still fit.
+    long_name = "Department of Education and Workforce Development Services Division"
+    first = client.post(WORKSPACES, json={"name": long_name}, headers=_auth(token))
+    second = client.post(WORKSPACES, json={"name": long_name}, headers=_auth(token))
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    # Both the bare stem and the disambiguated slug must fit the 48-char cap.
+    assert len(first.json()["slug"]) <= 48
+    assert len(second.json()["slug"]) <= 48
+    assert second.json()["slug"] != first.json()["slug"]

@@ -123,6 +123,12 @@ def decode_cursor(cursor: str) -> uuid.UUID:
 _SLUG_CLEAN = re.compile(r"[^a-z0-9]+")
 _SLUG_TRIM = re.compile(r"(^-+|-+$)")
 
+# Slug column / schema cap (``WorkspaceCreate.slug`` max_length). The bare stem
+# is truncated to this; a disambiguation suffix (``-rand4``, 5 chars) reserves
+# room so the final slug never exceeds the cap.
+SLUG_MAX_LEN = 48
+_SLUG_SUFFIX_LEN = 5
+
 
 def slugify(name: str) -> str:
     """Turn a workspace name into a URL-safe slug stem (ASCII, lowercase, dashed).
@@ -133,7 +139,7 @@ def slugify(name: str) -> str:
     ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
     slug = _SLUG_CLEAN.sub("-", ascii_name.lower())
     slug = _SLUG_TRIM.sub("", slug)
-    return slug[:48] or "workspace"
+    return slug[:SLUG_MAX_LEN] or "workspace"
 
 
 async def _slug_exists(session: AsyncSession, slug: str) -> bool:
@@ -144,16 +150,19 @@ async def _slug_exists(session: AsyncSession, slug: str) -> bool:
 async def _unique_slug(session: AsyncSession, name: str) -> str:
     """Return a globally-unique slug derived from ``name``.
 
-    Tries the bare stem first, then ``<stem>-<rand4>`` a handful of times.
-    Slug uniqueness is also enforced by a DB constraint, so a lost race surfaces
-    as an ``IntegrityError`` the route maps to ``409`` — this just avoids the
-    common case.
+    Tries the bare stem first, then ``<stem>-<rand4>`` a handful of times. The
+    stem is re-truncated to leave room for the suffix so the final slug stays
+    within :data:`SLUG_MAX_LEN`. Slug uniqueness is also enforced by a DB
+    constraint, so a lost race surfaces as an ``IntegrityError`` the route maps
+    to ``409`` — this just avoids the common case.
     """
     stem = slugify(name)
     if not await _slug_exists(session, stem):
         return stem
+    # Leave room for the "-rand4" suffix so the combined slug fits the cap.
+    suffix_stem = stem[: SLUG_MAX_LEN - _SLUG_SUFFIX_LEN].rstrip("-") or "workspace"
     for _ in range(8):
-        candidate = f"{stem}-{secrets.token_hex(2)}"
+        candidate = f"{suffix_stem}-{secrets.token_hex(2)}"
         if not await _slug_exists(session, candidate):
             return candidate
     raise SlugConflictError("could not allocate a unique workspace slug")
