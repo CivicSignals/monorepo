@@ -147,15 +147,24 @@ async def _dispatch_due_recipes_async() -> int:
 
 
 def _ingest_queue_has_headroom() -> bool:
-    """Backpressure gate for the dispatcher (TODO D15; doc 18 §6.4).
+    """Backpressure gate for the dispatcher (D15; doc 18 §6.4).
 
     Returns True while the ``ingest`` queue has room to accept new recipe runs.
-    D15 wires a real queue-depth probe (Redis ``LLEN`` of the ``ingest`` list) +
-    the soft/hard thresholds here; until then the scheduler always has headroom.
-    Kept as a separate function so D15's change is local and unit-testable.
+    Probes the Redis ``LLEN`` of the ``ingest`` list and applies hysteresis:
+
+    * Pause when depth >= hard threshold (``ingest_queue_hard_threshold``).
+    * Once paused, resume only when depth < soft threshold
+      (``ingest_queue_soft_threshold``).
+
+    State is held in the module-level :class:`~backpressure.BackpressureGate`
+    singleton so hysteresis persists correctly across consecutive beat ticks.
+    The probe and gate are injectable via
+    :func:`~backpressure.check_ingest_queue_headroom`'s keyword arguments —
+    tests pass a fake probe to drive any depth without a live Redis.
     """
-    # TODO D15: probe ingest queue depth; pause above hard, resume below soft.
-    return True
+    from .backpressure import check_ingest_queue_headroom
+
+    return check_ingest_queue_headroom()
 
 
 @celery_app.task(name="ingestion.browser_fetch")
