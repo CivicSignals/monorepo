@@ -28,6 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api import events
+from civicsignals_api.config import get_settings
 from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth import services as auth_services
 from civicsignals_api.modules.auth.dependencies import (
@@ -42,11 +43,16 @@ from civicsignals_api.modules.auth.schemas import (
     ApiTokenList,
     ApiTokenOut,
 )
+from civicsignals_api.modules.notifications import services as notifications_services
 from civicsignals_api.problems import ProblemException
 
 from . import services
-from .models import MembershipRole, Workspace
+from .models import InvitationStatus, MembershipRole, Workspace
 from .schemas import (
+    InvitationAccept,
+    InvitationCreate,
+    InvitationOut,
+    InvitationPage,
     MemberOut,
     MemberPage,
     MemberRoleUpdate,
@@ -433,5 +439,326 @@ async def revoke_api_token(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+# --- Invitations (B6) ---------------------------------------------------------
+# Admin-gated CRUD on ``/workspaces/{id}/invitations`` plus the public
+# ``/invitations/accept`` endpoint (unauthenticated token accept). The accept
+# path requires the calling user to be authenticated (they must already have or
+# create an account) but does NOT require workspace membership — they're joining
+# via the invitation link.
+
+invitations_router = APIRouter(prefix="/invitations", tags=["invitations"])
+
+
+def _compose_accept_url(token: str) -> str:
+    """Build the web accept-invite URL from settings."""
+    settings = get_settings()
+    return f"{settings.web_base_url}/accept-invite?token={token}"
+
+
+def _send_invite_email(
+    invited_email: str,
+    workspace_name: str,
+    inviter_name: str | None,
+    accept_url: str,
+    *,
+    sender: notifications_services.EmailSender | None = None,
+) -> None:
+    """Fire off the invitation email (best-effort — failure doesn't fail the request)."""
+    inviter_label = inviter_name or "A team member"
+    text_body = (
+        f"{inviter_label} has invited you to join the '{workspace_name}' workspace on CivicSignals.\n\n"
+        f"Accept the invitation here (link valid for 7 days):\n{accept_url}\n\n"
+        "If you didn't expect this invitation, you can ignore it."
+    )
+    html_body = (
+        f"<p>{inviter_label} has invited you to join the <strong>{workspace_name}</strong> "
+        f"workspace on CivicSignals.</p>"
+        f'<p><a href="{accept_url}">Accept invitation</a> (link valid for 7 days)</p>'
+        "<p>If you didn't expect this invitation, you can ignore it.</p>"
+    )
+    notifications_services.send_email(
+        notifications_services.OutboundEmail(
+            to=invited_email,
+            subject=f"You're invited to join {workspace_name} on CivicSignals",
+            text_body=text_body,
+            html_body=html_body,
+        ),
+        sender=sender,
+    )
+
+
+@workspaces_router.post(
+    "/{workspace_id}/invitations",
+    response_model=InvitationOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Invite a user to the workspace (admin only)",
+)
+async def create_invitation(
+    workspace_id: uuid.UUID,
+    body: InvitationCreate,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    response: Response,
+) -> InvitationOut:
+    """Create an invitation and send an invite email.
+
+    Requires the ``admin`` role (doc 06 §6). A pending invitation for the same
+    email in this workspace is a ``409``; use the resend endpoint to refresh it.
+    """
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    workspace = await services.get_workspace(session, workspace_id)
+    if workspace is None:  # pragma: no cover
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Workspace not found",
+            detail="No such workspace.",
+        )
+    try:
+        result = await services.create_invitation(
+            session,
+            workspace_id=workspace_id,
+            invited_email=str(body.invited_email),
+            role=body.role,
+            invited_by=ctx.user.id,
+        )
+        await session.commit()
+    except services.DuplicateInvitationError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="invitation_pending",
+            title="Pending invitation exists",
+            detail=(
+                "A pending invitation for this email already exists. "
+                "Revoke the existing one or use the resend endpoint."
+            ),
+        ) from exc
+
+    accept_url = _compose_accept_url(result.token)
+    _send_invite_email(
+        invited_email=str(body.invited_email),
+        workspace_name=workspace.name,
+        inviter_name=ctx.user.name,
+        accept_url=accept_url,
+    )
+
+    try:
+        await events.publish(
+            events.MEMBER_INVITED,
+            {
+                "user_id": str(ctx.user.id),
+                "workspace_id": str(workspace_id),
+                "invited_email": str(body.invited_email),
+                "invitation_id": str(result.invitation.id),
+            },
+        )
+    except Exception:
+        logger.warning("member_invited_event_failed", workspace_id=str(workspace_id))
+
+    response.headers["Location"] = (
+        f"/api/v1/workspaces/{workspace_id}/invitations/{result.invitation.id}"
+    )
+    return InvitationOut.model_validate(result.invitation)
+
+
+@workspaces_router.get(
+    "/{workspace_id}/invitations",
+    response_model=InvitationPage,
+    summary="List workspace invitations (admin only)",
+)
+async def list_invitations(
+    workspace_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = services.DEFAULT_LIMIT,
+    inv_status: Annotated[
+        InvitationStatus | None,
+        Query(alias="status", description="Filter by invitation status."),
+    ] = None,
+) -> InvitationPage:
+    """List invitations for a workspace. Requires the ``admin`` role."""
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    try:
+        page = await services.list_invitations(
+            session,
+            workspace_id,
+            status=inv_status,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="bad_request",
+            title="Invalid cursor",
+            detail="The supplied cursor is malformed.",
+        ) from exc
+    return InvitationPage(
+        items=[InvitationOut.model_validate(inv) for inv in page.items],
+        next_cursor=page.next_cursor,
+    )
+
+
+@workspaces_router.delete(
+    "/{workspace_id}/invitations/{invitation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a workspace invitation (admin only)",
+)
+async def revoke_invitation(
+    workspace_id: uuid.UUID,
+    invitation_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> Response:
+    """Revoke a pending invitation. Requires the ``admin`` role. Idempotent."""
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    invitation = await services.get_invitation_by_id(session, invitation_id, workspace_id)
+    if invitation is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Invitation not found",
+            detail="No such invitation in this workspace.",
+        )
+    await services.revoke_invitation(session, invitation)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@workspaces_router.post(
+    "/{workspace_id}/invitations/{invitation_id}/resend",
+    response_model=InvitationOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Resend/refresh a workspace invitation (admin only)",
+)
+async def resend_invitation(
+    workspace_id: uuid.UUID,
+    invitation_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    response: Response,
+) -> InvitationOut:
+    """Revoke the existing invitation and issue a fresh one with a new token.
+
+    Requires the ``admin`` role. The previous invite link is immediately
+    invalidated.
+    """
+    _require_active_workspace_matches_path(ctx, workspace_id)
+    workspace = await services.get_workspace(session, workspace_id)
+    if workspace is None:  # pragma: no cover
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Workspace not found",
+            detail="No such workspace.",
+        )
+    try:
+        result = await services.resend_invitation(
+            session,
+            invitation_id=invitation_id,
+            workspace_id=workspace_id,
+            invited_by=ctx.user.id,
+        )
+        await session.commit()
+    except services.InvitationNotFoundError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Invitation not found",
+            detail="No such invitation in this workspace.",
+        ) from exc
+
+    accept_url = _compose_accept_url(result.token)
+    _send_invite_email(
+        invited_email=result.invitation.invited_email,
+        workspace_name=workspace.name,
+        inviter_name=ctx.user.name,
+        accept_url=accept_url,
+    )
+
+    response.headers["Location"] = (
+        f"/api/v1/workspaces/{workspace_id}/invitations/{result.invitation.id}"
+    )
+    return InvitationOut.model_validate(result.invitation)
+
+
+# Accept invite: authenticated (the user must be logged in) but no workspace
+# membership required — they're joining via the invitation link. Mounted under
+# /invitations (not /workspaces/…) so the frontend can send the user here
+# immediately after signup/login without knowing the workspace id.
+
+
+@invitations_router.post(
+    "/accept",
+    response_model=MemberOut,
+    status_code=status.HTTP_200_OK,
+    summary="Accept a workspace invitation",
+)
+async def accept_invitation(
+    body: InvitationAccept,
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> MemberOut:
+    """Consume an invitation token and add the authenticated user to the workspace.
+
+    The token is single-use; re-submitting the same token returns ``400``. If
+    the invitee email does not match the authenticated user's email, the invite
+    is still valid — the accepting user is who gets added (consistent with
+    invite-link semantics; the admin chose the role, not the specific identity).
+
+    If the user is already a member of the workspace the response is ``409``.
+    """
+    invitation = await services.get_invitation_by_token(session, body.token)
+    if invitation is None:
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="invalid_token",
+            title="Invalid invitation token",
+            detail="The invitation token is invalid or has already been used.",
+        )
+
+    try:
+        membership = await services.accept_invitation(
+            session, invitation, accepting_user_id=current_user.id
+        )
+        await session.commit()
+    except services.InvitationConsumedError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="invitation_not_usable",
+            title="Invitation not usable",
+            detail=str(exc),
+        ) from exc
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_409_CONFLICT,
+            code="already_member",
+            title="Already a member",
+            detail="You are already a member of this workspace.",
+        ) from exc
+
+    # Emit member.joined event (B9 listens).
+    try:
+        await events.publish(
+            "member.joined",
+            {
+                "user_id": str(current_user.id),
+                "workspace_id": str(invitation.workspace_id),
+                "invitation_id": str(invitation.id),
+                "role": invitation.role.value,
+            },
+        )
+    except Exception:
+        logger.warning("member_joined_event_failed", workspace_id=str(invitation.workspace_id))
+
+    return MemberOut.model_validate(membership)
+
+
 router.include_router(accounts_router)
 router.include_router(workspaces_router)
+router.include_router(invitations_router)

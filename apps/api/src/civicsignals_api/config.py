@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     # Password-reset token TTL (B3). Short window reduces the attack surface for
     # a stolen reset link (threat-model §4.2).
     password_reset_ttl_seconds: int = 60 * 60  # 1 hour
+    # Invitation token TTL (B6). 7 days per doc 04 J7.
+    invitation_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
 
     # LLM gateway (doc 06 §7, doc 18 §6.6). Vendor SDKs are imported lazily by
     # the backends; only the keys/base URLs configured here are needed.

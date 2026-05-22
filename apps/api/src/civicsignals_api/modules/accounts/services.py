@@ -12,19 +12,28 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 import secrets
 import unicodedata
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import Membership, MembershipRole, Organization, User, Workspace
+from .models import (
+    Invitation,
+    InvitationStatus,
+    Membership,
+    MembershipRole,
+    Organization,
+    User,
+    Workspace,
+)
 
 # Cursor pagination defaults (doc 06 §5, doc 08 §1.5). Hard cap keeps an
 # unbounded ``limit`` from scanning every workspace a user belongs to.
@@ -385,3 +394,225 @@ async def list_members(
     items = rows[:limit]
     next_cursor = encode_cursor(items[-1].id) if has_more and items else None
     return MembershipPage(items=items, next_cursor=next_cursor)
+
+
+# ---------------------------------------------------------------------------
+# Invitations (B6)
+# ---------------------------------------------------------------------------
+# An admin creates an Invitation, which stores a hashed single-use token. The
+# raw token is embedded in an accept link emailed to the invitee. On acceptance
+# the token is consumed (status → accepted, accepted_at set) and add_member is
+# called to materialise the Membership. Token hash pattern mirrors B1/B3
+# (auth.services._hash_token).
+
+# Invitation token TTL — 7 days per doc 04 J7.
+INVITATION_TTL_SECONDS: int = 60 * 60 * 24 * 7
+
+
+class InvitationError(Exception):
+    """Base for invitation-layer failures the routes translate into RFC 7807."""
+
+
+class DuplicateInvitationError(InvitationError):
+    """A pending invitation for this email in this workspace already exists."""
+
+
+class InvitationNotFoundError(InvitationError):
+    """No matching invitation exists (unknown, wrong workspace, or deleted)."""
+
+
+class InvitationConsumedError(InvitationError):
+    """Token already accepted, revoked, or expired."""
+
+
+def _hash_invitation_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(slots=True)
+class CreateInvitationResult:
+    """Outcome of :func:`create_invitation` — the record plus the cleartext token."""
+
+    invitation: Invitation
+    token: str  # opaque URL-safe token to embed in the invite link
+
+
+async def create_invitation(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    invited_email: str,
+    role: MembershipRole = MembershipRole.MEMBER,
+    invited_by: uuid.UUID,
+) -> CreateInvitationResult:
+    """Create a new pending invitation for ``invited_email`` in ``workspace_id``.
+
+    Returns the :class:`Invitation` row and the raw (unhashed) token to embed
+    in the invite link. Raises :class:`DuplicateInvitationError` when a pending
+    invitation for this email already exists in the workspace.
+
+    Callers must commit after this call.
+    """
+    # Check for an existing pending invite.
+    existing = await session.execute(
+        select(Invitation).where(
+            Invitation.workspace_id == workspace_id,
+            Invitation.invited_email == invited_email,
+            Invitation.status == InvitationStatus.PENDING,
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise DuplicateInvitationError(
+            f"A pending invitation for {invited_email} already exists in this workspace."
+        )
+
+    raw = secrets.token_urlsafe(32)
+    invitation = Invitation(
+        workspace_id=workspace_id,
+        invited_email=invited_email,
+        role=role,
+        token_hash=_hash_invitation_token(raw),
+        expires_at=datetime.now(UTC) + timedelta(seconds=INVITATION_TTL_SECONDS),
+        status=InvitationStatus.PENDING,
+        invited_by=invited_by,
+    )
+    session.add(invitation)
+    await session.flush()
+    return CreateInvitationResult(invitation=invitation, token=raw)
+
+
+async def resend_invitation(
+    session: AsyncSession,
+    *,
+    invitation_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    invited_by: uuid.UUID,
+) -> CreateInvitationResult:
+    """Revoke the existing invitation and issue a fresh one (resend flow).
+
+    Returns the new invitation and fresh token. Raises :class:`InvitationNotFoundError`
+    if the invitation doesn't exist or doesn't belong to the workspace.
+    Callers must commit after this call.
+    """
+    result = await session.execute(
+        select(Invitation).where(
+            Invitation.id == invitation_id,
+            Invitation.workspace_id == workspace_id,
+        )
+    )
+    old = result.scalar_one_or_none()
+    if old is None:
+        raise InvitationNotFoundError("Invitation not found.")
+
+    # Revoke old (regardless of current status) then create a fresh one.
+    old.status = InvitationStatus.REVOKED
+    await session.flush()
+
+    return await create_invitation(
+        session,
+        workspace_id=workspace_id,
+        invited_email=old.invited_email,
+        role=old.role,
+        invited_by=invited_by,
+    )
+
+
+async def get_invitation_by_token(session: AsyncSession, raw_token: str) -> Invitation | None:
+    """Look up an invitation by its raw token (hashes it internally)."""
+    result = await session.execute(
+        select(Invitation).where(Invitation.token_hash == _hash_invitation_token(raw_token))
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_invitation_by_id(
+    session: AsyncSession, invitation_id: uuid.UUID, workspace_id: uuid.UUID | None = None
+) -> Invitation | None:
+    """Look up an invitation by id, optionally scoped to a workspace."""
+    stmt = select(Invitation).where(Invitation.id == invitation_id)
+    if workspace_id is not None:
+        stmt = stmt.where(Invitation.workspace_id == workspace_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def revoke_invitation(session: AsyncSession, invitation: Invitation) -> Invitation:
+    """Set an invitation's status to ``revoked``. Callers commit."""
+    invitation.status = InvitationStatus.REVOKED
+    await session.flush()
+    return invitation
+
+
+async def accept_invitation(
+    session: AsyncSession, invitation: Invitation, *, accepting_user_id: uuid.UUID
+) -> Membership:
+    """Consume a pending invitation and add the accepting user as a member.
+
+    Validates that the invitation is still pending and not expired, then:
+    - Marks the invitation as ``accepted`` (single-use).
+    - Calls :func:`add_member` to create the :class:`Membership`.
+
+    Raises :class:`InvitationConsumedError` if the invite is not usable.
+    Raises :class:`DuplicateInvitationError` (via ``add_member`` IntegrityError)
+    if the user is already a member — callers should catch that separately.
+    Callers must commit after this call.
+    """
+    if invitation.status != InvitationStatus.PENDING:
+        raise InvitationConsumedError(f"Invitation is {invitation.status.value}.")
+
+    expires_at = invitation.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at < datetime.now(UTC):
+        # Lazily mark as expired.
+        invitation.status = InvitationStatus.EXPIRED
+        await session.flush()
+        raise InvitationConsumedError("Invitation has expired.")
+
+    now = datetime.now(UTC)
+    invitation.status = InvitationStatus.ACCEPTED
+    invitation.accepted_at = now
+    await session.flush()
+
+    return await add_member(
+        session,
+        workspace_id=invitation.workspace_id,
+        user_id=accepting_user_id,
+        role=invitation.role,
+        invited_by=invitation.invited_by,
+    )
+
+
+@dataclass(slots=True)
+class InvitationPage:
+    """A cursor-paginated page of invitations."""
+
+    items: list[Invitation]
+    next_cursor: str | None
+
+
+async def list_invitations(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    *,
+    status: InvitationStatus | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> InvitationPage:
+    """Cursor-paginated list of invitations in ``workspace_id``.
+
+    Optionally filtered by ``status``. Ordered by the time-ordered UUID v7 id.
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    stmt = select(Invitation).where(Invitation.workspace_id == workspace_id)
+    if status is not None:
+        stmt = stmt.where(Invitation.status == status)
+    if cursor is not None:
+        stmt = stmt.where(Invitation.id > decode_cursor(cursor))
+    stmt = stmt.order_by(Invitation.id).limit(limit + 1)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = encode_cursor(items[-1].id) if has_more and items else None
+    return InvitationPage(items=items, next_cursor=next_cursor)
