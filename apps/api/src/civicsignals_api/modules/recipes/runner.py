@@ -803,6 +803,11 @@ class RecipeRunner:
         here, so the runner still owns fetch (robots + politeness + version
         pinning) and the extract fallback chain uniformly. ``run`` is the
         seed-URL convenience that uses the runner's own pass-through discover.
+
+        Records-only: does **not** retain the per-document
+        :class:`ExtractedDocument`s, so the memory profile for the many existing
+        callers is unchanged. The E7 drift path that needs the extractions uses
+        :meth:`run_pointers_collecting_extractions` instead.
         """
         records: list[CanonicalRecord] = []
         for pointer in pointers:
@@ -810,6 +815,29 @@ class RecipeRunner:
             extracted = self.extract(raw)
             records.extend(self.normalize(extracted, pointer.url))
         return records
+
+    def run_pointers_collecting_extractions(
+        self, pointers: Sequence[SourcePointer]
+    ) -> tuple[list[CanonicalRecord], list[ExtractedDocument]]:
+        """Like :meth:`run_pointers` but also returns each per-document extraction.
+
+        Additive sibling of :meth:`run_pointers` (it does *not* change the lifecycle
+        or any extract/normalize behavior): it threads out the per-document
+        :class:`ExtractedDocument` — including its D11 :class:`DriftCounters` — so the
+        E7 drift recorder can build a per-run outcome (extraction success rate, LLM
+        fallbacks, dead-letters) from the *result* of the run without re-running the
+        chain or touching the pipeline stages. Only this method retains the
+        extractions list; :meth:`run_pointers` stays records-only so existing callers
+        keep their memory profile.
+        """
+        records: list[CanonicalRecord] = []
+        extractions: list[ExtractedDocument] = []
+        for pointer in pointers:
+            raw = self.fetch(pointer)
+            extracted = self.extract(raw)
+            extractions.append(extracted)
+            records.extend(self.normalize(extracted, pointer.url))
+        return records, extractions
 
     def extract_html(self, html: str, source_url: str = "fixture://local") -> ExtractedDocument:
         """Extract straight from an HTML string (used by golden-fixture replay).

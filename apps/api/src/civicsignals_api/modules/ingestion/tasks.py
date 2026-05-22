@@ -195,3 +195,81 @@ def browser_fetch(recipe_id: str, seed_urls: list[str]) -> int:
     with BrowserFetcher() as fetcher:
         records = crawl(recipe_id, fetcher, seeds)
     return len(records)
+
+
+@celery_app.task(name="ingestion.evaluate_recipe_drift")
+def evaluate_recipe_drift() -> int:
+    """Recompute rolling drift metrics + auto-pause + auto-issue (doc 18 §3.2; E7).
+
+    The drift-evaluation beat task. It bridges two modules: the **recipes** module
+    owns the rolling metrics + the auto-pause *decision* + the GitHub auto-issue
+    (recipes can't import ingestion, doc 06 §3), while the **ingestion** module owns
+    the *authoritative* scheduler pause (``ingestion_recipe_schedule.paused``, D4)
+    that the cadence dispatcher reads to skip a recipe. So this ingestion task drives
+    the recipes drift evaluation and, when it returns ``should_pause``, flips the
+    scheduler pause via :func:`services.set_recipe_paused` — past signals stay
+    visible, only new runs stop (doc 18 §3.2).
+
+    Evaluates every recipe that recorded a run in the last 7d (a recipe with no
+    recent runs has nothing to evaluate). Returns the number of recipes newly paused
+    this tick. Each recipe is isolated + committed independently so one recipe's
+    failure (e.g. a GitHub error) can't abort the tick or roll back earlier work.
+    Routed to the ``ingest`` queue (the ``ingestion.*`` prefix); registered in the
+    beat schedule in ``celery_app.py``.
+    """
+    return asyncio.run(_evaluate_recipe_drift_async())
+
+
+async def _evaluate_recipe_drift_async() -> int:
+    from datetime import UTC, datetime, timedelta
+
+    from civicsignals_api.db import SessionLocal
+    from civicsignals_api.modules.recipes import services as recipes_services
+
+    from . import services
+
+    github_client = recipes_services.get_github_client()
+    newly_paused = 0
+
+    async with SessionLocal() as session:
+        now = datetime.now(UTC)
+        since = now - timedelta(hours=recipes_services.WINDOW_7D_HOURS)
+        recipe_ids = await recipes_services.list_recipe_ids_with_runs(session, since=since)
+        for recipe_id in recipes_services.evaluation_subjects(recipe_ids):
+            # Isolate + commit per recipe: a failure (e.g. a GitHub error after the
+            # pause decision) must not abort the tick or roll back earlier recipes.
+            try:
+                # The authoritative current pause state lives in ingestion's schedule.
+                schedule = await services.get_or_create_recipe_schedule(session, recipe_id)
+                result = await recipes_services.evaluate_recipe_drift(
+                    session,
+                    recipe_id,
+                    github_client,
+                    already_paused=schedule.paused,
+                    now=now,
+                )
+                # Apply the authoritative scheduler pause when drift says so (the
+                # recipes module recorded its own bookkeeping but cannot flip this).
+                if result.should_pause and not schedule.paused:
+                    await services.set_recipe_paused(session, recipe_id, paused=True)
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                log.exception("ingestion.evaluate_recipe_drift.recipe_failed", recipe_id=recipe_id)
+                continue
+            if result.newly_paused:
+                newly_paused += 1
+                log.warning(
+                    "ingestion.evaluate_recipe_drift.auto_paused",
+                    recipe_id=recipe_id,
+                    reason=result.pause_reason,
+                    issue_url=result.issue_url,
+                )
+            elif result.llm_fallback_alert:
+                log.info(
+                    "ingestion.evaluate_recipe_drift.llm_fallback_alert",
+                    recipe_id=recipe_id,
+                    llm_fallback_rate=result.window_7d.llm_fallback_rate,
+                )
+
+    return newly_paused

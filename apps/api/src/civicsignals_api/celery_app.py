@@ -55,6 +55,16 @@ celery_app.conf.beat_schedule = {
         "task": "extraction.run_pending_documents",
         "schedule": 60.0,
     },
+    # Recipe drift detection (E7, doc 18 §3.2): recompute rolling per-recipe
+    # metrics, auto-pause recipes whose extraction success rate dropped below
+    # threshold (flipping ingestion's authoritative scheduler pause), file an
+    # idempotent GitHub issue. Lives in the ingestion module because applying the
+    # pause flips ``ingestion_recipe_schedule.paused`` (D4). Every 10 minutes —
+    # drift is a rolling trend, not something a 1-minute cadence would catch sooner.
+    "ingestion.evaluate_recipe_drift": {
+        "task": "ingestion.evaluate_recipe_drift",
+        "schedule": 600.0,
+    },
     "signals.dedupe_recent": {
         "task": "signals.dedupe_recent",
         "schedule": 300.0,

@@ -10,6 +10,7 @@ recipe has passed schema validation.
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -379,3 +380,108 @@ class PreviewRequest(BaseModel):
     recipe_yaml: str | None = None
     html: str | None = None
     url: str | None = None
+
+
+# ----------------------------------------------------------------------------
+# Recipe drift detection (doc 18 §3.2, TODO E7)
+# ----------------------------------------------------------------------------
+
+
+class RunOutcome(BaseModel):
+    """The outcome of one recipe run, recorded for rolling drift metrics (E7).
+
+    Built from the runner / extraction-pipeline result at run completion (the
+    canonical records + D11 :class:`DriftCounters`), *not* by editing the pipeline
+    stages — E5/E9 own those. ``extractions_succeeded`` counts attempts that
+    produced a usable record; an attempt that dead-lettered or failed validation is
+    a miss. ``signals_produced`` is the canonical/candidate record count. The LLM
+    fields come straight from D11's counters (doc 18 §3.4).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str
+    recipe_version: int = 1
+    documents_total: int = 0
+    extractions_total: int = 0
+    extractions_succeeded: int = 0
+    signals_produced: int = 0
+    llm_fallbacks: int = 0
+    fields_total: int = 0
+    dead_letters: int = 0
+    wall_clock_seconds: float | None = None
+    # Defaults to "now" at record time when omitted; set explicitly in tests to
+    # place a run precisely inside/outside a rolling window.
+    finished_at: datetime | None = None
+
+
+class RollingMetrics(BaseModel):
+    """Rolling per-recipe metrics over one time window (doc 18 §3.2, E7).
+
+    Aggregated cheaply from ``recipes_run_metric`` rows whose ``finished_at`` falls
+    in ``[now - window, now]``. Rates are ``None`` when their denominator is zero
+    (e.g. extraction success rate over a window with no extraction attempts) so a
+    caller never divides an empty window into a misleading 0%.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str
+    window_hours: float
+    runs: int = 0
+    documents_total: int = 0
+    extractions_total: int = 0
+    extractions_succeeded: int = 0
+    signals_produced: int = 0
+    llm_fallbacks: int = 0
+    fields_total: int = 0
+    dead_letters: int = 0
+    # Extraction success rate = succeeded / total; None when no extractions ran.
+    extraction_success_rate: float | None = None
+    # LLM-assisted fallback rate = llm_fallbacks / fields_total; None when no fields.
+    llm_fallback_rate: float | None = None
+    # Mean signals produced per run; None when no runs in the window.
+    avg_signals_per_run: float | None = None
+    # Mean wall-clock seconds across runs that recorded a duration; None otherwise.
+    avg_wall_clock_seconds: float | None = None
+
+
+class DriftStateRecord(BaseModel):
+    """The recipes module's per-recipe **drift bookkeeping** (doc 18 §3.2, E7).
+
+    NOT the authoritative scheduler pause (that is ``ingestion_recipe_schedule``,
+    D4). ``drift_paused`` is the recipes-side record that drift decided to pause;
+    ``drift_issue_url`` is the GitHub-issue idempotency key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str
+    drift_paused: bool = False
+    paused_reason: str | None = None
+    paused_at: datetime | None = None
+    drift_issue_url: str | None = None
+
+
+class DriftEvaluation(BaseModel):
+    """Result of evaluating one recipe's drift (doc 18 §3.2, E7).
+
+    Surfaces the rolling windows the decision was made on plus the *decision*:
+    ``should_pause`` is the current-metrics drift verdict the caller acts on by
+    flipping the authoritative scheduler pause (``ingestion.services.set_recipe_paused``);
+    ``newly_paused`` is true when ``should_pause`` and the recipe was not already
+    paused (a state transition the caller can log/notify on). ``llm_fallback_alert``
+    flags a 7d LLM-fallback-rate breach. ``issue_url`` is any issue opened (``None``
+    when not filed — idempotent, healthy, or the GitHub client is a no-op).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    recipe_id: str
+    window_24h: RollingMetrics
+    window_7d: RollingMetrics
+    should_pause: bool = False
+    newly_paused: bool = False
+    pause_reason: str | None = None
+    llm_fallback_alert: bool = False
+    issue_url: str | None = None
