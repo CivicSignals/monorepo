@@ -44,6 +44,7 @@ from civicsignals_api.modules.extraction.models import (
     JOB_STATUS_PENDING,
     ExtractionCandidate,
     ExtractionJob,
+    RelevanceDecision,
 )
 from civicsignals_api.modules.extraction.relevance import RelevanceClassifier
 from civicsignals_api.modules.ingestion.services import StoredRawDocument
@@ -64,25 +65,29 @@ class _FakeStorage:
 
 @pytest_asyncio.fixture
 async def engine() -> AsyncIterator[AsyncEngine]:
-    """Engine with only the extraction job/candidate tables created/dropped.
+    """Engine with the extraction tables created; only the two we own are dropped.
 
-    Scoped to this module's two tables (not ``Base.metadata`` unfiltered) so the
-    test never touches other modules' tables, mirroring the relevance-persistence
-    fixture.
+    Scoped to this module's tables (not ``Base.metadata`` unfiltered) so the test
+    never touches other modules' tables. The end-to-end test runs the relevance
+    gate, which records into ``extraction_relevance_decision``, so we *create* that
+    table too (checkfirst) — but we do **not** drop it on teardown, since its
+    lifecycle is owned by ``test_relevance_persistence.py`` (which create/drops it
+    around its own cases); dropping it here could race that suite when both run.
     """
     assert _DSN is not None
     eng = create_async_engine(_DSN)
-    tables = [
+    owned = [
         Base.metadata.tables[ExtractionJob.__tablename__],
         Base.metadata.tables[ExtractionCandidate.__tablename__],
     ]
+    relevance = Base.metadata.tables[RelevanceDecision.__tablename__]
     async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all, tables=tables, checkfirst=True)
+        await conn.run_sync(Base.metadata.create_all, tables=[*owned, relevance], checkfirst=True)
     try:
         yield eng
     finally:
         async with eng.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all, tables=tables, checkfirst=True)
+            await conn.run_sync(Base.metadata.drop_all, tables=owned, checkfirst=True)
         await eng.dispose()
 
 
@@ -145,6 +150,35 @@ async def test_pending_listing_oldest_first(engine: AsyncEngine) -> None:
         pending = await services.list_pending_documents(session)
     ids = [p.id for p in pending]
     assert a.id in ids and b.id in ids
+
+
+async def test_claim_pending_jobs_transitions_out_of_pending(engine: AsyncEngine) -> None:
+    """Claiming moves jobs to running so a second claim returns nothing (no dup dispatch)."""
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    async with sessionmaker() as session:
+        a = await services.enqueue_extraction(session, uuid.uuid4(), recipe_id="r")
+        b = await services.enqueue_extraction(session, uuid.uuid4(), recipe_id="r")
+        await session.commit()
+
+    async with sessionmaker() as session:
+        claimed = await services.claim_pending_jobs(session, limit=10)
+        await session.commit()
+    claimed_ids = {c.id for c in claimed}
+    assert {a.id, b.id} <= claimed_ids
+    # The returned records already reflect the running transition.
+    assert all(c.status == "running" for c in claimed)
+
+    # A second claim finds nothing pending — the jobs were claimed exactly once.
+    async with sessionmaker() as session:
+        again = await services.claim_pending_jobs(session, limit=10)
+        await session.commit()
+    assert again == []
+
+    # And they are durably ``running`` in the table.
+    async with sessionmaker() as session:
+        for jid in (a.id, b.id):
+            row = await session.get(ExtractionJob, jid)
+            assert row is not None and row.status == "running"
 
 
 async def test_pipeline_end_to_end_persists_candidate(

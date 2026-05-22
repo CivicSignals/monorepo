@@ -188,21 +188,34 @@ async def list_raw_document_refs(
     *,
     limit: int = 200,
     after: datetime | None = None,
+    after_id: uuid.UUID | None = None,
 ) -> list[RawDocumentRef]:
     """List stored raw documents oldest-first, for the extraction beat task (E1).
 
     ``extraction.run_pending_documents`` (every 1 min, doc 06 §8) calls this to
     find freshly fetched documents and create an ``extraction_job`` per document
     (idempotent — the job table's UNIQUE on ``raw_document_id`` makes a re-scan a
-    no-op). ``after`` pages forward on ``created_at`` so a backlog is drained in
-    bounded ticks rather than re-scanning the whole table each minute. Returns the
-    lightweight :class:`RawDocumentRef` (id + recipe + cursor), not the full row or
-    bytes — the per-document task loads those via :func:`get_raw_document`.
+    no-op).
+
+    Pages forward on a **composite keyset cursor** ``(created_at, id)``: passing the
+    last row's ``after``/``after_id`` returns strictly later rows. Using ``id`` as a
+    tiebreaker (rather than ``created_at`` alone) means rows sharing a timestamp are
+    never skipped when a batch boundary falls between them — a real risk under
+    bursty ingestion where many docs land in the same instant. Backed by the
+    ``ingestion_raw_document_created_at_id_idx`` index so the scan stays cheap on a
+    large table. Returns the lightweight :class:`RawDocumentRef` (id + recipe +
+    cursor), not the full row or bytes — the per-document task loads those via
+    :func:`get_raw_document`.
     """
+    from sqlalchemy import tuple_
+
     stmt = select(RawDocument.id, RawDocument.recipe_id, RawDocument.created_at)
-    if after is not None:
+    if after is not None and after_id is not None:
+        # Strict keyset comparison: (created_at, id) > (after, after_id).
+        stmt = stmt.where(tuple_(RawDocument.created_at, RawDocument.id) > (after, after_id))
+    elif after is not None:
         stmt = stmt.where(RawDocument.created_at > after)
-    stmt = stmt.order_by(RawDocument.created_at).limit(limit)
+    stmt = stmt.order_by(RawDocument.created_at, RawDocument.id).limit(limit)
     rows = (await session.execute(stmt)).all()
     return [
         RawDocumentRef(id=row.id, recipe_id=row.recipe_id, created_at=row.created_at)

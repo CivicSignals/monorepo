@@ -78,13 +78,24 @@ def test_parse_unknown_content_type_is_degraded() -> None:
     assert "some bytes" in parsed.text
 
 
-def test_parse_pdf_below_ocr_threshold_is_degraded() -> None:
-    # pdfplumber is in the extraction extra; in this env it isn't installed so the
-    # lazy import returns "" — which is < OCR_MIN_PDF_CHARS and flags degraded,
-    # exercising the # TODO E9 OCR hook (doc 19 §2.2).
+def test_parse_pdf_below_ocr_threshold_is_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Force the PDF text-layer extraction to return "" (independent of whether the
+    # `extraction` extra / pdfplumber is installed), so the test deterministically
+    # exercises the < OCR_MIN_PDF_CHARS path that flags degraded — the # TODO E9
+    # OCR hook (doc 19 §2.2).
+    monkeypatch.setattr(pipeline, "_parse_pdf", lambda content: "")
     doc = _stored_doc(content_type="application/pdf")
     parsed = pipeline.parse_document(doc, b"%PDF-1.4 ...")
     assert parsed.degraded is True
+
+
+def test_parse_pdf_extracts_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When the text layer yields enough text, the parse is not degraded.
+    monkeypatch.setattr(pipeline, "_parse_pdf", lambda content: "RFP for ERP " * 30)
+    doc = _stored_doc(content_type="application/pdf")
+    parsed = pipeline.parse_document(doc, b"%PDF-1.4 ...")
+    assert parsed.degraded is False
+    assert "RFP for ERP" in parsed.text
 
 
 # --- extract --------------------------------------------------------------

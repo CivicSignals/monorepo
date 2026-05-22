@@ -215,13 +215,21 @@ def _parse_pdf(content: bytes) -> str:
 
     import io
 
-    parts: list[str] = []
-    with pdfplumber.open(io.BytesIO(content)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            if page_text:
-                parts.append(page_text)
-    return "\n\n".join(parts)
+    # A malformed/encrypted/truncated PDF can make pdfplumber (pdfminer under it)
+    # raise on open or per-page extraction. Parse is best-effort (doc 19 §2.1): a
+    # bad PDF must degrade to empty text — which the caller flags degraded and the
+    # # TODO E9 OCR hook later re-attempts — not crash the whole job.
+    try:
+        parts: list[str] = []
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                if page_text:
+                    parts.append(page_text)
+        return "\n\n".join(parts)
+    except Exception as exc:  # pdfminer raises a broad family of parse errors
+        log.warning("extraction.parse.pdf_failed", error=str(exc))
+        return ""
 
 
 def _normalize_whitespace(text: str) -> str:

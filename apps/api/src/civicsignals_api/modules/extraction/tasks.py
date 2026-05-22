@@ -111,9 +111,9 @@ async def _process_document_async(
     from .pipeline import run_extraction_pipeline
 
     storage = RawDocumentStorage.from_settings()
-    prefilter = _resolve_prefilter_for_document(raw_document_id)
 
     async with SessionLocal() as session:
+        prefilter = await _resolve_prefilter_for_job(session, raw_document_id)
         await services.mark_job_running(session, job_id, stage=STAGE_EXTRACT)
         await session.commit()
 
@@ -143,21 +143,27 @@ async def _dead_letter_async(job_id: uuid.UUID, *, error: str) -> None:
         await session.commit()
 
 
-def _resolve_prefilter_for_document(raw_document_id: uuid.UUID) -> str:
+async def _resolve_prefilter_for_job(session, raw_document_id: uuid.UUID) -> str:  # type: ignore[no-untyped-def]
     """Resolve the recipe's relevance prefilter for a document (doc 19 §3.3).
 
-    Best-effort: looks the document's recipe up and reads its ``prefilter`` so a
-    pre-vetted source (``assume_relevant``) skips the LLM gate entirely. The recipe
-    id lives on the job row we already created; the prefilter is a per-recipe
-    posture. Defaults to ``classifier`` (run the gate) whenever the recipe can't be
+    Best-effort and **async** — it runs inside the task's existing event loop and
+    session (never a nested ``asyncio.run``). Reads the job's ``recipe_id`` (the
+    job row already exists) and loads the recipe definition to read its
+    ``prefilter`` so a pre-vetted source (``assume_relevant``) skips the LLM gate
+    entirely. Defaults to ``classifier`` (run the gate) whenever the recipe can't be
     resolved — the safe, never-silently-drop default.
     """
+    from sqlalchemy import select
+
     from civicsignals_api.modules.recipes import services as recipes_services
 
-    # The job carries the recipe_id; resolve it without a DB round-trip by reading
-    # the recipe definition. We need the recipe_id, so fetch the job synchronously
-    # via a short-lived session.
-    recipe_id = asyncio.run(_recipe_id_for_job(raw_document_id))
+    from .models import ExtractionJob
+
+    recipe_id = (
+        await session.execute(
+            select(ExtractionJob.recipe_id).where(ExtractionJob.raw_document_id == raw_document_id)
+        )
+    ).scalar_one_or_none()
     if recipe_id is None:
         return services.PREFILTER_CLASSIFIER
     try:
@@ -167,26 +173,11 @@ def _resolve_prefilter_for_document(raw_document_id: uuid.UUID) -> str:
     return recipe.prefilter
 
 
-async def _recipe_id_for_job(raw_document_id: uuid.UUID) -> str | None:
-    from sqlalchemy import select
-
-    from civicsignals_api.db import SessionLocal
-
-    from .models import ExtractionJob
-
-    async with SessionLocal() as session:
-        return (
-            await session.execute(
-                select(ExtractionJob.recipe_id).where(
-                    ExtractionJob.raw_document_id == raw_document_id
-                )
-            )
-        ).scalar_one_or_none()
-
-
-# How many freshly-fetched raw documents one beat tick turns into jobs. A backlog
-# is drained over successive ticks rather than in one burst (doc 06 §8: every 1m).
+# Page size for one keyset discovery batch (and one claim+dispatch batch).
 DISCOVER_BATCH = 200
+# Per-tick cap on documents scanned/enqueued, so a large backlog is drained over
+# successive ticks (doc 06 §8: every 1m) rather than in one unbounded burst.
+DISCOVER_MAX_PER_TICK = 2_000
 
 
 @celery_app.task(name="extraction.run_pending_documents")
@@ -196,12 +187,17 @@ def run_pending_documents() -> int:
     The beat task at the head of the funnel. Two steps:
 
     1. **Discover** freshly-fetched ``ingestion_raw_document`` rows (via ingestion's
-       service seam — doc 06 §3) and create an ``extraction_job`` per document. The
-       job table's UNIQUE on ``raw_document_id`` makes this idempotent: a document
-       already enqueued is a no-op, so a re-scan never double-processes.
-    2. **Dispatch** ``process_document`` for every pending job into the ``extract``
-       queue. Each runs through the relevance gate (doc 19 §3, E8) before any
-       expensive extraction — the funnel's largest cost lever.
+       service seam — doc 06 §3) and create an ``extraction_job`` per document.
+       Discovery pages forward with a keyset cursor on ``created_at`` so a backlog
+       larger than one batch isn't starved (it advances past already-enqueued rows
+       instead of re-scanning the same oldest ``DISCOVER_BATCH`` every tick), up to
+       ``DISCOVER_MAX_PER_TICK``. The job table's UNIQUE on ``raw_document_id``
+       makes enqueue idempotent: a document already enqueued is a no-op.
+    2. **Claim + dispatch**: :func:`services.claim_pending_jobs` atomically moves
+       the jobs it returns out of ``pending`` (``FOR UPDATE SKIP LOCKED``), so a job
+       that lingers in the broker past the 1-minute cadence is dispatched exactly
+       once — no duplicate concurrent processing. Each runs the relevance gate
+       (doc 19 §3, E8) before any expensive extraction — the funnel's cost lever.
 
     Returns the number of jobs dispatched this tick (0 when nothing is pending).
     """
@@ -209,22 +205,43 @@ def run_pending_documents() -> int:
 
 
 async def _run_pending_documents_async() -> int:
+    from datetime import datetime
+
     from civicsignals_api.db import SessionLocal
     from civicsignals_api.modules.ingestion import services as ingestion_services
 
     async with SessionLocal() as session:
         # 1. Discover new raw documents and create pending jobs (idempotent).
-        refs = await ingestion_services.list_raw_document_refs(session, limit=DISCOVER_BATCH)
-        for ref in refs:
-            await services.enqueue_extraction(session, ref.id, recipe_id=ref.recipe_id)
+        # Page forward on the composite (created_at, id) keyset cursor so we don't
+        # re-scan the same oldest rows every tick; enqueue is idempotent so already-
+        # known docs are cheap no-ops, but advancing the cursor lets newer docs
+        # through. The id tiebreaker prevents skipping same-timestamp rows.
+        cursor_ts: datetime | None = None
+        cursor_id: uuid.UUID | None = None
+        scanned = 0
+        while scanned < DISCOVER_MAX_PER_TICK:
+            refs = await ingestion_services.list_raw_document_refs(
+                session, limit=DISCOVER_BATCH, after=cursor_ts, after_id=cursor_id
+            )
+            if not refs:
+                break
+            for ref in refs:
+                await services.enqueue_extraction(session, ref.id, recipe_id=ref.recipe_id)
+            scanned += len(refs)
+            cursor_ts = refs[-1].created_at
+            cursor_id = refs[-1].id
+            if len(refs) < DISCOVER_BATCH:
+                break  # drained the table
         await session.commit()
 
-        # 2. Dispatch a per-document task for every pending job.
-        pending = await services.list_pending_documents(session)
+        # 2. Atomically claim a batch of pending jobs (moves them out of pending),
+        # then dispatch one task each. Claiming closes the duplicate-dispatch window.
+        claimed = await services.claim_pending_jobs(session, limit=DISCOVER_BATCH)
+        await session.commit()
 
-    for job in pending:
+    for job in claimed:
         process_document.delay(str(job.id), str(job.raw_document_id))
-    return len(pending)
+    return len(claimed)
 
 
 def enqueue_extraction(raw_document_id: uuid.UUID, *, recipe_id: str) -> None:

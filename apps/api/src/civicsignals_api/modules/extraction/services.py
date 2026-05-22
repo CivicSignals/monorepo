@@ -96,11 +96,11 @@ async def get_job(session: AsyncSession, job_id: uuid.UUID) -> ExtractionJobReco
 async def list_pending_documents(
     session: AsyncSession, *, limit: int = 100
 ) -> list[ExtractionJobRecord]:
-    """List pending jobs for the beat task to dispatch (doc 06 §8; oldest first).
+    """List pending jobs (read-only observability; oldest first).
 
-    The ``run_pending_documents`` beat task (every 1 min) drains these into the
-    ``extract`` queue. Bounded by ``limit`` so one tick can't enqueue an unbounded
-    burst; the next tick picks up the rest.
+    For the dispatch path the beat task uses :func:`claim_pending_jobs`, which
+    *atomically* transitions the jobs it returns out of ``pending`` so they can't
+    be dispatched twice. This read-only listing is kept for inspection/tests.
     """
     rows = (
         (
@@ -115,6 +115,44 @@ async def list_pending_documents(
         .all()
     )
     return [ExtractionJobRecord.model_validate(r) for r in rows]
+
+
+async def claim_pending_jobs(
+    session: AsyncSession, *, limit: int = 200
+) -> list[ExtractionJobRecord]:
+    """Atomically claim a batch of pending jobs for dispatch (doc 06 §8).
+
+    The dispatch path of the ``run_pending_documents`` beat task. Selecting
+    ``pending`` jobs and *immediately* transitioning them to ``running`` in one
+    statement (oldest first, ``FOR UPDATE SKIP LOCKED``) closes the duplicate-
+    dispatch window: a job that sits in the broker for longer than the 1-minute
+    beat cadence is no longer ``pending`` on the next tick, so it is dispatched
+    exactly once. ``SKIP LOCKED`` also makes two overlapping beat ticks safe — each
+    claims a disjoint set rather than blocking or double-claiming. The caller owns
+    the transaction (this flushes, not commits); ``process_document``'s own
+    ``mark_job_running`` is then an idempotent re-affirm that bumps ``attempts``.
+    """
+    # Select-and-lock the oldest pending jobs, skipping rows another worker/tick
+    # already holds, then flip them to running in the same unit of work.
+    locked = (
+        (
+            await session.execute(
+                select(ExtractionJob)
+                .where(ExtractionJob.status == JOB_STATUS_PENDING)
+                .order_by(ExtractionJob.created_at)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    claimed: list[ExtractionJobRecord] = []
+    for row in locked:
+        row.status = JOB_STATUS_RUNNING
+        claimed.append(ExtractionJobRecord.model_validate(row))
+    await session.flush()
+    return claimed
 
 
 async def mark_job_running(
@@ -191,6 +229,7 @@ __all__ = [
     "RelevanceClassifier",
     "RelevanceDecisionRecord",
     "RelevanceVerdict",
+    "claim_pending_jobs",
     "enqueue_extraction",
     "get_job",
     "list_pending_documents",
