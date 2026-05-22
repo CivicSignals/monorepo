@@ -5,9 +5,17 @@ recipe (by id or inline YAML) + a sample input (pasted HTML or a URL) is
 dry-run through the runner, returning the extracted records, per-field results,
 and the ``degraded``/diagnostic info an author needs (doc 18 §3).
 
-Errors use RFC 7807 ``application/problem+json`` (doc 06 §5). The endpoint is
-**staff-only** via a deliberate stub (``staff_problem``) — real workspace RBAC
-is TODO B7; see the stub for the seam.
+E12 adds two **read-only scorecard endpoints** (workspace-authenticated, any
+member):
+
+- ``GET /recipes/scorecards`` — list all recipes' scorecards, cursor-paginated,
+  optional ``?health=`` filter.
+- ``GET /recipes/scorecards/{recipe_id}`` — single recipe scorecard.
+
+Errors use RFC 7807 ``application/problem+json`` (doc 06 §5). The preview
+endpoint is **staff-only** via a deliberate stub (``staff_problem``) — real
+workspace RBAC is TODO B7; see the stub for the seam.  Scorecard endpoints use
+the standard ``require_workspace`` / ``RequireViewer`` dependency (B5/B7).
 """
 
 from __future__ import annotations
@@ -15,17 +23,31 @@ from __future__ import annotations
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header, Query, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.config import get_settings
+from civicsignals_api.db import get_session
+from civicsignals_api.modules.auth.dependencies import RequireViewer
+from civicsignals_api.problems import ProblemException
 
+from . import scorecard as scorecard_svc
 from . import services
-from .schemas import PreviewRequest, PreviewResult
+from .schemas import (
+    PreviewRequest,
+    PreviewResult,
+    RecipeScorecardOut,
+    ScorecardHealthOut,
+    ScorecardPageOut,
+)
 
 router = APIRouter(prefix="/recipes", tags=["recipes"])
 
 PROBLEM_JSON = "application/problem+json"
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+CursorQuery = Annotated[str | None, Query(description="Opaque pagination cursor.")]
+LimitQuery = Annotated[int, Query(ge=1, le=scorecard_svc.MAX_LIMIT)]
 
 
 def _problem(status: int, title: str, detail: str) -> JSONResponse:
@@ -106,3 +128,104 @@ def preview_recipe_endpoint(
         # caller's mistake: 400. The 404/502 cases are caught above by *type*, so
         # routing never depends on message text.
         return _problem(400, "Bad request", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# E12 — Recipe scorecard / quality dashboard endpoints (read-only)
+# ---------------------------------------------------------------------------
+
+
+def _scorecard_out(card: scorecard_svc.RecipeScorecard) -> RecipeScorecardOut:
+    """Map an internal :class:`RecipeScorecard` to the API response schema."""
+    return RecipeScorecardOut(
+        recipe_id=card.recipe_id,
+        health=ScorecardHealthOut(card.health.value),
+        drift_paused=card.drift_paused,
+        paused_reason=card.paused_reason,
+        paused_at=card.paused_at,
+        drift_issue_url=card.drift_issue_url,
+        last_run_at=card.last_run_at,
+        window_24h=card.window_24h,
+        window_7d=card.window_7d,
+        computed_at=card.computed_at,
+    )
+
+
+@router.get(
+    "/scorecards",
+    response_model=ScorecardPageOut,
+    summary="List per-recipe quality scorecards (workspace-scoped, read-only)",
+    responses={
+        400: {"description": "Bad request (invalid cursor)", "content": {PROBLEM_JSON: {}}},
+        401: {"description": "Unauthorized", "content": {PROBLEM_JSON: {}}},
+        404: {"description": "Workspace not found", "content": {PROBLEM_JSON: {}}},
+    },
+)
+async def list_scorecards_endpoint(
+    session: SessionDep,
+    _ctx: RequireViewer,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = scorecard_svc.DEFAULT_LIMIT,
+    health: Annotated[
+        ScorecardHealthOut | None,
+        Query(description="Filter by health status (healthy/degraded/paused/unknown)."),
+    ] = None,
+) -> ScorecardPageOut:
+    """Return a cursor-paginated list of recipe scorecards.
+
+    Each scorecard summarises one recipe's quality metrics from the last 24h and
+    7d rolling windows (E7 ``RunMetric``/``DriftState`` data).  Ordered
+    alphabetically by recipe id; pass ``?cursor=<next_cursor>`` for subsequent
+    pages.  Filter by ``?health=degraded`` (or ``paused``/``healthy``/``unknown``)
+    to surface only the recipes that need attention.
+
+    Workspace membership is required (``X-Workspace-Id`` header or last-active
+    fallback, doc 08 §1.4). Read-only — viewer role and above.
+    """
+    try:
+        health_filter = (
+            scorecard_svc.ScorecardHealth(health.value) if health is not None else None
+        )
+        page = await scorecard_svc.list_scorecards(
+            session,
+            health=health_filter,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="bad_request",
+            title="Bad request",
+            detail="Invalid cursor.",
+        ) from exc
+    return ScorecardPageOut(
+        items=[_scorecard_out(card) for card in page.items],
+        next_cursor=page.next_cursor,
+    )
+
+
+@router.get(
+    "/scorecards/{recipe_id}",
+    response_model=RecipeScorecardOut,
+    summary="Get a single recipe's quality scorecard (workspace-scoped, read-only)",
+    responses={
+        401: {"description": "Unauthorized", "content": {PROBLEM_JSON: {}}},
+        404: {"description": "Workspace not found", "content": {PROBLEM_JSON: {}}},
+    },
+)
+async def get_scorecard_endpoint(
+    recipe_id: str,
+    session: SessionDep,
+    _ctx: RequireViewer,
+) -> RecipeScorecardOut:
+    """Return the quality scorecard for one recipe.
+
+    A scorecard is returned even when the recipe has no recorded runs yet
+    (health is ``unknown``, all metric counts are zero).  The ``recipe_id`` is
+    the recipe slug string (same as in ``RunMetric``/``DriftState``).
+
+    Workspace membership is required. Read-only — viewer role and above.
+    """
+    card = await scorecard_svc.get_scorecard(session, recipe_id)
+    return _scorecard_out(card)
