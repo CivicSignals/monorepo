@@ -17,7 +17,9 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   PATCH /signals/{id}/status                 — transition the per-workspace status (G4)
   POST /signals/bulk-status                  — bulk-transition many signals' status (G3)
   POST /signals/{id}/feedback                — record / change / retract user feedback (F5)
-  GET  /signals/{id}                         — get one signal
+  GET  /signals/{id}/public                  — public narrowed signal projection (P2, public types only)
+  GET  /signals/{id}/sources                 — public source citations for a signal (P2, public types only)
+  GET  /signals/{id}                         — get one signal (full internal read)
 
 Route ordering note: ``/feed``, ``/fuzzy-reviews`` and their sub-paths MUST be
 registered before ``/{signal_id}`` (the parameterised catch-all) so that FastAPI's
@@ -52,13 +54,16 @@ from civicsignals_api.modules.auth.dependencies import (
     RequireMember,
     RequireViewer,
 )
+from civicsignals_api.ratelimit import public_signal_limiter
 
 from . import services
 from .schemas import (
+    PublicSignalRead,
     RelatedSignalRead,
     SignalDetailRead,
     SignalPage,
     SignalRead,
+    SignalSourcesRead,
     SourceDocumentRead,
     SuggestedContactRead,
 )
@@ -69,6 +74,11 @@ log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/signals", tags=["signals"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+# P4: per-client (IP) rate limit applied ONLY to the public, unauthenticated
+# signal reads below — never to the authenticated /feed or admin fuzzy-review
+# routes. ``Depends`` re-resolves ``public_signal_limiter`` per request so the
+# configured limit/window is read from settings (and is overridable in tests).
+PublicRateLimit = Depends(public_signal_limiter)
 CursorQuery = Annotated[str | None, Query(description="Opaque pagination cursor.")]
 LimitQuery = Annotated[int, Query(ge=1, le=services.MAX_LIMIT)]
 
@@ -225,9 +235,18 @@ async def get_workspace_feed(
 # ---------------------------------------------------------------------------
 
 
+# NOTE: this bare list (and ``GET /{signal_id}`` below) is unauthenticated and
+# returns the full internal ``SignalRead`` projection. That full-field public
+# exposure predates this epic, and the public directory (C5) relies on these reads
+# being public — so we deliberately do NOT change the auth or response shape here.
+# The conservative hardening this epic adds is to apply the SAME public rate limiter
+# used on ``/public`` + ``/sources`` so a scraper cannot hammer the corpus.
+# TODO (pre-existing follow-up): narrow the unauthenticated projection to public-safe
+# fields (mirror PublicSignalRead) instead of leaking the full internal SignalRead.
 @router.get("", response_model=SignalPage, summary="List global signals")
 async def list_signals(
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
     entity_id: Annotated[uuid.UUID | None, Query(description="Filter by entity id.")] = None,
     signal_type: Annotated[str | None, Query(description="Filter by signal type slug.")] = None,
     occurred_after: Annotated[
@@ -839,14 +858,84 @@ async def retract_feedback(
 
 
 # ---------------------------------------------------------------------------
+# Public signal read + source citations (P2) — read-only, unauthenticated.
+#
+# Registered before /{signal_id} so the static ``/public`` / ``/sources`` suffixes
+# are matched as sub-resources of the signal id (mirrors entities'
+# ``/{entity_id}/children``).
+#
+# BOTH gate on ``PUBLIC_SIGNAL_TYPES`` (doc 13 §4.1, §4.6): a non-public (paid-tier)
+# signal 404s server-side so the public surface cannot be scraped by id. The full
+# internal ``SignalRead`` stays on the authenticated ``GET /{signal_id}`` below.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{signal_id}/public",
+    response_model=PublicSignalRead,
+    summary="Public signal projection for the /s/{id} page (P2)",
+)
+async def get_public_signal(
+    signal_id: uuid.UUID,
+    session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
+) -> PublicSignalRead | JSONResponse:
+    """Public, unauthenticated, narrowed read of a signal (P2; doc 13 §4.1, §4.6).
+
+    Powers the public ``/s/{id}`` page. Returns only public-safe fields (id, type,
+    title, summary, public entity name, occurred/observed dates) — never the internal
+    ``content_hash`` / ``raw_document_ids`` / ``confidence`` / ``status`` / ``details``
+    that the full ``SignalRead`` carries (doc 13 §4.2: depth is paid). 404s when the
+    signal does not exist or its type is not in the public allowlist, so a paid-tier
+    signal cannot be scraped by id.
+    """
+    result = await services.get_public_signal(session, signal_id)
+    if result is None:
+        return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
+    return result
+
+
+@router.get(
+    "/{signal_id}/sources",
+    response_model=SignalSourcesRead,
+    summary="Public source citations for a signal (P2)",
+)
+async def get_signal_sources(
+    signal_id: uuid.UUID,
+    session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
+) -> SignalSourcesRead | JSONResponse:
+    """Public, unauthenticated source citations for a signal (P2; doc 07 §3).
+
+    Signals are global (like the entity directory), so this read endpoint requires
+    no ``X-Workspace-Id`` and no auth — it powers the public ``/s/{id}`` signal page,
+    which cites where each fact came from. Returns the public-safe provenance of every
+    corroborating ``ingestion_raw_document`` (source URL + recipe + fetch time); the
+    S3 key and internal metadata are never exposed. 404s when the signal does not
+    exist or its type is not in :data:`~signals.schemas.PUBLIC_SIGNAL_TYPES`
+    (doc 13 §4.1, §4.6) so a paid-tier signal cannot be scraped by id.
+    """
+    result = await services.get_signal_sources(session, signal_id)
+    if result is None:
+        return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Parameterised signal endpoint — MUST be last so static prefixes above win.
 # ---------------------------------------------------------------------------
 
 
+# NOTE: like the list above, this is unauthenticated and returns the full internal
+# ``SignalRead``; C5 relies on it being public, so we hold auth/shape constant and
+# only add the public rate limiter as conservative hardening.
+# TODO (pre-existing follow-up): narrow the unauthenticated projection to public-safe
+# fields (mirror PublicSignalRead) rather than exposing the full internal SignalRead.
 @router.get("/{signal_id}", response_model=SignalRead, summary="Get one signal")
 async def get_signal(
     signal_id: uuid.UUID,
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
 ) -> SignalRead | JSONResponse:
     """Fetch one global signal by id."""
     signal = await services.get_signal(session, signal_id)

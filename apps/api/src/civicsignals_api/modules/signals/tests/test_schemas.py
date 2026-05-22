@@ -14,12 +14,14 @@ import pytest
 
 from civicsignals_api.modules.signals.schemas import (
     PAYLOAD_BY_TYPE,
+    PUBLIC_SIGNAL_TYPES,
     BudgetApprovedPayload,
     ContractExpiringPayload,
     LeadershipChangePayload,
     RFPPostedPayload,
     SignalType,
     SignalValidationError,
+    is_public_signal_type,
     parse_signal_payload,
 )
 
@@ -141,3 +143,40 @@ def test_every_type_parses_with_its_minimal_required_payload(signal_type: str) -
     minimal.update(required.get(signal_type, {}))
     payload = parse_signal_payload(signal_type, minimal)
     assert payload.signal_type.value == signal_type
+
+
+# ---------------------------------------------------------------------------
+# Public-surface allowlist (P2 — doc 13 §4.1, §4.6)
+# ---------------------------------------------------------------------------
+
+
+def test_public_allowlist_is_exactly_the_late_stage_public_types() -> None:
+    """Only public RFPs, news mentions, grant awards are publicly indexable.
+
+    Doc 13 §4.1 (Free/Self-host tier) + §4.6 name exactly these three commodity,
+    already-public types. Everything else is paid-tier value upstream of the public
+    layer and must not appear on the unauthenticated public surface.
+    """
+    assert set(PUBLIC_SIGNAL_TYPES) == {
+        SignalType.RFP_POSTED,
+        SignalType.NEWS_MENTION,
+        SignalType.GRANT_AWARDED,
+    }
+
+
+@pytest.mark.parametrize("signal_type", ["rfp_posted", "news_mention", "grant_awarded"])
+def test_is_public_signal_type_allows_public_types(signal_type: str) -> None:
+    assert is_public_signal_type(signal_type) is True
+
+
+@pytest.mark.parametrize(
+    "signal_type",
+    [t.value for t in SignalType if t not in PUBLIC_SIGNAL_TYPES],
+)
+def test_is_public_signal_type_rejects_paid_tier_types(signal_type: str) -> None:
+    assert is_public_signal_type(signal_type) is False
+
+
+def test_is_public_signal_type_rejects_unknown_and_none() -> None:
+    assert is_public_signal_type("made_up_type") is False
+    assert is_public_signal_type(None) is False
