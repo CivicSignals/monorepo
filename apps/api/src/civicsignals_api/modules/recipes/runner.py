@@ -830,29 +830,25 @@ class RecipeRunner:
         """
         doc = ParsedDocument(_parse_html(html), html)
         return {
-            name: _extract_field(doc, name, spec).value
-            for name, spec in self.recipe.fields.items()
+            name: _extract_field(doc, name, spec).value for name, spec in self.recipe.fields.items()
         }
 
-    def preview_field_extractions(
+    def preview_extract(
         self, html: str, *, source_url: str = "preview://pasted-html"
-    ) -> list[FieldExtraction]:
-        """Per-field :class:`FieldExtraction` results — public, never raises.
+    ) -> tuple[ExtractedDocument, str | None]:
+        """Extract from ``html`` through the full chain, never raising on required-field misses.
 
-        Like :meth:`field_values` but returns the full :class:`FieldExtraction`
-        objects (including method, selector_index, and selector) so the authoring
-        preview (D5) can build a faithful ``FieldPreview`` list that is consistent
-        with the records produced by the full extraction chain (selectors + LLM
-        rung). Required-field misses are captured in the returned
-        :class:`FieldExtraction` (value ``None``, method ``dead_letter``) rather
-        than raised as :class:`RequiredFieldMissingError`, so the preview always
-        shows the full field picture regardless of extraction outcome.
+        Returns ``(extracted, error_message)`` — a single extraction pass that
+        the authoring preview (D5) uses as the single source of truth for both
+        per-field diagnostics and canonical records. ``error_message`` is set when
+        a required field misses (otherwise ``None``); the returned
+        :class:`ExtractedDocument` always has ``field_extractions`` populated even
+        when a required field could not be extracted. This avoids the double-pass
+        that would occur if the caller ran :meth:`preview_field_extractions` and
+        :meth:`extract_html` separately.
         """
         doc = ParsedDocument(_parse_html(html), html)
         page_text = doc.soup.get_text(" ", strip=True) if self._any_llm_assisted() else ""
-        # Build a minimal RawDocument shell so _resolve_field can construct
-        # DeadLetterEntry objects (the entries are discarded by the preview, but
-        # the method signature requires them).
         raw = RawDocument(
             recipe_id=self.recipe.recipe_id,
             connector=self.recipe.connector,
@@ -862,13 +858,57 @@ class RecipeRunner:
             content_hash=_content_hash(html),
             recipe_version=self.recipe.version,
         )
-        extractions: list[FieldExtraction] = []
+
+        field_extractions: list[FieldExtraction] = []
+        degraded_fields: list[str] = []
+        dead_letters: list[DeadLetterEntry] = []
+        drift = DriftCounters(fields_total=len(self.recipe.fields))
+        out: dict[str, str | None] = {}
+        error_message: str | None = None
+
         for name, spec in self.recipe.fields.items():
-            result, _dead_letter = self._resolve_field(
+            result, dead_letter = self._resolve_field(
                 doc=doc, page_text=page_text, name=name, spec=spec, raw=raw
             )
-            extractions.append(result)
-        return extractions
+            field_extractions.append(result)
+            out[name] = result.value
+
+            if result.method is ExtractionMethod.FALLBACK:
+                drift.selector_fallbacks += 1
+                drift.fallback_by_field[name] = drift.fallback_by_field.get(name, 0) + 1
+            elif result.method is ExtractionMethod.LLM_ASSISTED:
+                drift.llm_fallbacks += 1
+                drift.llm_by_field[name] = drift.llm_by_field.get(name, 0) + 1
+            if result.degraded:
+                degraded_fields.append(name)
+            if dead_letter is not None:
+                drift.dead_letters += 1
+                drift.dead_letter_by_field[name] = drift.dead_letter_by_field.get(name, 0) + 1
+                dead_letters.append(dead_letter)
+
+            # Capture the required-field miss but continue — the preview needs
+            # the full field picture even when a required field is absent.
+            if result.value is None and spec.required and error_message is None:
+                error_message = str(RequiredFieldMissingError(name))
+
+        method = ExtractionMethod.PRIMARY
+        for result in field_extractions:
+            if _METHOD_SEVERITY[result.method] > _METHOD_SEVERITY[method]:
+                method = result.method
+
+        extracted = ExtractedDocument(
+            recipe_id=self.recipe.recipe_id,
+            recipe_version=self.recipe.version,
+            signal_types=list(self.recipe.signal_types),
+            extraction_method=method,
+            degraded=bool(degraded_fields),
+            fields=out,
+            field_extractions=field_extractions,
+            degraded_fields=degraded_fields,
+            dead_letters=dead_letters,
+            drift=drift,
+        )
+        return extracted, error_message
 
 
 __all__ = [

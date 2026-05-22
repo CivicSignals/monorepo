@@ -6,10 +6,10 @@ return a rich, per-field view of what the runner extracted, plus the
 
 This is the engine behind both the authoring CLI ``preview`` subcommand and the
 staff ``POST /recipes/preview`` endpoint. It is **additive**: it consumes the
-runner only through its public lifecycle (``extract_html`` /
-``preview_field_extractions`` / ``run``) and never touches the extraction
-internals (``_extract_field`` / ``_resolve_field`` / the selector chain) or
-the DSL schema — those belong to D11.
+runner only through its public lifecycle (``preview_extract`` / ``normalize``)
+and never touches the extraction internals (``_extract_field`` /
+``_resolve_field`` / the selector chain) or the DSL schema — those belong to
+D11.
 
 Two input modes:
 
@@ -30,11 +30,10 @@ from .runner import (
     Recipe,
     RecipeError,
     RecipeRunner,
-    RequiredFieldMissingError,
 )
 from .schemas import (
     CanonicalRecord,
-    FieldExtraction,
+    ExtractedDocument,
     FieldPreview,
     PreviewResult,
 )
@@ -63,20 +62,21 @@ class _PreviewNoopFetcher:
         return None
 
 
-def _field_previews(recipe: Recipe, extractions: list[FieldExtraction]) -> list[FieldPreview]:
-    """Build the per-field diagnostic view from full-chain :class:`FieldExtraction` results.
+def _field_previews(recipe: Recipe, extracted: ExtractedDocument) -> list[FieldPreview]:
+    """Build the per-field diagnostic view from a completed :class:`ExtractedDocument`.
 
-    ``extractions`` come from :meth:`RecipeRunner.preview_field_extractions`
-    (the public non-raising surface that covers the full selector→LLM chain),
-    so the per-field picture is consistent with the records produced by the full
-    extraction: a field that the LLM rung fills will show ``matched=True`` here
-    just as it appears in the canonical record, rather than ``False`` (which
-    would happen if we only ran the selector chain). We pair each extraction
-    with its :class:`FieldSpec` (which the recipe exposes publicly) to surface
-    required-ness, the read attribute, and the ordered selector list an author
-    would debug against.
+    ``extracted`` comes from :meth:`RecipeRunner.preview_extract`, which runs the
+    full selector→LLM chain without raising on required-field misses. Deriving
+    the per-field preview from the same :class:`ExtractedDocument` that produces
+    the canonical records (via ``normalize``) guarantees consistency: a field the
+    LLM rung fills will show ``matched=True`` here and appear in the record with
+    the same value, rather than showing ``matched=False`` if we had run only the
+    selector chain in a separate pass. We pair each
+    :class:`FieldExtraction` with its :class:`FieldSpec` (which the recipe
+    exposes publicly) to surface required-ness, the read attribute, and the
+    ordered selector list an author would debug against.
     """
-    by_name = {fe.name: fe for fe in extractions}
+    by_name = {fe.name: fe for fe in extracted.field_extractions}
     previews: list[FieldPreview] = []
     for name, spec in recipe.fields.items():
         fe = by_name.get(name)
@@ -100,39 +100,29 @@ def preview_html(recipe: Recipe, html: str, *, source_url: str = HTML_SOURCE_URL
 
     Returns a :class:`PreviewResult` regardless of whether a required field is
     missing — a failed extraction is the *most* useful thing for an author to
-    see, so we capture the :class:`RequiredFieldMissingError` into the result's
-    ``error`` rather than raising. ``ok`` is ``False`` in that case.
+    see, so we capture the required-field error into the result's ``error``
+    rather than raising. ``ok`` is ``False`` in that case.
 
-    Per-field results are derived from
-    :meth:`RecipeRunner.preview_field_extractions` (full selector→LLM chain,
-    never raises) so they are consistent with the records produced by
-    ``extract_html`` + ``normalize``.
+    A single extraction pass (:meth:`RecipeRunner.preview_extract`) produces
+    both the per-field diagnostics and the canonical records, so the two views
+    are always consistent and no extraction work is duplicated.
     """
     runner = RecipeRunner(recipe, _PreviewNoopFetcher())
-    # Run the full chain (selector → LLM) for every field without raising on
-    # required-field misses; this is the source of truth for FieldPreview.
-    field_extractions = runner.preview_field_extractions(html, source_url=source_url)
-    fields = _field_previews(recipe, field_extractions)
+    # Single pass: full chain (selector → LLM), never raises on required misses.
+    extracted, error = runner.preview_extract(html, source_url=source_url)
+    fields = _field_previews(recipe, extracted)
 
-    error: str | None = None
     records: list[CanonicalRecord] = []
-    degraded = False
-    extraction_method: str | None = None
-    try:
-        extracted = runner.extract_html(html, source_url=source_url)
-        degraded = extracted.degraded
-        extraction_method = extracted.extraction_method
+    if error is None:
         records = runner.normalize(extracted, source_url)
-    except RequiredFieldMissingError as exc:
-        error = str(exc)
 
     return PreviewResult(
         recipe_id=recipe.recipe_id,
         recipe_version=recipe.version,
         source=source_url,
         ok=error is None,
-        degraded=degraded,
-        extraction_method=extraction_method,
+        degraded=extracted.degraded,
+        extraction_method=extracted.extraction_method,
         signal_types=list(recipe.signal_types),
         fields=fields,
         records=records,

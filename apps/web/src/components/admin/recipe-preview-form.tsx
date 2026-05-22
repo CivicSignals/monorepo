@@ -90,9 +90,9 @@ export function RecipePreviewForm({
   return (
     <div className="space-y-6">
       <form onSubmit={onSubmit} className="space-y-5" aria-label="Recipe preview">
-        {/* Staff token gate (TODO B7). Hidden when the env var supplies it so the
-            common case is frictionless; always editable for non-dev environments
-            where the API returns 403 without a valid token. */}
+        {/* Staff token gate (TODO B7). Always shown so staff can supply or change
+            it in any environment; the server injects a default value from the
+            server-only env var so it is pre-filled when the operator has set it. */}
         <div className="space-y-1">
           <label
             htmlFor="staff-token"

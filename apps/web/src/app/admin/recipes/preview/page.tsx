@@ -16,11 +16,14 @@ export const metadata = {
 };
 
 export default function RecipePreviewPage() {
-  // Read the token from the build-time env var so staff don't have to type it
-  // on every page load. An operator sets this in the Next.js runtime env; if
-  // absent (local dev or when the API gate is open), the form still works with
-  // an empty token (the API allows it in `environment == "development"`).
-  const envToken = process.env.NEXT_PUBLIC_RECIPE_PREVIEW_STAFF_TOKEN ?? "";
+  // Read the token from the server-only env var so it is never bundled into
+  // client JS. The form receives it as an initial value for the token input
+  // (which users can override); the actual fetch happens client-side so the
+  // header is sent at runtime, not baked into the bundle. Operators set this in
+  // their deployment env; in local dev the API gate is open when the var is
+  // absent (environment == "development"). TODO B7: replace with a session-
+  // scoped credential once real RBAC is in place.
+  const envToken = process.env.RECIPE_PREVIEW_STAFF_TOKEN ?? "";
 
   return (
     <main className="container max-w-4xl py-12">
