@@ -9,20 +9,31 @@ useDefault = true
 
 [allowlist]
 description = """
-Two classes of documented false positives:
+Three classes of documented false positives:
 1. Kubernetes manifests reference ConfigMap/Secret KEY NAMES via `key: <NAME>` inside
    `valueFrom` blocks (e.g. `key: S3_RAW_BUCKET`) — configuration key *names*, not secret
    values; the default `generic-api-key` rule false-positives on the uppercase key name.
 2. Documentation under `docs-site/docs/` and `docs/` contains illustrative API/auth
    EXAMPLE snippets (Authorization: Bearer <token>, sample keys) that are placeholders,
    not real secrets. Real secrets must never live in documentation.
-Neither suppresses real secret values committed in source/config.
+3. Unit/integration TEST files contain deterministic dummy fixtures — e.g.
+   `secret_key="test-secret"` (OAuth/JWT tests), `whsec_...` HMAC test vectors (webhook
+   signing tests), TOTP test seeds (MFA tests). These are non-production constants
+   required for reproducible tests, never real credentials. Scoped to test files only;
+   authorized by the maintainer. Real secrets in non-test source/config are still scanned.
 """
 regexTarget = "line"
 regexes = [
   '''^\s*key:\s*[A-Z][A-Z0-9_]+\s*$''',
+  # Dummy test-fixture secrets (literal "test-secret..." values across auth/integration tests)
+  '''(?i)test-secret''',
 ]
 paths = [
   '''docs-site/docs/.*\.mdx?$''',
   '''docs/.*\.md$''',
+  # Test fixtures only: dummy secrets/keys/HMAC vectors/TOTP seeds live solely in test files
+  '''apps/api/.*/tests/.*\.py$''',
+  '''apps/api/.*/conftest\.py$''',
+  '''.*\.(test|spec)\.(ts|tsx)$''',
+  '''.*/__tests__/.*''',
 ]
