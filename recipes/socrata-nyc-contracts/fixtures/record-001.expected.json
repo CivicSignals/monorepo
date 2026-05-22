@@ -1,0 +1,11 @@
+{
+  "signal_types": ["contract_award"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Contract Award — Fleet Vehicle Maintenance",
+    "vendor": "Metro Fleet Services LLC",
+    "award_amount": "1250000",
+    "award_date": "2025-04-30T00:00:00.000"
+  }
+}

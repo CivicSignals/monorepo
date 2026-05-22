@@ -1,0 +1,50 @@
+# Example recipe — example city council meeting via Granicus PEAK
+# (doc 18 §5 wave 2 #7). Instantiates the multi-tenant `granicus_peak` connector
+# (TODO D7) for one city by subdomain + view_id. Public agendas/minutes; static
+# HTML; scrapable public records (doc 16 §16, Tier 1). Synthetic detail-page
+# fixture exercises the runner's CSS-selector extraction over each meeting page
+# the connector's discover() emits.
+recipe_id: granicus-peak-example-city
+connector: granicus_peak
+version: 1
+
+entity:
+  name: City of Example
+  state: WA
+  kind: city
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  granicus_peak:
+    subdomain: example-city
+    view_id: 3
+
+fields:
+  title:
+    selectors:
+      - "h1.meeting-name"
+      - ".meeting-header h1"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-when time"
+      - "span.when"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".agenda-abstract"
+      - "div.abstract"
+    required: false
+
+signal_types:
+  - board_decision
+  - rfp_posted
+  - budget

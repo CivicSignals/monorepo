@@ -1,0 +1,11 @@
+{
+  "signal_types": ["budget", "board_decision"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Riverside Library Renovation",
+    "budget": "5800000",
+    "status": "In Construction",
+    "department": "Public Works"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "signal_types": ["budget", "rfp_posted"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Rural Broadband Infrastructure Grant",
+    "agency": "Washington State Department of Commerce",
+    "funding_amount": "3400000",
+    "posted_date": "2025-05-01"
+  }
+}

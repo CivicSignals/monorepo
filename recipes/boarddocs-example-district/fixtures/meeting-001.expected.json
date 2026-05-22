@@ -1,0 +1,10 @@
+{
+  "signal_types": ["board_decision", "budget"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Regular Board Meeting — May 2025",
+    "meeting_date": "2025-05-12",
+    "agenda_summary": "Board approved the FY2026 technology budget and authorized an RFP for a district-wide network refresh."
+  }
+}

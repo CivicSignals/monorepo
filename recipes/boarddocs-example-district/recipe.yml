@@ -1,0 +1,52 @@
+# Example recipe — example K-12 district board meeting via BoardDocs
+# (doc 18 §5 wave 2 #6). Instantiates the multi-tenant `boarddocs` connector
+# (TODO D7) for one district by state+subdomain. Public agendas/minutes; static
+# HTML; scrapable public records (doc 16 §16, Tier 1). Synthetic detail-page
+# fixture exercises the CSS-selector extraction the runner runs over each meeting
+# page the connector's discover() emits.
+recipe_id: boarddocs-example-district
+connector: boarddocs
+version: 1
+
+entity:
+  name: Example School District
+  state: WA
+  kind: k12_district
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+# Public records; honor robots.txt strictly with a polite window (doc 16 §18).
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  boarddocs:
+    state: wa
+    subdomain: example-sd
+
+# Ordered selectors over a BoardDocs meeting detail page (primary -> fallbacks,
+# doc 18 §3.4).
+fields:
+  title:
+    selectors:
+      - "h1.meeting-title"
+      - ".agenda-header h2"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-date time"
+      - "span.date"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".agenda-summary"
+      - "div.summary"
+    required: false
+
+signal_types:
+  - board_decision
+  - budget

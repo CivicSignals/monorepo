@@ -1,0 +1,53 @@
+# Example recipe — municipal capital projects via ArcGIS REST (doc 18 §5 wave 2 #11).
+# Instantiates the multi-tenant `arcgis_rest` connector (TODO D7) for one Esri
+# FeatureServer layer. Synthetic example: demonstrates per-tenant config + the
+# `dd[data-key=...]` selectors over the connector's feature-attributes->HTML
+# projection. Public open-data; token optional (secured services only).
+recipe_id: arcgis-capital-projects
+connector: arcgis_rest
+version: 1
+
+entity:
+  name: City of Example
+  state: CO
+  kind: city
+
+schedule:
+  cron: "0 8 * * 1" # weekly (capital project layers change slowly)
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  arcgis_rest:
+    layer_url: https://services.arcgis.com/example/arcgis/rest/services/CapitalProjects/FeatureServer/0
+    where: "STATUS <> 'Cancelled'"
+    out_fields: "*"
+    page_size: 100
+    max_pages: 20
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='PROJECT_NAME']"
+      - "dd[data-key='project_name']"
+    required: true
+  budget:
+    selectors:
+      - "dd[data-key='PROJECT_BUDGET']"
+    required: false
+  status:
+    selectors:
+      - "dd[data-key='STATUS']"
+    required: false
+  department:
+    selectors:
+      - "dd[data-key='DEPARTMENT']"
+    required: false
+
+signal_types:
+  - budget
+  - board_decision

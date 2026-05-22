@@ -1,0 +1,57 @@
+# Example recipe — NYC OpenData contract awards via Socrata (doc 18 §5 wave 2 #9).
+# Instantiates the multi-tenant `socrata` connector (TODO D7) for one tenant +
+# dataset. Synthetic example: demonstrates the per-tenant config + the
+# `dd[data-key=...]` field selectors that read the connector's JSON->HTML
+# projection. Public open-data; no auth required (app_token optional).
+recipe_id: socrata-nyc-contracts
+connector: socrata
+version: 1
+
+entity:
+  name: New York City
+  state: NY
+  kind: city
+
+schedule:
+  cron: "0 6 * * *" # daily
+
+# Open-data API access is by app token, not robots-gated; politeness still applies
+# between the runner's per-record fetches (which are local, post-discover).
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+# Pre-vetted open-data feed: skip the Stage-2 relevance classifier (doc 19 §3).
+prefilter: assume_relevant
+
+connector_config:
+  socrata:
+    domain: data.cityofnewyork.us
+    dataset_id: abcd-1234
+    order: ":id"
+    page_size: 100
+    max_pages: 20
+
+# The connector projects each SODA row into an HTML <dl>; fields select the
+# column by data-key (doc 18 §3.4 ordered selectors: primary -> fallbacks).
+fields:
+  title:
+    selectors:
+      - "dd[data-key='title']"
+      - "dd[data-key='contract_title']"
+    required: true
+  vendor:
+    selectors:
+      - "dd[data-key='vendor']"
+    required: false
+  award_amount:
+    selectors:
+      - "dd[data-key='award_amount']"
+    required: false
+  award_date:
+    selectors:
+      - "dd[data-key='award_date']"
+    required: false
+
+signal_types:
+  - contract_award

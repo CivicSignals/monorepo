@@ -1,0 +1,54 @@
+# Example recipe — example town board meeting via CivicPlus / CivicWeb
+# (doc 18 §5 wave 2 #8). Instantiates the multi-tenant `civicplus` connector
+# (TODO D7) for one municipality by subdomain + platform. Public meeting
+# materials; static HTML (doc 16 §16, Tier 1). Synthetic detail-page fixture
+# exercises the runner's CSS-selector extraction over each meeting page the
+# connector's discover() emits.
+#
+# NOTE (D9 seam): a CivicClerk tenant whose meeting list renders only client-side
+# is the one wave-2 case most likely to need the headless browser. Switch *that*
+# recipe to `connector: http_browser` once D9 lands; do not render JS in this
+# connector. Document the decision in the recipe's legal_notes.
+recipe_id: civicplus-example-town
+connector: civicplus
+version: 1
+
+entity:
+  name: Town of Example
+  state: OR
+  kind: city
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  civicplus:
+    subdomain: example-town
+    platform: civicweb
+
+fields:
+  title:
+    selectors:
+      - "h1.MeetingTitle"
+      - ".meeting-detail h1"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".MeetingDate time"
+      - "span.date"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".MeetingSummary"
+      - "div.summary"
+    required: false
+
+signal_types:
+  - board_decision
+  - rfp_posted

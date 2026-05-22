@@ -1,0 +1,10 @@
+{
+  "signal_types": ["board_decision", "rfp_posted"],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Town Board Work Session — May 2025",
+    "meeting_date": "2025-05-08",
+    "agenda_summary": "Board reviewed the proposed water utility budget and scheduled a public hearing on the parks maintenance contract renewal."
+  }
+}

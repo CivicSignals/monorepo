@@ -160,6 +160,88 @@
             "format": { "type": "string", "enum": ["csv", "json", "zip"], "description": "File format hint; inferred from the URL/Content-Type when omitted." },
             "checkpoint_strategy": { "type": "string", "enum": ["etag", "last_modified", "content_hash"], "default": "etag", "description": "How discover() decides the file is unchanged (doc 18 §2.1 bulk): conditional ETag/Last-Modified header, or a content hash compared to the stored marker." }
           }
+        },
+        "socrata": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Socrata SODA open-data API (doc 18 §1 cat. E, §5 wave 2). One connector covers hundreds of city/state portals; this block selects a tenant + dataset. discover() pages the SODA endpoint and emits one pointer per row, projected to an HTML <dl> the recipe's `fields` extract with `dd[data-key='<column>']`.",
+          "required": ["domain", "dataset_id"],
+          "properties": {
+            "domain": { "type": "string", "description": "Portal domain or full base URL, e.g. `data.cityofnewyork.us` or `https://data.colorado.gov`." },
+            "dataset_id": { "type": "string", "description": "Socrata 4x4 resource id (the dataset behind /resource/<id>.json)." },
+            "where": { "type": "string", "description": "Optional SoQL $where clause (e.g. `posted_date > '2025-01-01'`)." },
+            "order": { "type": "string", "description": "Optional SoQL $order clause for deterministic paging." },
+            "select": { "type": "string", "description": "Optional SoQL $select projection." },
+            "page_size": { "type": "integer", "minimum": 1, "default": 100, "description": "$limit per page." },
+            "max_pages": { "type": "integer", "minimum": 1, "default": 50, "description": "Safety cap on pages walked per run." },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." },
+            "app_token": { "type": "string", "description": "Socrata app token, literal or `env:NAME` (optional; lifts the anonymous rate limit). Sent as the X-App-Token header." }
+          }
+        },
+        "ckan": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "CKAN open-data catalog API (doc 18 §1 cat. E, §5 wave 2). One connector covers Data.gov + many state/city catalogs; this block selects a tenant + datastore resource. discover() pages /api/3/action/datastore_search and emits one pointer per record, projected to an HTML <dl> the recipe's `fields` extract with `dd[data-key='<field>']`.",
+          "required": ["domain", "resource_id"],
+          "properties": {
+            "domain": { "type": "string", "description": "Catalog domain or full base URL, e.g. `catalog.data.gov` or `https://data.wa.gov`." },
+            "resource_id": { "type": "string", "description": "CKAN datastore resource id." },
+            "q": { "type": "string", "description": "Optional full-text filter passed to datastore_search `q`." },
+            "filters": { "type": "object", "description": "Optional CKAN `filters` object (field -> value), serialized to JSON.", "additionalProperties": true },
+            "page_size": { "type": "integer", "minimum": 1, "default": 100, "description": "`limit` per page." },
+            "max_pages": { "type": "integer", "minimum": 1, "default": 50, "description": "Safety cap on pages walked per run." },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." },
+            "api_key": { "type": "string", "description": "CKAN API key for private datasets, literal or `env:NAME`. Sent as the Authorization header." }
+          }
+        },
+        "arcgis_rest": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Esri ArcGIS REST query API (doc 18 §1 cat. E, §5 wave 2). One connector covers Esri-hosted GIS/tabular layers; this block selects a layer. discover() pages the layer /query endpoint and emits one pointer per feature (attributes flattened), projected to an HTML <dl> the recipe's `fields` extract with `dd[data-key='<field>']`.",
+          "required": ["layer_url"],
+          "properties": {
+            "layer_url": { "type": "string", "description": "Layer endpoint, e.g. `https://services.arcgis.com/.../FeatureServer/0` (the connector appends /query)." },
+            "where": { "type": "string", "default": "1=1", "description": "SQL-style where clause; `1=1` fetches all rows." },
+            "out_fields": { "type": "string", "default": "*", "description": "Comma-separated outFields; `*` returns all attributes." },
+            "page_size": { "type": "integer", "minimum": 1, "default": 100, "description": "resultRecordCount per page." },
+            "max_pages": { "type": "integer", "minimum": 1, "default": 50, "description": "Safety cap on pages walked per run." },
+            "include_geometry": { "type": "boolean", "default": false, "description": "Keep each feature's geometry (returnGeometry); off by default — we want the tabular attributes." },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." },
+            "token": { "type": "string", "description": "Token for secured ArcGIS services, literal or `env:NAME`. Sent as the `token` query param." }
+          }
+        },
+        "boarddocs": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "BoardDocs (Diligent) meeting platform (doc 18 §1 cat. E, §5 wave 2). One connector covers ~10,000 K-12/community-college boards via the per-tenant subdomain pattern. discover() crawls the tenant's meeting index and emits one pointer per meeting detail page for the runner to fetch + extract.",
+          "properties": {
+            "base_url": { "type": "string", "description": "Full tenant base URL (overrides state+subdomain), e.g. `https://go.boarddocs.com/wa/spsk12`." },
+            "state": { "type": "string", "description": "Two-letter state segment of the BoardDocs URL (e.g. `wa`). Used with `subdomain`." },
+            "subdomain": { "type": "string", "description": "Tenant subdomain segment of the BoardDocs URL (e.g. `spsk12`). Used with `state`." },
+            "meeting_path": { "type": "string", "default": "Board.nsf/Public", "description": "Index path appended to the tenant base when crawling for meeting links." }
+          }
+        },
+        "granicus_peak": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Granicus PEAK meeting platform (doc 18 §1 cat. E, §5 wave 2). One connector covers 7,000+ government orgs via the per-tenant subdomain pattern. discover() crawls the tenant's PEAK meeting archive and emits one pointer per meeting/agenda detail page.",
+          "properties": {
+            "base_url": { "type": "string", "description": "Full tenant base URL (overrides subdomain), e.g. `https://seattle.granicus.com`." },
+            "subdomain": { "type": "string", "description": "Tenant subdomain of `<subdomain>.granicus.com`." },
+            "view_id": { "type": "integer", "description": "PEAK ViewPublisher view_id for the meeting archive (optional)." },
+            "meeting_path": { "type": "string", "default": "ViewPublisher.php", "description": "Archive path appended to the tenant base when crawling for meeting links." }
+          }
+        },
+        "civicplus": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "CivicPlus / CivicClerk municipal platform (doc 18 §1 cat. E, §5 wave 2). One connector covers 2,500+ local governments. discover() crawls the tenant's meeting/agenda index and emits one pointer per detail page. A tenant whose list renders only client-side is a per-recipe http_browser (D9) decision, noted in legal_notes — not handled here.",
+          "properties": {
+            "base_url": { "type": "string", "description": "Full tenant base URL (overrides subdomain+platform), e.g. `https://townofx.civicweb.net`." },
+            "subdomain": { "type": "string", "description": "Tenant subdomain. Used with `platform`." },
+            "platform": { "type": "string", "enum": ["civicweb", "civicplus", "civicclerk"], "default": "civicweb", "description": "Which CivicPlus host family the tenant uses." },
+            "meeting_path": { "type": "string", "default": "Portal/MeetingTypeList.aspx", "description": "Index path appended to the tenant base when crawling for meeting links." }
+          }
         }
       }
     },
