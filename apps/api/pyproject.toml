@@ -36,6 +36,8 @@ dependencies = [
     # them and the Docker images install with `uv sync --no-dev` (no extras).
     "jsonschema>=4.23",
     "beautifulsoup4>=4.12",
+    # Stripe billing SDK (N1). Version pinned to major for API stability.
+    "stripe>=11.0",
     # Observability (A6). All three are config-gated: Sentry is a no-op when
     # SENTRY_DSN is unset; OTel is a no-op when OTEL_EXPORTER_OTLP_ENDPOINT is
     # unset; prometheus-client exposes /metrics (always on, no external account
@@ -84,6 +86,9 @@ dev = [
     # In-memory S3 mock for the raw-document storage tests (D3) so no real
     # network/MinIO is needed; pinned to the s3 extra to keep the install slim.
     "moto[s3]>=5.0",
+    # In-memory SQLite backend for billing unit tests (N1); avoids needing
+    # Postgres for tests that don't touch CITEXT / pgvector.
+    "aiosqlite>=0.20",
 ]
 
 [build-system]
@@ -156,6 +161,11 @@ module = [
     "opentelemetry.*",
     "starlette_prometheus.*",
 ]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# stripe SDK ships partial/no py.typed; ignore missing stubs (N1).
+module = ["stripe.*"]
 ignore_missing_imports = true
 
 # ----------------------------------------------------------------------------
