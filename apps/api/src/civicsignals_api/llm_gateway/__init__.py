@@ -15,6 +15,7 @@ from functools import lru_cache
 from ..config import Settings, get_settings
 from .accounting import (
     InMemoryTokenAccountant,
+    TaskUsage,
     TokenAccountant,
     UsageCounters,
     estimate_cost_usd,
@@ -31,6 +32,7 @@ from .types import (
     LLMBackend,
     LLMError,
     LLMResult,
+    PermanentLLMError,
     TransientLLMError,
 )
 
@@ -51,7 +53,9 @@ __all__ = [
     "ModelChoice",
     "OllamaBackend",
     "OpenAIBackend",
+    "PermanentLLMError",
     "TaskModelPolicy",
+    "TaskUsage",
     "TokenAccountant",
     "TransientLLMError",
     "UsageCounters",
@@ -72,8 +76,10 @@ def _policy_from_settings(settings: Settings) -> TaskModelPolicy:
         else:
             provider, model = default_provider, raw
         overrides[task] = ModelChoice(provider=provider, model=model)
-    default_choice = DEFAULT_TASK_MODELS.get(TASK_CLASSIFY)
-    return TaskModelPolicy(overrides=overrides, default_choice=default_choice)
+    # default_choice=None lets TaskModelPolicy derive its fallback from the
+    # *merged* models, so an overridden `classify` (or a changed default
+    # provider) also governs unmapped tasks.
+    return TaskModelPolicy(overrides=overrides)
 
 
 def build_gateway(settings: Settings | None = None) -> LLMGateway:

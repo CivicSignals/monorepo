@@ -44,6 +44,14 @@ class TransientLLMError(LLMError):
     """A retryable failure (timeout, 429, 5xx). The gateway retries with backoff."""
 
 
+class PermanentLLMError(LLMError):
+    """A non-retryable provider failure (4xx auth/bad-request, invalid model, …).
+
+    Backends wrap vendor SDK errors in this so the rest of the system never has
+    to import or catch ``anthropic.*`` / ``openai.*`` exception types directly.
+    """
+
+
 class BackendNotAvailableError(LLMError):
     """A backend's vendor SDK is not installed or is misconfigured.
 

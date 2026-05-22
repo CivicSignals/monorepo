@@ -64,8 +64,16 @@ class TaskModelPolicy:
 
         Explicit ``provider``/``model`` arguments win over the policy so callers
         can force a specific model (e.g. doc 19's confidence-driven escalation
-        from Haiku to Sonnet) without editing the policy table.
+        from Haiku to Sonnet) without editing the policy table. They must be
+        supplied together: overriding only ``provider`` would pair it with the
+        base task's model (typically from another vendor), so we reject that
+        rather than route an invalid provider/model combination.
         """
+        if (provider is None) != (model is None):
+            raise ValueError(
+                "provider and model overrides must be supplied together "
+                f"(got provider={provider!r}, model={model!r})"
+            )
         base = self._models.get(task, self._default)
         return ModelChoice(
             provider=provider or base.provider,

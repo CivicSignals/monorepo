@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 # USD per 1K tokens, keyed by model id. Coarse defaults for cost estimation;
@@ -50,6 +50,16 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
 
 
 @dataclass
+class TaskUsage:
+    """Per-task usage breakdown. Token/call counts are ints; cost is USD."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    calls: int = 0
+
+
+@dataclass
 class UsageCounters:
     """Accumulated usage for a single workspace."""
 
@@ -57,8 +67,8 @@ class UsageCounters:
     output_tokens: int = 0
     cost_usd: float = 0.0
     calls: int = 0
-    # Per-task breakdown, e.g. {"classify": {"input_tokens": ..., ...}}.
-    by_task: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Per-task breakdown, e.g. {"classify": TaskUsage(...)}.
+    by_task: dict[str, TaskUsage] = field(default_factory=dict)
 
     @property
     def total_tokens(self) -> int:
@@ -105,13 +115,11 @@ class InMemoryTokenAccountant:
             counters.output_tokens += output_tokens
             counters.cost_usd += cost_usd
             counters.calls += 1
-            task_counters = counters.by_task.setdefault(
-                task, {"input_tokens": 0.0, "output_tokens": 0.0, "cost_usd": 0.0, "calls": 0.0}
-            )
-            task_counters["input_tokens"] += input_tokens
-            task_counters["output_tokens"] += output_tokens
-            task_counters["cost_usd"] += cost_usd
-            task_counters["calls"] += 1
+            task_counters = counters.by_task.setdefault(task, TaskUsage())
+            task_counters.input_tokens += input_tokens
+            task_counters.output_tokens += output_tokens
+            task_counters.cost_usd += cost_usd
+            task_counters.calls += 1
 
     def usage(self, workspace_id: str) -> UsageCounters:
         with self._lock:
@@ -122,7 +130,7 @@ class InMemoryTokenAccountant:
                 output_tokens=counters.output_tokens,
                 cost_usd=counters.cost_usd,
                 calls=counters.calls,
-                by_task={task: dict(stats) for task, stats in counters.by_task.items()},
+                by_task={task: replace(stats) for task, stats in counters.by_task.items()},
             )
 
     def reset(self, workspace_id: str | None = None) -> None:

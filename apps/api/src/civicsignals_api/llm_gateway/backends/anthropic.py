@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING, Any
 
 from ..types import (
     BackendNotAvailableError,
+    LLMError,
     LLMResult,
+    PermanentLLMError,
     TransientLLMError,
 )
 
@@ -85,11 +87,14 @@ class AnthropicBackend:
         )
 
 
-def _normalize_error(exc: Exception) -> Exception:
+def _normalize_error(exc: Exception) -> LLMError:
     """Map anthropic SDK errors to the gateway taxonomy.
 
-    Rate limits, timeouts, connection errors, and 5xx are retryable. Inspected
-    by class name to avoid importing the SDK's error types eagerly.
+    Rate limits, timeouts, connection errors, and 5xx become
+    :class:`TransientLLMError` (retried); everything else becomes
+    :class:`PermanentLLMError`. Either way the vendor exception type never
+    crosses the gateway boundary. Inspected by class name to avoid importing the
+    SDK's error types eagerly.
     """
     name = type(exc).__name__
     status = getattr(exc, "status_code", None)
@@ -104,4 +109,4 @@ def _normalize_error(exc: Exception) -> Exception:
     }
     if name in transient_names or (isinstance(status, int) and (status == 429 or status >= 500)):
         return TransientLLMError(f"anthropic transient error: {name}: {exc}")
-    return exc
+    return PermanentLLMError(f"anthropic error: {name}: {exc}")

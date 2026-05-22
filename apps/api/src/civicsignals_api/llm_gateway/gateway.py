@@ -54,6 +54,8 @@ class LLMGateway:
         accountant: TokenAccountant | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     ) -> None:
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         self._backends = backends
         self._policy = policy or TaskModelPolicy()
         self._accountant: TokenAccountant = accountant or InMemoryTokenAccountant()

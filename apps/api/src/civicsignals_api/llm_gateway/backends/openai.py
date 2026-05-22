@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING, Any
 
 from ..types import (
     BackendNotAvailableError,
+    LLMError,
     LLMResult,
+    PermanentLLMError,
     TransientLLMError,
 )
 
@@ -82,7 +84,7 @@ class OpenAIBackend:
         )
 
 
-def _normalize_error(exc: Exception) -> Exception:
+def _normalize_error(exc: Exception) -> LLMError:
     """Map openai SDK errors to the gateway taxonomy (see anthropic backend)."""
     name = type(exc).__name__
     status = getattr(exc, "status_code", None)
@@ -95,4 +97,4 @@ def _normalize_error(exc: Exception) -> Exception:
     }
     if name in transient_names or (isinstance(status, int) and (status == 429 or status >= 500)):
         return TransientLLMError(f"openai transient error: {name}: {exc}")
-    return exc
+    return PermanentLLMError(f"openai error: {name}: {exc}")

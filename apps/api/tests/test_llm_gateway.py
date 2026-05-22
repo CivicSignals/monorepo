@@ -24,7 +24,7 @@ from civicsignals_api.llm_gateway import (
     build_gateway,
     estimate_cost_usd,
 )
-from civicsignals_api.llm_gateway.types import TransientLLMError
+from civicsignals_api.llm_gateway.types import PermanentLLMError, TransientLLMError
 
 
 def _gateway(backend: FakeBackend, **kwargs: object) -> LLMGateway:
@@ -54,11 +54,15 @@ async def test_task_routing_selects_policy_model() -> None:
     assert [c["model"] for c in backend.calls] == ["haiku", "sonnet"]
 
 
-async def test_explicit_model_overrides_policy() -> None:
+async def test_explicit_provider_and_model_override_policy() -> None:
+    # provider+model together force a specific backend+model (doc 19 escalation).
     backend = FakeBackend()
     gw = _gateway(backend)
-    result = await gw.complete(prompt="p", task=TASK_CLASSIFY, model="sonnet-forced")
+    result = await gw.complete(
+        prompt="p", task=TASK_CLASSIFY, provider="fake", model="sonnet-forced"
+    )
     assert result.model == "sonnet-forced"
+    assert result.provider == "fake"
 
 
 async def test_default_task_falls_back_to_default_choice() -> None:
@@ -68,6 +72,31 @@ async def test_default_task_falls_back_to_default_choice() -> None:
     result = await gw.complete(prompt="p", task="unmapped-task")
     assert result.model == "haiku"
     assert result.task == "unmapped-task"
+
+
+async def test_provider_only_override_rejected() -> None:
+    # Overriding provider without model would pair an OpenAI provider with the
+    # base task's Anthropic model — reject rather than route an invalid combo.
+    backend = FakeBackend()
+    gw = _gateway(backend)
+    with pytest.raises(ValueError, match="provider and model overrides"):
+        await gw.complete(prompt="p", task=TASK_CLASSIFY, provider="openai")
+
+
+def test_unmapped_task_follows_overridden_classify() -> None:
+    # An override of `classify` (or the default provider) should also govern
+    # unmapped tasks via build_gateway's policy wiring.
+    settings = Settings(
+        llm_default_provider="ollama",
+        llm_task_models={"classify": "ollama:llama3"},
+    )
+    gw = build_gateway(settings)
+    assert gw._policy.resolve("totally-unknown") == ModelChoice("ollama", "llama3")  # type: ignore[attr-defined]
+
+
+def test_max_attempts_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+        LLMGateway({"fake": FakeBackend()}, max_attempts=0)
 
 
 async def test_unregistered_provider_raises() -> None:
@@ -115,9 +144,11 @@ async def test_token_accounting_accumulates_per_workspace() -> None:
     assert ws1.output_tokens > 0
     assert ws1.total_tokens == ws1.input_tokens + ws1.output_tokens
     assert ws1.cost_usd > 0
-    # Per-task breakdown is tracked.
+    # Per-task breakdown is tracked (int counts, float cost).
     assert set(ws1.by_task) == {TASK_CLASSIFY, TASK_EXTRACTION}
-    assert ws1.by_task[TASK_CLASSIFY]["calls"] == 1
+    assert ws1.by_task[TASK_CLASSIFY].calls == 1
+    assert isinstance(ws1.by_task[TASK_CLASSIFY].input_tokens, int)
+    assert isinstance(ws1.by_task[TASK_CLASSIFY].cost_usd, float)
 
     assert ws2.calls == 1
     # Workspaces are isolated.
@@ -233,6 +264,37 @@ async def test_anthropic_backend_requires_api_key() -> None:
     backend = AnthropicBackend(api_key=None)
     with pytest.raises(BackendNotAvailableError, match="ANTHROPIC_API_KEY"):
         await backend.complete(prompt="p", model="claude", max_tokens=10)
+
+
+# --- error normalization (no vendor exceptions cross the boundary) -------
+
+
+class _FakeStatusError(Exception):
+    """Mimics an SDK error carrying an HTTP status_code attribute."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize("module_name", ["anthropic", "openai"])
+def test_normalize_error_taxonomy(module_name: str) -> None:
+    from importlib import import_module
+
+    normalize = import_module(
+        f"civicsignals_api.llm_gateway.backends.{module_name}"
+    )._normalize_error
+
+    # 5xx and 429 are transient and retryable.
+    assert isinstance(normalize(_FakeStatusError(503)), TransientLLMError)
+    assert isinstance(normalize(_FakeStatusError(429)), TransientLLMError)
+    # 4xx is permanent — and crucially NOT transient (must not be retried).
+    permanent = normalize(_FakeStatusError(400))
+    assert isinstance(permanent, PermanentLLMError)
+    assert not isinstance(permanent, TransientLLMError)
+    assert isinstance(normalize(_FakeStatusError(401)), PermanentLLMError)
+    # An arbitrary non-status error is wrapped as permanent, not leaked raw.
+    assert isinstance(normalize(ValueError("boom")), PermanentLLMError)
 
 
 # --- settings-driven factory --------------------------------------------

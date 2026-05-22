@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from ..types import LLMResult, TransientLLMError
+from ..types import LLMResult, PermanentLLMError, TransientLLMError
 
 
 class OllamaBackend:
@@ -48,7 +48,9 @@ class OllamaBackend:
             status = exc.response.status_code
             if status >= 500 or status == 429:
                 raise TransientLLMError(f"ollama transient error: HTTP {status}") from exc
-            raise
+            # 4xx (bad request, model not found) is permanent; wrap so the raw
+            # httpx error never crosses the gateway boundary.
+            raise PermanentLLMError(f"ollama error: HTTP {status}") from exc
         except httpx.TransportError as exc:
             # TransportError covers timeouts, connection, and protocol errors.
             raise TransientLLMError(f"ollama transport error: {exc}") from exc
