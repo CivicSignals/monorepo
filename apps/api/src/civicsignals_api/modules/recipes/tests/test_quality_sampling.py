@@ -33,6 +33,7 @@ Coverage:
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -183,7 +184,9 @@ def _make_signal(recipe_id: str, *, age_days: float = 1.0, now: datetime = NOW) 
         "content_hash": uuid.uuid4().hex,
         "title": f"Test signal {recipe_id}",
         "summary": "Test summary",
-        "details": {"title": "Test signal", "amount": "50000"},
+        # asyncpg requires JSONB values to be pre-serialized to a JSON string
+        # when passed as raw text() SQL parameters.
+        "details": json.dumps({"title": "Test signal", "amount": "50000"}),
         "status": "new",
         "is_degraded": False,
         "review_required": False,
