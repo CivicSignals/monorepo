@@ -154,17 +154,73 @@ async def test_extract_candidates_unparseable_falls_back() -> None:
     assert candidates[0].fields["raw_output"] == "this is not json at all"
 
 
-# --- score + dedupe (passthrough stubs) -----------------------------------
+# --- score (E6 banded blend) + dedupe --------------------------------------
 
 
-def test_score_candidate_keeps_reported_confidence() -> None:
-    c = CandidateRecord(signal_type="rfp_posted", confidence=0.8)
-    assert pipeline.score_candidate(c).confidence == pytest.approx(0.8)
+def test_score_candidate_blends_and_bands() -> None:
+    # rfp_posted with a plausible due_at, model self-reported 0.8, neutral source
+    # quality, 0/6 optional fields filled, entity unresolved. The blend:
+    #   field_level 0.8*0.40 + llm 0.8*0.20 + source 0.5*0.15 +
+    #   schema_completeness 0.0*0.15 + cross_validation 0.5*0.10 = 0.605
+    # which lands in the degraded band (0.6-0.8, doc 19 §6.3).
+    c = CandidateRecord(
+        signal_type="rfp_posted",
+        confidence=0.8,
+        fields={"title": "ERP RFP", "summary": "x", "due_at": "2026-06-01T17:00:00Z"},
+    )
+    out = pipeline.score_candidate(c)
+    assert out.confidence == pytest.approx(0.605)
+    assert out.band == "degraded"
+    assert pipeline.candidate_is_rejected(out) is False
 
 
-def test_score_candidate_defaults_missing_confidence() -> None:
-    c = CandidateRecord(signal_type="rfp_posted", confidence=None)
-    assert pipeline.score_candidate(c).confidence == pytest.approx(0.5)
+def test_score_candidate_unknown_type_bands_self_report() -> None:
+    # No usable signal type: keep the self-reported confidence and band it (the E4
+    # strict gate rejects it at store regardless).
+    c = CandidateRecord(signal_type=None, confidence=0.9, fields={})
+    out = pipeline.score_candidate(c)
+    assert out.confidence == pytest.approx(0.9)
+    assert out.band == "normal"
+
+
+def test_score_candidate_unknown_type_defaults_neutral() -> None:
+    c = CandidateRecord(signal_type=None, confidence=None, fields={})
+    out = pipeline.score_candidate(c)
+    assert out.confidence == pytest.approx(0.5)
+    assert out.band == "pending_review"  # 0.5 -> pending_review band
+
+
+def test_score_candidate_rejects_low_blend() -> None:
+    # A leadership_change missing all optional fields, no model confidence, entity
+    # unresolved -> a low blend that lands in the rejected band (< 0.4).
+    c = CandidateRecord(
+        signal_type="leadership_change",
+        confidence=0.1,
+        fields={"title": "x", "summary": "y", "role": "CIO", "person_name": "A. Doe"},
+    )
+    out = pipeline.score_candidate(c)
+    assert out.band == "rejected"
+    assert pipeline.candidate_is_rejected(out) is True
+
+
+def test_score_candidate_respects_config_override() -> None:
+    from civicsignals_api.modules.signals.services import (
+        BandThresholds,
+        ConfidenceConfig,
+    )
+
+    c = CandidateRecord(
+        signal_type="rfp_posted",
+        confidence=0.8,
+        fields={"title": "ERP RFP", "summary": "x", "due_at": "2026-06-01T17:00:00Z"},
+    )
+    # A noisy aggregator lowers the floors: the same 0.605 blend is now "normal".
+    cfg = ConfidenceConfig(
+        thresholds=BandThresholds(normal_floor=0.6, degraded_floor=0.4, pending_review_floor=0.2)
+    )
+    out = pipeline.score_candidate(c, config=cfg)
+    assert out.confidence == pytest.approx(0.605)
+    assert out.band == "normal"
 
 
 def test_dedupe_candidate_computes_placeholder_key() -> None:

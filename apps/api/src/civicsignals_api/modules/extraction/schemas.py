@@ -111,8 +111,10 @@ class CandidateRecord(BaseModel):
     Emitted by the extract stage, carried through score/dedupe/store. ``fields`` is
     a free-form dict until E4's strict per-signal-type schema replaces it; nothing
     here is validated as hard as a real signal yet (that is the E4 gate, doc 19
-    §6.1). ``confidence`` is filled by the score stage (E6 stub); ``dedup_key`` by
-    the dedupe stage (E5 stub).
+    §6.1). ``confidence`` + ``band`` are filled by the score stage (E6 blend, doc 19
+    §6.2-§6.3): ``confidence`` is the blended extraction confidence, ``band`` the
+    mapped action band (``rejected`` candidates are dropped before store).
+    ``dedup_key`` is filled by the dedupe stage (E5 stub).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -120,6 +122,10 @@ class CandidateRecord(BaseModel):
     signal_type: str | None = None
     fields: dict[str, object] = Field(default_factory=dict)
     confidence: float | None = None
+    # The E6 confidence band (doc 19 §6.3): "normal" | "degraded" | "pending_review"
+    # | "rejected". Filled by the score stage; carried to the store step which lifts
+    # it onto the ``signals_signal`` row flags. ``None`` until the score stage runs.
+    band: str | None = None
     dedup_key: str | None = None
     extraction_method: str = "llm"
 

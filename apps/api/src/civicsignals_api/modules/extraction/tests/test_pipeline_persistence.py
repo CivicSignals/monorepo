@@ -280,7 +280,12 @@ async def test_pipeline_end_to_end_persists_candidate(
         assert len(candidates) == 1
         assert candidates[0].signal_type == "rfp_posted"
         assert candidates[0].fields["title"] == "ERP RFP"
-        assert candidates[0].confidence == pytest.approx(0.8)
+        # The E6 score stage (doc 19 §6.2) re-derives confidence as the weighted blend
+        # of the five components — not the raw 0.8 the model self-reported. For this
+        # candidate (LLM 0.8, neutral source quality, 0/6 optional fields filled,
+        # cross-validation: due_at plausible but entity unresolved) the blend is 0.605,
+        # which lands in the degraded band (0.6-0.8, doc 19 §6.3).
+        assert candidates[0].confidence == pytest.approx(0.605)
         # The candidate was promoted into a global signal (E4 hard gate passed).
         assert candidates[0].status == "promoted"
 
@@ -296,6 +301,11 @@ async def test_pipeline_end_to_end_persists_candidate(
         assert signals[0].title == "ERP RFP"
         assert signals[0].source_candidate_id == candidates[0].id
         assert str(doc_id) in signals[0].raw_document_ids
+        # The 0.605 blend lands in the degraded band (doc 19 §6.3): the signal carries
+        # the degraded "verify the details" flag; the unresolved entity also holds it
+        # for review (doc 19 §4.3).
+        assert signals[0].is_degraded is True
+        assert signals[0].review_required is True
         # The embed step (I1) populated the pgvector column at extraction time.
         embedding = signals[0].vector_embedding
         assert embedding is not None
