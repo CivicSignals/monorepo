@@ -65,8 +65,33 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
-export function listWorkspaces(token: string): Promise<WorkspacePage> {
-  return request<WorkspacePage>("/workspaces", { token });
+// Server cursor-pagination cap (doc 06 §5; mirrors the API's MAX_LIMIT).
+export const WORKSPACES_PAGE_LIMIT = 100;
+
+export function listWorkspaces(
+  token: string,
+  opts: { cursor?: string; limit?: number } = {},
+): Promise<WorkspacePage> {
+  const params = new URLSearchParams();
+  params.set("limit", String(opts.limit ?? WORKSPACES_PAGE_LIMIT));
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  return request<WorkspacePage>(`/workspaces?${params.toString()}`, { token });
+}
+
+/**
+ * Fetch every workspace the user belongs to by following `next_cursor`.
+ * The switcher needs the complete set (a user may have more than one page),
+ * and the count is small, so eagerly draining the cursor is fine here.
+ */
+export async function listAllWorkspaces(token: string): Promise<Workspace[]> {
+  const all: Workspace[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await listWorkspaces(token, { cursor });
+    all.push(...page.items);
+    cursor = page.next_cursor ?? undefined;
+  } while (cursor);
+  return all;
 }
 
 export interface CreateWorkspaceInput {

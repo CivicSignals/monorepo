@@ -24,7 +24,7 @@ export function WorkspaceSwitcher() {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
 
-  const workspaces = data?.items ?? [];
+  const workspaces = data ?? [];
 
   if (isLoading) {
     return (

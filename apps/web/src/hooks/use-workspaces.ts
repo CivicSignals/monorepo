@@ -13,24 +13,26 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type CreateWorkspaceInput,
   type Workspace,
-  type WorkspacePage,
   createWorkspace as createWorkspaceApi,
-  listWorkspaces as listWorkspacesApi,
+  listAllWorkspaces as listAllWorkspacesApi,
   switchWorkspace as switchWorkspaceApi,
 } from "@/lib/workspaces-api";
 import { useSessionStore } from "@/store/session";
 import { useUiStore } from "@/store/ui";
 
-export const WORKSPACES_QUERY_KEY = ["workspaces"] as const;
+// Query key is scoped by user id so a cached list never bleeds across accounts
+// on the long-lived QueryClient (log out as A, log in as B). When signed out the
+// key has no user segment and the query is disabled.
+export const workspacesQueryKey = (userId: string | undefined) =>
+  ["workspaces", userId ?? "anonymous"] as const;
 
 export function useWorkspaces() {
   const token = useSessionStore((s) => s.accessToken);
-  return useQuery<WorkspacePage>({
-    queryKey: WORKSPACES_QUERY_KEY,
-    queryFn: () =>
-      token
-        ? listWorkspacesApi(token)
-        : Promise.resolve({ items: [], next_cursor: null }),
+  const userId = useSessionStore((s) => s.user?.id);
+  return useQuery<Workspace[]>({
+    queryKey: workspacesQueryKey(userId),
+    // Drain the cursor so the switcher sees every workspace, not just page 1.
+    queryFn: () => (token ? listAllWorkspacesApi(token) : Promise.resolve([])),
     enabled: token !== null,
   });
 }
@@ -46,7 +48,7 @@ export function useActiveWorkspace(): Workspace | null {
   const setActiveId = useUiStore((s) => s.setActiveWorkspaceId);
   // Memoize so the array identity is stable across renders (the useEffect below
   // depends on it; an inline `?? []` would re-run the effect every render).
-  const items = useMemo(() => data?.items ?? [], [data]);
+  const items = useMemo(() => data ?? [], [data]);
 
   useEffect(() => {
     if (items.length === 0) return;
@@ -59,6 +61,7 @@ export function useActiveWorkspace(): Workspace | null {
 
 export function useCreateWorkspace() {
   const token = useSessionStore((s) => s.accessToken);
+  const userId = useSessionStore((s) => s.user?.id);
   const setActiveId = useUiStore((s) => s.setActiveWorkspaceId);
   const queryClient = useQueryClient();
 
@@ -70,7 +73,9 @@ export function useCreateWorkspace() {
     onSuccess: (workspace) => {
       // Newly-created workspace becomes the active one.
       setActiveId(workspace.id);
-      void queryClient.invalidateQueries({ queryKey: WORKSPACES_QUERY_KEY });
+      void queryClient.invalidateQueries({
+        queryKey: workspacesQueryKey(userId),
+      });
     },
   });
 }

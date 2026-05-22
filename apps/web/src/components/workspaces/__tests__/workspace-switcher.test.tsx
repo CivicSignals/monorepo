@@ -46,6 +46,12 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+// Match on the URL pathname so query params (?limit=, ?cursor=) don't break
+// routing in the mock.
+function pathOf(input: RequestInfo | URL): string {
+  return new URL(String(input), "http://localhost").pathname;
+}
+
 beforeEach(() => {
   localStorage.clear();
   useSessionStore.setState({ accessToken: "jwt-access", user: null });
@@ -86,12 +92,9 @@ describe("WorkspaceSwitcher", () => {
   it("switches the active workspace via the switch endpoint", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
-      .mockImplementation(async (input, init) => {
-        const url = String(input);
-        if (
-          url.endsWith("/workspaces") &&
-          (!init || init.method === undefined)
-        ) {
+      .mockImplementation(async (input) => {
+        const path = pathOf(input);
+        if (path === "/api/v1/workspaces") {
           return jsonResponse({
             items: [
               makeWorkspace({ id: "ws-1", name: "Acme SLED" }),
@@ -100,7 +103,7 @@ describe("WorkspaceSwitcher", () => {
             next_cursor: null,
           });
         }
-        if (url.includes("/workspaces/ws-2/switch")) {
+        if (path === "/api/v1/workspaces/ws-2/switch") {
           return jsonResponse(makeWorkspace({ id: "ws-2", name: "Beta Team" }));
         }
         return jsonResponse({ items: [], next_cursor: null });
@@ -128,15 +131,12 @@ describe("WorkspaceSwitcher", () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockImplementation(async (input, init) => {
-        const url = String(input);
-        if (url.endsWith("/workspaces") && init?.method === "POST") {
+        const path = pathOf(input);
+        if (path === "/api/v1/workspaces" && init?.method === "POST") {
           return jsonResponse(
             makeWorkspace({ id: "ws-new", name: "Fresh WS", slug: "fresh-ws" }),
             201,
           );
-        }
-        if (url.endsWith("/workspaces")) {
-          return jsonResponse({ items: [], next_cursor: null });
         }
         return jsonResponse({ items: [], next_cursor: null });
       });
@@ -154,7 +154,7 @@ describe("WorkspaceSwitcher", () => {
       expect(useUiStore.getState().activeWorkspaceId).toBe("ws-new"),
     );
     const createCall = fetchSpy.mock.calls.find(
-      (c) => String(c[0]).endsWith("/workspaces") && c[1]?.method === "POST",
+      (c) => pathOf(c[0]) === "/api/v1/workspaces" && c[1]?.method === "POST",
     );
     expect(createCall).toBeDefined();
     expect(String(createCall?.[1]?.body)).toContain("Fresh WS");
