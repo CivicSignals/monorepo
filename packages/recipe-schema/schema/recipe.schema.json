@@ -74,6 +74,95 @@
       "default": "classifier",
       "description": "assume_relevant skips the Stage-2 relevance classifier for pre-vetted sources (doc 19 §3)."
     },
+    "connector_config": {
+      "type": "object",
+      "description": "Per-connector configuration block (doc 18 §1, §5 wave 1, TODO D6). The runner dispatches to the connector named by `connector` and validates this block against that connector's sub-schema. Exactly one sub-key (matching `connector`) is expected; an unknown connector or extra key is rejected so a typo can't silently degrade to no-op.",
+      "additionalProperties": false,
+      "properties": {
+        "http_static": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Generic HTTP fetcher (doc 18 §1 cat. C). Retries/backoff and conditional GET on top of the runner's robots.txt + politeness window.",
+          "properties": {
+            "timeout_seconds": { "type": "number", "minimum": 0, "default": 30 },
+            "max_attempts": { "type": "integer", "minimum": 1, "default": 3, "description": "Total fetch attempts (incl. the first) on transient HTTP 5xx / network errors (doc 18 §4)." },
+            "backoff_seconds": { "type": "number", "minimum": 0, "default": 1, "description": "Base for exponential backoff between retries." },
+            "conditional_get": { "type": "boolean", "default": true, "description": "Send If-None-Match / If-Modified-Since when a prior ETag / Last-Modified is known (doc 18 §2.2 step 3)." }
+          }
+        },
+        "rss": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "RSS/Atom feed connector (doc 18 §1 cat. B). discover() parses the feed and emits one pointer per item.",
+          "properties": {
+            "feed_url": { "type": "string", "description": "Feed URL to discover items from. Defaults to the recipe's seed URL when omitted." },
+            "max_items": { "type": "integer", "minimum": 1, "description": "Cap items discovered per run (newest first)." },
+            "fetch_item_body": { "type": "boolean", "default": true, "description": "Fetch each item's linked article (cat. B). When false, only the feed entry fields are used (doc 18 §4 'Article URLs no longer resolve')." }
+          }
+        },
+        "pdf_extractor": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "PDF text extraction chain (doc 18 §1 cat. F): pdfplumber text → OCR fallback → LLM table extraction. Consumed by other connectors, not scheduled directly.",
+          "properties": {
+            "ocr_fallback": { "type": "boolean", "default": true, "description": "Run OCR when the PDF has no extractable text layer (image-only PDF; doc 18 §4)." },
+            "llm_table_fallback": { "type": "boolean", "default": false, "description": "After text/OCR, ask the LLM gateway to extract tables when they parse poorly (doc 18 §4)." },
+            "max_pages": { "type": "integer", "minimum": 1, "description": "Cap pages extracted (large PDFs)." }
+          }
+        },
+        "rest_api_pager": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "REST/JSON client (doc 18 §1 cat. A) with pagination, auth, and rate limiting.",
+          "required": ["base_url"],
+          "properties": {
+            "base_url": { "type": "string", "description": "API base/endpoint URL." },
+            "pagination": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "How to advance through pages (doc 18 §2.1 REST).",
+              "required": ["mode"],
+              "properties": {
+                "mode": { "type": "string", "enum": ["cursor", "offset", "page"], "description": "cursor: follow a next-cursor token; offset: bump an offset param; page: bump a page-number param." },
+                "items_path": { "type": "string", "default": "items", "description": "Dotted path to the array of records in each response." },
+                "cursor_path": { "type": "string", "description": "Dotted path to the next-cursor token (cursor mode)." },
+                "cursor_param": { "type": "string", "default": "cursor", "description": "Query param carrying the cursor (cursor mode)." },
+                "offset_param": { "type": "string", "default": "offset", "description": "Query param carrying the offset (offset mode)." },
+                "page_param": { "type": "string", "default": "page", "description": "Query param carrying the page number (page mode)." },
+                "limit_param": { "type": "string", "default": "limit", "description": "Query param carrying the page size." },
+                "page_size": { "type": "integer", "minimum": 1, "default": 50 },
+                "start_page": { "type": "integer", "minimum": 0, "default": 1, "description": "First page index (page mode)." },
+                "max_pages": { "type": "integer", "minimum": 1, "default": 100, "description": "Safety cap on pages walked per run." }
+              }
+            },
+            "auth": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Auth applied to every request (doc 18 §2.2 step 2). The secret is the literal value or an `env:NAME` reference resolved from the environment (never the plaintext key in committed YAML).",
+              "required": ["mode"],
+              "properties": {
+                "mode": { "type": "string", "enum": ["none", "api_key", "bearer"], "default": "none" },
+                "header": { "type": "string", "description": "Header name for api_key mode (e.g. X-Api-Key)." },
+                "param": { "type": "string", "description": "Query param name for api_key-in-query." },
+                "value": { "type": "string", "description": "The literal secret, or `env:NAME` to read it from the environment at run time." }
+              }
+            },
+            "rate_limit_per_minute": { "type": "integer", "minimum": 1, "description": "Client-side cap on requests/minute (doc 18 §4 'HTTP 429')." }
+          }
+        },
+        "bulk_download": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Periodic file fetch (doc 18 §1 cat. G) with per-file checkpointing so re-runs only process new data.",
+          "required": ["file_url"],
+          "properties": {
+            "file_url": { "type": "string", "description": "URL of the periodic dump (CSV/JSON/zip)." },
+            "format": { "type": "string", "enum": ["csv", "json", "zip"], "description": "File format hint; inferred from the URL/Content-Type when omitted." },
+            "checkpoint_strategy": { "type": "string", "enum": ["etag", "last_modified", "content_hash"], "default": "etag", "description": "How discover() decides the file is unchanged (doc 18 §2.1 bulk): conditional ETag/Last-Modified header, or a content hash compared to the stored marker." }
+          }
+        }
+      }
+    },
     "fields": {
       "type": "object",
       "description": "Field extraction map. Each field lists ordered selectors (primary → fallbacks) per doc 18 §3.4. The runner tries each selector in order, then (when `llm_assisted` is set) an LLM-assisted pass, then dead-letters. A non-primary win flags the document `degraded: true`.",

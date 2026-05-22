@@ -763,8 +763,20 @@ class RecipeRunner:
     # -- full lifecycle -----------------------------------------------------
     def run(self, seed_urls: Sequence[str]) -> list[CanonicalRecord]:
         """Run the whole lifecycle for the given seed URLs."""
+        return self.run_pointers(self.discover(seed_urls))
+
+    def run_pointers(self, pointers: Sequence[SourcePointer]) -> list[CanonicalRecord]:
+        """Run ``fetch -> extract -> normalize`` over already-discovered pointers.
+
+        The discover step is connector-specific (a feed expands to per-item
+        pointers, a paginated API to per-page pointers, …): the ingestion module
+        runs the selected connector's :meth:`discover` (D6) and feeds the result
+        here, so the runner still owns fetch (robots + politeness + version
+        pinning) and the extract fallback chain uniformly. ``run`` is the
+        seed-URL convenience that uses the runner's own pass-through discover.
+        """
         records: list[CanonicalRecord] = []
-        for pointer in self.discover(seed_urls):
+        for pointer in pointers:
             raw = self.fetch(pointer)
             extracted = self.extract(raw)
             records.extend(self.normalize(extracted, pointer.url))
