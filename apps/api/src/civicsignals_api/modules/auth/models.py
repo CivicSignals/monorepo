@@ -30,7 +30,7 @@ from civicsignals_api.ids import uuid7
 
 
 class OAuthIdentity(Base):
-    """A OAuth provider identity linked to a :class:`~accounts.models.User` (B2).
+    """An OAuth provider identity linked to a :class:`~accounts.models.User` (B2).
 
     Stores a ``(provider, subject)`` pair uniquely — e.g. ``("google",
     "<google-sub>")`` — so the same Google account cannot be linked to two

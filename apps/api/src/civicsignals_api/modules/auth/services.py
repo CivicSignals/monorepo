@@ -15,7 +15,7 @@ RBAC), so the public surface is intentionally small and stable:
 - ``create_password_reset_token`` / ``consume_password_reset_token`` — B3 reset
   flow. Token is single-use, hashed at rest, and expires after a configurable TTL.
 - ``google_oauth_start`` / ``google_oauth_callback`` — B2 Google OAuth2
-  authorization-code flow with PKCE + signed-state.
+  authorization-code flow with signed-state (HMAC-SHA256 nonce).
 
 Cross-module rules: user identity is owned by ``accounts`` and reached only via
 ``accounts.services``; verification mail goes out via ``notifications.services``.
@@ -31,6 +31,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from urllib.parse import urlencode
 from uuid import UUID
 
 import httpx
@@ -687,8 +688,6 @@ class OAuthProviderError(OAuthError):
 
 # Google OAuth2 scopes — openid + email is the minimum to get a verified email.
 _GOOGLE_SCOPES = "openid email profile"
-# Length of the random PKCE code verifier (43-128 chars per RFC 7636).
-_PKCE_VERIFIER_BYTES = 32
 # Length of the random state nonce.
 _STATE_NONCE_BYTES = 16
 # HMAC algorithm for the state signature.
@@ -720,13 +719,25 @@ def _verify_state(state_token: str, settings: Settings) -> bool:
 
 
 def _derive_redirect_uri(settings: Settings) -> str:
-    """Return the OAuth redirect URI (override > derived from web_base_url)."""
+    """Return the OAuth redirect URI (override > derived from api_base_url).
+
+    The redirect URI must point to the *API* callback endpoint
+    ``/api/v1/auth/oauth/google/callback`` so Google sends the authorization
+    code directly to the server. The server then issues the JWT and redirects
+    the browser to the web app. Use ``google_oauth_redirect_uri`` to override
+    when a reverse-proxy changes the apparent host.
+
+    ``web_base_url`` is the web app origin; ``api_v1_prefix`` is ``/api/v1``.
+    We reconstruct the API origin from ``web_base_url`` by default, but the
+    most reliable approach is to set ``GOOGLE_OAUTH_REDIRECT_URI`` explicitly
+    in production.
+    """
     if settings.google_oauth_redirect_uri:
         return settings.google_oauth_redirect_uri
-    # The callback lives on the web app, not the API, so it round-trips through
-    # the browser. The web app hits /auth/oauth/google/callback on the API.
-    # Convention: web app calls the API callback endpoint directly.
-    return f"{settings.web_base_url}/auth/callback/google"
+    # Derive the API base from the web base URL by replacing the port / path.
+    # Default local: web=http://localhost:3000 → api=http://localhost:8000/api/v1
+    # This default is only used in dev; production always sets the override.
+    return f"http://localhost:8000{settings.api_v1_prefix}/auth/oauth/google/callback"
 
 
 @dataclass(frozen=True)
@@ -742,8 +753,8 @@ def google_oauth_start(settings: Settings | None = None) -> GoogleOAuthStartResu
 
     No DB access required. Returns the URL to redirect the browser to plus the
     state token (the route embeds it in the redirect response so the callback
-    can verify it; the client does not need to store it separately because we
-    embed it in the URL itself for the PKCE-less variant, or sign it here).
+    can verify it without server-side session storage — the HMAC signature
+    makes the state self-verifying).
 
     Raises :class:`OAuthProviderError` when ``GOOGLE_OAUTH_CLIENT_ID`` is not
     configured (fail-closed: the endpoint is mounted but returns a clear error
@@ -758,18 +769,22 @@ def google_oauth_start(settings: Settings | None = None) -> GoogleOAuthStartResu
     state = _sign_state(nonce, settings)
     redirect_uri = _derive_redirect_uri(settings)
 
-    params = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": _GOOGLE_SCOPES,
-        "state": state,
-        "access_type": "offline",
-        "prompt": "select_account",
-    }
-    query = "&".join(f"{k}={v}" for k, v in params.items())
+    # urlencode properly percent-encodes all values (scope has spaces,
+    # redirect_uri has colons / slashes — manual concatenation would produce an
+    # invalid Location header that breaks some browsers and proxies).
+    params = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": _GOOGLE_SCOPES,
+            "state": state,
+            "access_type": "offline",
+            "prompt": "select_account",
+        }
+    )
     return GoogleOAuthStartResult(
-        authorization_url=f"https://accounts.google.com/o/oauth2/v2/auth?{query}",
+        authorization_url=f"https://accounts.google.com/o/oauth2/v2/auth?{params}",
         state=state,
     )
 
@@ -790,7 +805,15 @@ async def _exchange_code_for_tokens(
 
     Returns the raw token response dict. ``http_post`` is injectable so tests
     can supply a mock without live Google calls.
+
+    Raises :class:`OAuthProviderError` when ``GOOGLE_OAUTH_CLIENT_SECRET`` is not
+    configured (the exchange would fail at Google with a cryptic error otherwise).
     """
+    client_secret = settings.google_oauth_client_secret
+    if not client_secret:
+        raise OAuthProviderError(
+            "Google OAuth is not configured (GOOGLE_OAUTH_CLIENT_SECRET missing)"
+        )
     redirect_uri = _derive_redirect_uri(settings)
 
     if http_post is not None:
@@ -799,7 +822,7 @@ async def _exchange_code_for_tokens(
             data={
                 "code": code,
                 "client_id": settings.google_oauth_client_id,
-                "client_secret": settings.google_oauth_client_secret,
+                "client_secret": client_secret,
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
             },
@@ -811,7 +834,7 @@ async def _exchange_code_for_tokens(
             data={
                 "code": code,
                 "client_id": settings.google_oauth_client_id,
-                "client_secret": settings.google_oauth_client_secret,
+                "client_secret": client_secret,
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
             },

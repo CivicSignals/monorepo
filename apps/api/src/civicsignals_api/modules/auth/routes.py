@@ -15,6 +15,7 @@ reusable ``get_current_user`` dependency guards ``/me``.
 from __future__ import annotations
 
 from typing import Annotated
+from urllib.parse import urlencode
 from uuid import UUID
 
 import structlog
@@ -489,8 +490,9 @@ async def google_oauth_start(settings: SettingsDep) -> RedirectResponse:
 async def google_oauth_callback(
     session: SessionDep,
     settings: SettingsDep,
-    code: str = Query(..., description="Authorization code from Google"),
-    state: str = Query(..., description="State nonce returned by Google"),
+    code: str | None = Query(default=None, description="Authorization code from Google"),
+    state: str | None = Query(default=None, description="State nonce returned by Google"),
+    error: str | None = Query(default=None, description="Error code from Google (user cancelled)"),
 ) -> RedirectResponse:
     """Complete the Google OAuth2 flow: exchange code, link/create user, issue JWT.
 
@@ -498,16 +500,24 @@ async def google_oauth_callback(
     so the web app can store the token client-side without it appearing in the
     server logs (token in URL fragment, not query string).
 
-    On error redirects to ``{web_base_url}/login?error=<code>`` so the user
-    sees a readable message in the browser (not a raw API error page).
+    On error (including user-cancelled consent, where Google redirects back with
+    ``?error=access_denied`` and no ``code``) redirects to
+    ``{web_base_url}/login?error=<code>`` so the user sees a readable message
+    in the browser (not a raw API 422 response).
     """
 
     def _error_redirect(code_str: str, detail: str) -> RedirectResponse:
-        from urllib.parse import urlencode
-
         params = urlencode({"error": code_str, "detail": detail})
         url = f"{settings.web_base_url}/login?{params}"
         return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
+
+    # Handle the case where Google redirects back with an error (e.g. user
+    # cancelled consent) — no ``code`` is present in that case.
+    if error or not code or not state:
+        detail = error or "missing_code"
+        return _error_redirect(
+            "oauth_denied", f"Google sign-in was denied or cancelled ({detail})."
+        )
 
     try:
         result = await auth_services.google_oauth_callback(
@@ -551,7 +561,15 @@ async def google_oauth_callback(
     pair = _token_pair(result.user.id, settings)
     # Redirect to the web app callback page with the token in the URL fragment
     # (not query string) so it doesn't appear in server logs or Referer headers.
-    fragment = f"access_token={pair.access_token}&refresh_token={pair.refresh_token}&expires_in={pair.expires_in}&token_type=bearer"
+    # urlencode ensures special characters in token values are percent-encoded.
+    fragment = urlencode(
+        {
+            "access_token": pair.access_token,
+            "refresh_token": pair.refresh_token,
+            "expires_in": pair.expires_in,
+            "token_type": "bearer",
+        }
+    )
     url = f"{settings.web_base_url}/auth/callback/google#{fragment}"
     return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
 

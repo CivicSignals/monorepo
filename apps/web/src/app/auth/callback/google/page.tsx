@@ -27,6 +27,10 @@ export default function GoogleCallbackPage() {
   useEffect(() => {
     // Fragment is only available in the browser (not during SSR).
     const fragment = window.location.hash.slice(1); // drop leading '#'
+    // Immediately clear the fragment from browser history so the token
+    // doesn't linger in the address bar or browser history entries.
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+
     if (!fragment) {
       setError("No token received from Google sign-in.");
       return;
