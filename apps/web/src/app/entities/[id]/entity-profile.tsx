@@ -1,14 +1,16 @@
-// EntityProfile — client island for the /entities/[id] profile page (C3).
+// EntityProfile — client island for the /entities/[id] profile page (C3/C4).
 //
-// Shows: name, kind, geo, hierarchy (parent + children), key stats, source URLs.
-// Contacts are C4 — a placeholder section with a TODO is included.
+// Shows: name, kind, geo, hierarchy (parent + children), key stats, source URLs,
+// and a Contacts section (C4) with verified/stale badge and load-more pagination.
 // Children are loaded via useEntityChildren (infinite query, cursor-paginated).
+// Contacts are loaded via ContactList (useEntityContacts, cursor-paginated).
 
 "use client";
 
 import Link from "next/link";
 import { useEntity, useEntityChildren } from "@/hooks/use-entities";
 import { EntityCard } from "@/components/entities/entity-card";
+import { ContactList } from "@/components/contacts/contact-list";
 import { ProblemError } from "@/lib/auth-api";
 
 /** Capitalise a slug/type string for display. */
@@ -304,16 +306,12 @@ export function EntityProfile({ id }: EntityProfileProps) {
         </section>
       )}
 
-      {/* Contacts — TODO C4 */}
+      {/* Contacts (C4) — verified/stale indicator + cursor-paginated list */}
       <section aria-labelledby="contacts-heading">
         <h2 id="contacts-heading" className="mb-3 text-xl font-semibold">
           Contacts
         </h2>
-        {/* TODO C4 — contact directory within an entity.
-            Wire up GET /api/v1/entities/{id}/contacts when C4 ships. */}
-        <p className="text-sm text-muted-foreground italic">
-          Contact information will be available in a future release.
-        </p>
+        <ContactList entityId={id} />
       </section>
     </div>
   );
