@@ -21,9 +21,19 @@ K2 adds the Salesforce field-mapping surface (admin, same workspace scoping):
 - ``DELETE .../connections/{id}/field-mappings/{target_object}`` — delete a mapping.
 - ``POST .../connections/{id}/push`` — push a signal/pipeline-item to the provider.
 
-Errors are RFC 7807 ``application/problem+json``. Connections are workspace-
-scoped (``RequireAdmin`` resolves + role-gates the active workspace). Token
-material is never returned and never logged.
+L3 — Outbound webhook subscriber management (doc 08 §3.6 / §1.10):
+
+- ``GET  /integrations/webhooks``             — list subscriptions (admin).
+- ``POST /integrations/webhooks``             — create subscription; secret shown ONCE.
+- ``GET  /integrations/webhooks/{id}``        — get one subscription (admin).
+- ``PATCH /integrations/webhooks/{id}``       — update URL / events / active (admin).
+- ``DELETE /integrations/webhooks/{id}``      — delete subscription (admin).
+- ``GET  /integrations/webhooks/{id}/deliveries`` — delivery log for one subscription (admin).
+- ``POST /integrations/webhooks/{id}/ping``   — test-ping the subscriber URL (admin).
+
+Errors are RFC 7807 ``application/problem+json``. Connections and webhook endpoints are
+workspace-scoped (``RequireAdmin`` resolves + role-gates the active workspace). Token
+material and HMAC secrets are never returned after create, never logged.
 """
 
 from __future__ import annotations
@@ -61,6 +71,13 @@ from .schemas import (
     PushLogPageOut,
     PushOut,
     PushRequestIn,
+    WebhookDeliveryOut,
+    WebhookDeliveryPageOut,
+    WebhookSubscriptionCreate,
+    WebhookSubscriptionCreated,
+    WebhookSubscriptionList,
+    WebhookSubscriptionOut,
+    WebhookSubscriptionUpdate,
 )
 
 logger = structlog.get_logger(__name__)
@@ -585,3 +602,283 @@ async def list_push_log(
         data=[PushLogOut.from_orm_log(log) for log in page.items],
         next_cursor=page.next_cursor,
     )
+
+
+# ---------------------------------------------------------------------------
+# L3: Webhook subscriber CRUD + delivery log + test-ping
+# ---------------------------------------------------------------------------
+
+
+def _webhook_not_found() -> ProblemException:
+    return ProblemException(
+        status=status.HTTP_404_NOT_FOUND,
+        code="not_found",
+        title="Webhook subscription not found",
+        detail="No such webhook subscription in this workspace.",
+    )
+
+
+def _webhook_event_invalid(detail: str) -> ProblemException:
+    return ProblemException(
+        status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        code="validation",
+        title="Validation failed",
+        detail=detail,
+    )
+
+
+@router.get(
+    "/webhooks",
+    response_model=WebhookSubscriptionList,
+    summary="List webhook subscriptions for the active workspace (admin only)",
+)
+async def list_webhooks(ctx: RequireAdmin, session: SessionDep) -> WebhookSubscriptionList:
+    """List webhook subscriptions — secrets are never included (L3)."""
+    subs = await services.list_webhook_subscriptions(session, ctx.workspace_id)
+    return WebhookSubscriptionList(data=[WebhookSubscriptionOut.from_orm(s) for s in subs])
+
+
+@router.post(
+    "/webhooks",
+    response_model=WebhookSubscriptionCreated,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a webhook subscription — secret shown ONCE (admin only, L3)",
+)
+async def create_webhook(
+    body: WebhookSubscriptionCreate,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    settings: SettingsDep,
+    response: Response,
+) -> WebhookSubscriptionCreated:
+    """Create a webhook subscription.
+
+    The HMAC secret (``whsec_...``) is returned **once** in the response. It is
+    stored encrypted at rest and cannot be recovered via the API. If lost, the
+    admin must delete and recreate the subscription.
+
+    Returns ``409`` when a subscription with the same URL already exists in this
+    workspace. Returns ``422`` for unknown event types.
+    """
+    # Validate event types before touching the DB.
+    try:
+        validated_events = body.validated_events()
+    except ValueError as exc:
+        raise _webhook_event_invalid(str(exc)) from exc
+
+    sub, plaintext_secret = await services.create_webhook_subscription(
+        session,
+        workspace_id=ctx.workspace_id,
+        url=str(body.url),
+        subscribed_events=validated_events,
+        description=body.description,
+        created_by_user_id=ctx.user.id,
+        settings=settings,
+    )
+    await session.commit()
+    await session.refresh(sub)
+
+    try:
+        await events.publish(
+            events.INTEGRATION_CONNECTION_CREATED,
+            {
+                "user_id": str(ctx.user.id),
+                "workspace_id": str(ctx.workspace_id),
+                "subscription_id": str(sub.id),
+                "kind": "webhook",
+            },
+        )
+    except Exception:
+        logger.warning("webhook_subscription_created_event_failed")
+
+    response.headers["Location"] = f"/api/v1/integrations/webhooks/{sub.id}"
+    return WebhookSubscriptionCreated(
+        id=sub.id,
+        url=sub.url,
+        secret=plaintext_secret,
+        events=sub.subscribed_events,
+        active=sub.active,
+        description=sub.description,
+        created_at=sub.created_at,
+    )
+
+
+@router.get(
+    "/webhooks/{subscription_id}",
+    response_model=WebhookSubscriptionOut,
+    summary="Get a single webhook subscription (admin only, L3)",
+)
+async def get_webhook(
+    subscription_id: uuid.UUID, ctx: RequireAdmin, session: SessionDep
+) -> WebhookSubscriptionOut:
+    """Return one webhook subscription (secret never included)."""
+    sub = await services.get_webhook_subscription(session, ctx.workspace_id, subscription_id)
+    if sub is None:
+        raise _webhook_not_found()
+    return WebhookSubscriptionOut.from_orm(sub)
+
+
+@router.patch(
+    "/webhooks/{subscription_id}",
+    response_model=WebhookSubscriptionOut,
+    summary="Update a webhook subscription (admin only, L3)",
+)
+async def update_webhook(
+    subscription_id: uuid.UUID,
+    body: WebhookSubscriptionUpdate,
+    ctx: RequireAdmin,
+    session: SessionDep,
+) -> WebhookSubscriptionOut:
+    """Partially update a webhook subscription (URL, events, active, description).
+
+    Returns ``404`` if not found in this workspace. Returns ``422`` for unknown
+    event types. Secrets cannot be rotated here — delete and recreate.
+    """
+    sub = await services.get_webhook_subscription(session, ctx.workspace_id, subscription_id)
+    if sub is None:
+        raise _webhook_not_found()
+
+    # Validate events before touching the DB.
+    validated_events: list[str] | None = None
+    try:
+        validated_events = body.validated_events()
+    except ValueError as exc:
+        raise _webhook_event_invalid(str(exc)) from exc
+
+    await services.update_webhook_subscription(
+        session,
+        sub,
+        url=str(body.url) if body.url is not None else None,
+        subscribed_events=validated_events,
+        active=body.active,
+        description=body.description,
+    )
+    await session.commit()
+    await session.refresh(sub)
+    return WebhookSubscriptionOut.from_orm(sub)
+
+
+@router.delete(
+    "/webhooks/{subscription_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a webhook subscription (admin only, L3)",
+)
+async def delete_webhook(
+    subscription_id: uuid.UUID, ctx: RequireAdmin, session: SessionDep
+) -> Response:
+    """Hard-delete a webhook subscription. Delivery rows cascade-delete."""
+    sub = await services.get_webhook_subscription(session, ctx.workspace_id, subscription_id)
+    if sub is None:
+        raise _webhook_not_found()
+    await services.delete_webhook_subscription(session, sub)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/webhooks/{subscription_id}/deliveries",
+    response_model=WebhookDeliveryPageOut,
+    summary="List delivery log for a webhook subscription (admin only, L3)",
+)
+async def list_webhook_deliveries(
+    subscription_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = services.DEFAULT_LIMIT,
+) -> WebhookDeliveryPageOut:
+    """Return cursor-paginated delivery attempts for one webhook subscription.
+
+    Scoped to the active workspace. Newest first.
+    """
+    # Verify subscription exists in this workspace.
+    sub = await services.get_webhook_subscription(session, ctx.workspace_id, subscription_id)
+    if sub is None:
+        raise _webhook_not_found()
+
+    try:
+        page = await services.list_webhook_deliveries(
+            session,
+            ctx.workspace_id,
+            subscription_id=subscription_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="bad_request",
+            title="Invalid cursor",
+            detail="The supplied cursor is malformed.",
+        ) from exc
+
+    return WebhookDeliveryPageOut(
+        data=[WebhookDeliveryOut.from_orm(d) for d in page.items],
+        next_cursor=page.next_cursor,
+    )
+
+
+@router.post(
+    "/webhooks/{subscription_id}/ping",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Send a test ping to the subscriber URL (admin only, L3)",
+)
+async def ping_webhook(
+    subscription_id: uuid.UUID,
+    ctx: RequireAdmin,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> dict[str, object]:
+    """POST a test ``ping`` event to the subscriber URL and return the delivery id.
+
+    Useful for verifying the endpoint is reachable and accepting signed deliveries.
+    The ping is recorded in the delivery log like any other delivery attempt.
+    """
+    sub = await services.get_webhook_subscription(session, ctx.workspace_id, subscription_id)
+    if sub is None:
+        raise _webhook_not_found()
+
+    deliveries = await services.deliver_event_to_subscribers(
+        session,
+        event_type="ping",
+        payload={"kind": "ping", "subscription_id": str(sub.id)},
+        workspace_id=ctx.workspace_id,
+        settings=settings,
+    )
+    await session.commit()
+
+    # deliver_event_to_subscribers filters by active subscriptions that match
+    # the event type. For ping we bypass filtering by calling directly.
+    # Retry: call directly on the one subscription.
+    if not deliveries:
+        # The subscription may be inactive; still do the ping.
+        from civicsignals_api.modules.integrations.models import (
+            WebhookDelivery,
+            WebhookDeliveryStatus,
+        )
+
+        delivery = WebhookDelivery(
+            workspace_id=ctx.workspace_id,
+            subscription_id=sub.id,
+            event_type="ping",
+            request_body={"kind": "ping", "subscription_id": str(sub.id)},
+            status=WebhookDeliveryStatus.PENDING,
+            attempt_count=0,
+        )
+        session.add(delivery)
+        await session.flush()
+        delivery = await services.execute_webhook_delivery(
+            session,
+            subscription=sub,
+            delivery=delivery,
+            settings=settings,
+        )
+        await session.commit()
+        deliveries = [delivery]
+
+    d = deliveries[0]
+    return {
+        "delivery_id": str(d.event_id),
+        "status": d.status.value,
+        "response_status": d.response_status,
+    }

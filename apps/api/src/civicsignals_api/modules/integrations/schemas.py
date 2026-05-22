@@ -1,13 +1,14 @@
-"""Pydantic request/response shapes for the integrations module (doc 08 §3.6)."""
+"""Pydantic request/response shapes for the integrations module (doc 08 §3.6 + L3)."""
 
 from __future__ import annotations
 
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 
 from .models import (
+    WEBHOOK_EVENT_TYPES,
     Connection,
     ConnectionStatus,
     FieldMapping,
@@ -15,6 +16,9 @@ from .models import (
     PushErrorCode,
     PushLog,
     PushStatus,
+    WebhookDelivery,
+    WebhookDeliveryStatus,
+    WebhookSubscription,
 )
 
 CONNECTION_NAME_MAX_LEN = 160
@@ -226,3 +230,131 @@ class PushOut(BaseModel):
     """POST .../push response — the resulting push-log row (K2)."""
 
     push_log: PushLogOut
+
+
+# ---------------------------------------------------------------------------
+# L3: Webhook subscriber CRUD + delivery log schemas
+# ---------------------------------------------------------------------------
+
+WEBHOOK_URL_MAX_LEN = 2048
+WEBHOOK_DESCRIPTION_MAX_LEN = 255
+
+
+def _validate_events(events: list[str]) -> list[str]:
+    """Validate that every event name is a known type (raises ValueError on unknown)."""
+    unknown = [e for e in events if e not in WEBHOOK_EVENT_TYPES]
+    if unknown:
+        raise ValueError(f"unknown event type(s): {', '.join(sorted(unknown))}")
+    if not events:
+        raise ValueError("at least one event type is required")
+    return events
+
+
+class WebhookSubscriptionCreate(BaseModel):
+    """Body for POST /webhooks (doc 08 §3.6 — shown ONCE, like B8 tokens)."""
+
+    url: AnyHttpUrl
+    events: list[str] = Field(min_length=1)
+    description: str | None = Field(default=None, max_length=WEBHOOK_DESCRIPTION_MAX_LEN)
+
+    def validated_events(self) -> list[str]:
+        """Return the validated event list (raises ValueError on unknown types)."""
+        return _validate_events(self.events)
+
+
+class WebhookSubscriptionCreated(BaseModel):
+    """POST /webhooks response — secret revealed ONCE (doc 08 §3.6)."""
+
+    id: UUID
+    url: str
+    secret: str  # plaintext, shown once; not returned on subsequent reads
+    events: list[str]
+    active: bool
+    description: str | None = None
+    created_at: datetime
+
+
+class WebhookSubscriptionUpdate(BaseModel):
+    """Body for PATCH /webhooks/{id} — all fields optional."""
+
+    url: AnyHttpUrl | None = None
+    events: list[str] | None = Field(default=None, min_length=1)
+    active: bool | None = None
+    description: str | None = Field(default=None, max_length=WEBHOOK_DESCRIPTION_MAX_LEN)
+
+    def validated_events(self) -> list[str] | None:
+        """Return the validated event list if present."""
+        if self.events is None:
+            return None
+        return _validate_events(self.events)
+
+
+class WebhookSubscriptionOut(BaseModel):
+    """Public subscription metadata — secret NEVER included (L3)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    url: str
+    events: list[str]
+    active: bool
+    description: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm(cls, sub: WebhookSubscription) -> WebhookSubscriptionOut:
+        return cls(
+            id=sub.id,
+            url=sub.url,
+            events=sub.subscribed_events,
+            active=sub.active,
+            description=sub.description,
+            created_at=sub.created_at,
+            updated_at=sub.updated_at,
+        )
+
+
+class WebhookSubscriptionList(BaseModel):
+    """GET /webhooks response."""
+
+    data: list[WebhookSubscriptionOut]
+
+
+class WebhookDeliveryOut(BaseModel):
+    """One delivery log row (L3). Secrets are never included."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    subscription_id: UUID
+    event_id: UUID
+    event_type: str
+    status: WebhookDeliveryStatus
+    response_status: int | None = None
+    attempt_count: int
+    retry_at: datetime | None = None
+    attempted_at: datetime | None = None
+    created_at: datetime
+
+    @classmethod
+    def from_orm(cls, d: WebhookDelivery) -> WebhookDeliveryOut:
+        return cls(
+            id=d.id,
+            subscription_id=d.subscription_id,
+            event_id=d.event_id,
+            event_type=d.event_type,
+            status=d.status,
+            response_status=d.response_status,
+            attempt_count=d.attempt_count,
+            retry_at=d.retry_at,
+            attempted_at=d.attempted_at,
+            created_at=d.created_at,
+        )
+
+
+class WebhookDeliveryPageOut(BaseModel):
+    """Cursor-paginated delivery log page (L3)."""
+
+    data: list[WebhookDeliveryOut]
+    next_cursor: str | None = None

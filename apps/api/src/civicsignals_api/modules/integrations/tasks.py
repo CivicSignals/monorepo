@@ -1,10 +1,15 @@
-"""Celery tasks for the integrations module (doc 06 §8, K1).
+"""Celery tasks for the integrations module (doc 06 §8, K1 + L3).
 
 ``retry_failed_pushes`` is the beat-scheduled sweeper (``celery_app`` registers
 it at 600s): it finds push-log rows in ``failed`` status whose ``retry_at`` is
 due and re-runs each through :func:`services.execute_push`, which applies the
 exponential backoff and dead-letters once attempts are exhausted (K5). A
 re-pushed row reuses its connection's auto-refreshed token.
+
+``retry_failed_webhook_deliveries`` (L3) is the analogous sweeper for webhook
+delivery rows. It follows the same pattern: find due failed rows, re-POST with
+the stored request body (same event_id for idempotency), dead-letter on
+exhaustion.
 """
 
 from __future__ import annotations
@@ -67,4 +72,53 @@ async def _retry_failed_pushes_async() -> int:
             await http.aclose()
 
     logger.info("integrations_retry_failed_pushes", attempted=attempted)
+    return attempted
+
+
+# ---------------------------------------------------------------------------
+# L3: Webhook delivery retry sweeper
+# ---------------------------------------------------------------------------
+
+
+@celery_app.task(name="integrations.retry_failed_webhook_deliveries")
+def retry_failed_webhook_deliveries() -> int:
+    """Retry due failed webhook deliveries with backoff; dead-letter on exhaustion (L3).
+
+    Returns the number of deliveries re-attempted. Runs the async sweeper in its
+    own event loop (the Celery worker is sync), opening its own ``SessionLocal``.
+    """
+    return asyncio.run(_retry_failed_webhook_deliveries_async())
+
+
+async def _retry_failed_webhook_deliveries_async() -> int:
+    from civicsignals_api.config import get_settings
+    from civicsignals_api.db import SessionLocal
+
+    from . import services
+
+    settings = get_settings()
+    attempted = 0
+    async with SessionLocal() as session:
+        due = await services.due_failed_webhook_deliveries(session)
+        http = services.default_http_client()
+        try:
+            for delivery in due:
+                sub = await services.get_webhook_subscription_unscoped(
+                    session, delivery.subscription_id
+                )
+                if sub is None:  # pragma: no cover - cascade should prevent
+                    continue
+                await services.execute_webhook_delivery(
+                    session,
+                    subscription=sub,
+                    delivery=delivery,
+                    http_client=http,
+                    settings=settings,
+                )
+                attempted += 1
+            await session.commit()
+        finally:
+            await http.aclose()
+
+    logger.info("integrations_retry_failed_webhook_deliveries", attempted=attempted)
     return attempted

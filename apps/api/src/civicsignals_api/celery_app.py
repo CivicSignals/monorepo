@@ -77,6 +77,13 @@ celery_app.conf.beat_schedule = {
         "task": "integrations.retry_failed_pushes",
         "schedule": 600.0,
     },
+    # L3: retry failed outbound webhook deliveries (exponential backoff, same
+    # pattern as integrations.retry_failed_pushes). Ticks every 60s so the
+    # shortest retry window (1 min) is honoured without excessive lag.
+    "integrations.retry_failed_webhook_deliveries": {
+        "task": "integrations.retry_failed_webhook_deliveries",
+        "schedule": 60.0,
+    },
     "contacts.revalidate_stale": {
         "task": "contacts.revalidate_stale",
         "schedule": crontab(hour=4, minute=0),
