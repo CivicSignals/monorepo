@@ -34,6 +34,8 @@ fails if this file is stale or a disallowed license appears.
 | click-didyoumean          | MIT License                                        | https://github.com/click-contrib/click-didyoumean              |
 | click-plugins             | BSD License                                        | https://github.com/click-contrib/click-plugins                 |
 | click-repl                | MIT                                                | https://github.com/untitaker/click-repl                        |
+| dnspython                 | ISC License (ISCL)                                 | https://www.dnspython.org                                      |
+| email-validator           | The Unlicense (Unlicense)                          | https://github.com/JoshData/python-email-validator             |
 | fastapi                   | MIT                                                | https://github.com/fastapi/fastapi                             |
 | greenlet                  | MIT AND PSF-2.0                                    | https://greenlet.readthedocs.io                                |
 | h11                       | MIT License                                        | https://github.com/python-hyper/h11                            |
