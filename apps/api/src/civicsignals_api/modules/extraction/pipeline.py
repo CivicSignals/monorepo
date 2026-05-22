@@ -64,10 +64,18 @@ from civicsignals_api.modules.signals.services import (
     score_candidate_confidence,
 )
 
+from .entity_extraction import run_entity_extraction
 from .models import ExtractionCandidate
 from .ocr import OcrBackend, get_ocr_backend
 from .relevance import RelevanceClassifier
-from .schemas import CandidateRecord, DocumentRef, ParsedDocument, RelevanceVerdict
+from .schemas import (
+    CandidateRecord,
+    DocumentRef,
+    EntityExtractionResult,
+    ExtractedEntity,
+    ParsedDocument,
+    RelevanceVerdict,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -404,6 +412,7 @@ async def extract_candidates(
     parsed: ParsedDocument,
     *,
     workspace_id: str | None,
+    session: AsyncSession | None = None,
 ) -> list[CandidateRecord]:
     """Emit candidate signal records from the document via the gateway (doc 19 §5).
 
@@ -411,11 +420,61 @@ async def extract_candidates(
     with the versioned ``signal_extraction`` prompt. Returns permissive
     :class:`CandidateRecord` objects.
 
+    **E11 two-pass entity extraction (doc 19 §4):** before the signal-type
+    detection call, the Stage-3 two-pass entity extraction runs:
+
+    - Pass 1 (``entity_extraction/v2``, Haiku-class): fast candidate entity
+      extraction — organisations, persons, amounts, dates, vendors, etc.
+    - Pass 2 (``entity_extraction/v1``, Sonnet-class): triggered when Pass 1
+      found fewer than 3 entity types or confidence < 0.6; refines and
+      gap-fills the partial extraction.
+    - Entity linking: looks up each organisation/vendor mention in the
+      ``entities_entity`` table (via ``entities.services.search_entities``)
+      and attaches a canonical ``entity_id`` when found.
+
+    The ``EntityExtractionResult`` is attached to every emitted
+    :class:`CandidateRecord` via ``entity_extraction``.  The first resolved
+    entity's ``entity_name`` is also injected into ``fields["entity_name"]``
+    (or the raw name when unresolved) so the downstream score/dedupe/store
+    stages continue to work without modification (the ``entity_name`` field is
+    already part of the ``signal_extraction`` prompt schema).
+
+    If the entity extraction step fails entirely the signal-type detection still
+    runs — entity data is best-effort (doc 19 §4.3 / §12.1).
+
     # TODO E4: the deterministic Stage-3 first pass (spaCy NER + regex, doc 19
     # §4.1) and the strict typed per-signal-type schemas + required-field hard gate
     # (doc 19 §5.1, §6.1) replace this single permissive LLM pass. The free-form
     # ``fields`` dict is the seam E4 reads from.
     """
+    # --- Stage 3: two-pass entity extraction (E11, doc 19 §4) ----------------
+    entity_result: EntityExtractionResult | None = None
+    try:
+        entity_result = await run_entity_extraction(
+            gateway,
+            parsed.text,
+            workspace_id=workspace_id,
+            session=session,
+            raw_document_id=parsed.raw_document_id,
+        )
+        log.info(
+            "extraction.entity_extraction.done",
+            raw_document_id=str(parsed.raw_document_id),
+            entities=len(entity_result.entities),
+            method=entity_result.extraction_method,
+            degraded=entity_result.degraded,
+        )
+    except Exception as exc:
+        # Entity extraction is best-effort; a failure must not block signal
+        # detection (doc 19 §12.1).
+        log.warning(
+            "extraction.entity_extraction.unexpected_failure",
+            raw_document_id=str(parsed.raw_document_id),
+            error=str(exc),
+            exc_info=True,
+        )
+
+    # --- Stage 4: signal-type detection (signal_extraction prompt) -----------
     document_text, _truncated = _truncate(parsed.text, MAX_EXTRACT_CHARS)
     result = await gateway.complete(
         task=TASK_EXTRACTION,
@@ -444,9 +503,39 @@ async def extract_candidates(
                 signal_type=None,
                 fields={"raw_output": result.text},
                 extraction_method=METHOD_FALLBACK,
+                entity_extraction=entity_result,
             )
         ]
-    return candidates
+
+    # Attach entity extraction result + propagate the best entity name into
+    # fields["entity_name"] for downstream compatibility (doc 19 §4.3).
+    enriched: list[CandidateRecord] = []
+    for candidate in candidates:
+        candidate = candidate.model_copy(update={"entity_extraction": entity_result})
+        # Propagate a resolved (or raw) entity name into fields if not already set.
+        if entity_result is not None and "entity_name" not in candidate.fields:
+            best_entity = _best_entity(entity_result)
+            if best_entity is not None:
+                candidate = candidate.model_copy(
+                    update={
+                        "fields": {
+                            **candidate.fields,
+                            "entity_name": best_entity.entity_name or best_entity.raw_name,
+                        }
+                    }
+                )
+        enriched.append(candidate)
+    return enriched
+
+
+def _best_entity(entity_result: EntityExtractionResult) -> ExtractedEntity | None:
+    """Return the highest-confidence resolved entity, or the first unresolved one."""
+    resolved = [e for e in entity_result.entities if not e.resolution_pending]
+    if resolved:
+        return max(resolved, key=lambda e: e.confidence)
+    if entity_result.entities:
+        return max(entity_result.entities, key=lambda e: e.confidence)
+    return None
 
 
 def _parse_candidates(text: str) -> list[CandidateRecord] | None:
@@ -731,10 +820,10 @@ async def store_candidates(
             recipe_id=recipe_id,
             raw_document_id=raw_document_id,
             content_hash=_candidate_content_hash(candidate),
-            # TODO E10: entity resolution (doc 19 §4.3) supplies a resolved
-            # entity_id; until then the signal is stored resolution-pending (the
-            # service flags it review_required) with the raw name from the fields.
-            entity_id=None,
+            # E11 (doc 19 §4.3): use the entity_id from the two-pass entity
+            # extraction when a canonical entity was resolved; fall back to
+            # None (resolution-pending) otherwise, as before E11 / E10.
+            entity_id=_candidate_resolved_entity_id(candidate),
             entity_name=_candidate_entity_name(candidate),
             confidence=candidate.confidence,
             # The E6 band the score stage computed (doc 19 §6.3) drives the row's
@@ -795,6 +884,25 @@ def _candidate_entity_name(candidate: CandidateRecord) -> str | None:
         return None
     raw = candidate.fields.get("entity_name")
     return str(raw) if isinstance(raw, str) and raw.strip() else None
+
+
+def _candidate_resolved_entity_id(candidate: CandidateRecord) -> uuid.UUID | None:
+    """Return the resolved entity_id from the E11 two-pass extraction, if any.
+
+    Looks at the candidate's ``entity_extraction`` result (doc 19 §4.3; E11)
+    for the best resolved entity.  Falls back to ``None`` (resolution-pending)
+    when no linked entity was found, so the store step behaves identically to
+    the pre-E11 path for unresolved mentions.
+    """
+    er = candidate.entity_extraction
+    if er is None or not er.entities:
+        return None
+    # Prefer resolved entities (resolution_pending=False) with highest confidence.
+    resolved = [e for e in er.entities if not e.resolution_pending and e.entity_id is not None]
+    if resolved:
+        best = max(resolved, key=lambda e: e.confidence)
+        return best.entity_id
+    return None
 
 
 def _coerce_band(raw: str | None) -> ConfidenceBand | None:
@@ -869,7 +977,9 @@ async def run_extraction_pipeline(
             candidates=[],
         )
 
-    raw_candidates = await extract_candidates(gateway, parsed, workspace_id=workspace_id)
+    raw_candidates = await extract_candidates(
+        gateway, parsed, workspace_id=workspace_id, session=session
+    )
     scored = [
         dedupe_candidate(score_candidate(c, config=confidence_config)) for c in raw_candidates
     ]

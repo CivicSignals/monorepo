@@ -2,6 +2,7 @@
 
 These cover the Stage-2 relevance gate (doc 19 §3, E8): the cheap LLM that
 decides whether a fetched document is worth running through full extraction.
+Also carries the two-pass entity extraction types (doc 19 §4; E11).
 """
 
 from __future__ import annotations
@@ -10,6 +11,68 @@ import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# ---------------------------------------------------------------------------
+# E11: Two-pass entity extraction result types (doc 19 §4)
+# ---------------------------------------------------------------------------
+
+
+class ExtractedEntity(BaseModel):
+    """One entity mention surfaced by the two-pass extraction (doc 19 §4; E11).
+
+    ``raw_name`` is the name as it appeared in the document.  After the entity-
+    linking pass, ``entity_id`` / ``entity_name`` are filled from the canonical
+    ``entities_entity`` row (doc 19 §4.3).  ``resolution_pending=True`` means
+    the mention was not matched to a known entity and the signal will be stored
+    with the raw string + human-review flag until the entity is resolved or
+    created.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw_name: str
+    entity_id: uuid.UUID | None = None
+    entity_name: str | None = None
+    confidence: float = 0.0
+    # True until a canonical entity row is linked (doc 19 §4.3).
+    resolution_pending: bool = True
+
+
+class EntityExtractionResult(BaseModel):
+    """Full output of the two-pass entity extraction stage (doc 19 §4; E11).
+
+    ``entities`` is the deduplicated, linked list of organisation/vendor
+    mentions.  The detailed sub-lists (``organizations``, ``persons``, …) carry
+    the raw LLM output for provenance and downstream scoring.
+
+    ``extraction_method`` records which passes ran:
+    - ``"deterministic"``  — Pass 1 only (sufficient confidence + type coverage).
+    - ``"llm_assisted"``   — Pass 1 + Pass 2 (Sonnet refinement triggered).
+    - ``"failed"``         — Pass 1 failed entirely; result is empty + degraded.
+
+    ``degraded=True`` when Pass 2 was needed but failed; the result carries
+    Pass-1 data only, with lower implicit confidence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entities: list[ExtractedEntity] = Field(default_factory=list)
+    # Detailed sub-lists from the merged LLM output (permissive dicts; typed
+    # schemas are E4's responsibility at promotion time).
+    organizations: list[dict[str, object]] = Field(default_factory=list)
+    persons: list[dict[str, object]] = Field(default_factory=list)
+    monetary_amounts: list[dict[str, object]] = Field(default_factory=list)
+    dates: list[dict[str, object]] = Field(default_factory=list)
+    products_categories: list[str] = Field(default_factory=list)
+    vendors_mentioned: list[dict[str, object]] = Field(default_factory=list)
+    contract_terms_mentions: list[dict[str, object]] = Field(default_factory=list)
+    raw_keywords: list[str] = Field(default_factory=list)
+    # Overall extraction confidence (0.0-0.95).
+    extraction_confidence: float = 0.0
+    extraction_warnings: list[str] = Field(default_factory=list)
+    extraction_method: str = "deterministic"
+    degraded: bool = False
+
 
 # The candidate signal-type categories the classifier is asked about. These line
 # up with the signal-type taxonomy (doc 19 §5.1) but stay deliberately coarse —
@@ -123,6 +186,13 @@ class CandidateRecord(BaseModel):
     §6.2-§6.3): ``confidence`` is the blended extraction confidence, ``band`` the
     mapped action band (``rejected`` candidates are dropped before store).
     ``dedup_key`` is filled by the dedupe stage (E5 stub).
+
+    ``entity_extraction`` carries the two-pass entity extraction result (E11,
+    doc 19 §4) that ran before signal-type detection.  It is ``None`` when the
+    entity extraction step was skipped (e.g. very short docs or test fixtures
+    that pre-date E11).  The ``entity_id`` / ``entity_name`` from the first
+    resolved entity in ``entity_extraction.entities`` are propagated into the
+    store step (doc 19 §4.3) so the candidate links to the right canonical row.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -136,6 +206,9 @@ class CandidateRecord(BaseModel):
     band: str | None = None
     dedup_key: str | None = None
     extraction_method: str = "llm"
+    # E11: two-pass entity extraction result (doc 19 §4).  ``None`` when the step
+    # was skipped or not yet wired (backward compatible with pre-E11 code).
+    entity_extraction: EntityExtractionResult | None = None
 
 
 class ExtractionCandidateRecord(BaseModel):

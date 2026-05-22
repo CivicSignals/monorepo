@@ -89,8 +89,27 @@ def _gateway(*, relevance: str, extract: str) -> tuple[LLMGateway, FakeBackend]:
     tasks: TASK_CLASSIFY -> the relevance backend, TASK_EXTRACTION -> the extract
     backend. Returns the gateway plus the extract backend so a test can assert
     whether the (expensive) extract call ever fired.
+
+    E11: extract_candidates now runs two-pass entity extraction before signal
+    detection, both routed to ``TASK_EXTRACTION``. The extract backend is
+    seeded with two responses: a minimal entity extraction reply (consumed by
+    entity extraction Pass 1) then the test's ``extract`` signal reply.
     """
-    extract_be = FakeBackend(provider="extract_be", responses=[extract])
+    _entity_reply = json.dumps(
+        {
+            "organizations": [{"name": "Seattle Public Schools", "confidence": 0.85}],
+            "persons": [{"name": "Alice", "role": "CIO", "confidence": 0.8}],
+            "monetary_amounts": [{"amount_cents": 5000000, "currency": "USD", "confidence": 0.9}],
+            "dates": [],
+            "products_categories": [],
+            "vendors_mentioned": [],
+            "contract_terms_mentions": [],
+            "raw_keywords": [],
+            "extraction_confidence": 0.82,
+            "extraction_warnings": [],
+        }
+    )
+    extract_be = FakeBackend(provider="extract_be", responses=[_entity_reply, extract])
     policy = TaskModelPolicy(
         overrides={
             TASK_CLASSIFY: ModelChoice("relevance_be", "haiku"),
