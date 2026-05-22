@@ -1,0 +1,128 @@
+# Release workflow — build, push, and cosign-sign multi-arch container images.
+#
+# Triggers:
+#   - Semver tags (v*) pushed to the repo → publish :vX.Y.Z + :latest
+#   - Manual workflow_dispatch → publish :sha-<short-sha>
+#
+# Images produced:
+#   ghcr.io/civicsignals/api   — Python/FastAPI (lean; no ingestion/extraction extras)
+#   ghcr.io/civicsignals/web   — Next.js standalone
+#
+# Signing: keyless OIDC via cosign (Sigstore).  Verify with:
+#   cosign verify --certificate-identity-regexp="github.com/CivicSignals/monorepo" \
+#                 --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+#                 ghcr.io/civicsignals/api:<tag>
+#
+# NOTE: this file intentionally does NOT run lint/tests.  CI (ci.yml, task A3) owns those.
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Release images
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write        # push to GHCR
+  id-token: write        # keyless cosign signing via OIDC
+
+env:
+  REGISTRY: ghcr.io
+  ORG: civicsignals
+
+jobs:
+  build-and-push:
+    name: Build & push ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: api
+            context: apps/api
+            dockerfile: apps/api/Dockerfile
+            # Build arg selects optional extras; empty = lean api image
+            build_args: ""
+          - name: web
+            context: .
+            dockerfile: apps/web/Dockerfile
+            build_args: ""
+
+    steps:
+      # ------------------------------------------------------------------ setup
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (cross-arch emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------ tags
+      - name: Generate image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image.name }}
+          tags: |
+            # On tag push: vX.Y.Z and latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # On manual dispatch or any push: sha-<short-sha>
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=civicsignals-${{ matrix.image.name }}
+            org.opencontainers.image.description=CivicSignals ${{ matrix.image.name }} service
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.source=https://github.com/CivicSignals/monorepo
+
+      # ------------------------------------------------------------------ build
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ matrix.image.build_args }}
+          # Layer cache: read from GHCR cache, write back on main/tag
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image.name }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image.name }}:buildcache,mode=max
+          # Generate OCI-compliant provenance attestation
+          provenance: true
+          # Generate SBOM (Software Bill of Materials) in SPDX format
+          sbom: true
+
+      # ------------------------------------------------------------------ sign
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless OIDC)
+        # Sign the manifest digest so both amd64 and arm64 share one signature.
+        # cosign uses the GitHub Actions OIDC token automatically when
+        # id-token: write is granted.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image.name }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Output image digest
+        run: |
+          echo "Image: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.image.name }}"
+          echo "Digest: ${{ steps.build.outputs.digest }}"

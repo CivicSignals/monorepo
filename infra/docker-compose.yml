@@ -1,22 +1,37 @@
 # Single-host production / self-host quickstart (doc 06 §10 Phase 0 + Phase 2).
-# Env-vars-only config, persistent volumes, published images. This is the file a
-# self-hoster runs. The full quickstart hardening lands in TODO O2.
+# Env-vars-only config, persistent volumes, published images from GHCR. This is
+# the file a self-hoster runs. Full quickstart hardening lands in TODO O2.
+#
+# Images published by .github/workflows/release-images.yml (task O1):
+#   ghcr.io/civicsignals/api:<CIVIC_VERSION>
+#   ghcr.io/civicsignals/web:<CIVIC_VERSION>
 #
 # Set image tags + secrets via a .env file next to this compose.
+# SPDX-License-Identifier: AGPL-3.0-only
 
 name: civicsignals
 
+# ---------------------------------------------------------------------------
+# Shared anchor for all api process types (one image, six process types).
+# The 'command' field selects which process type runs inside the container.
+# ---------------------------------------------------------------------------
 x-api-image: &api-image
   image: ghcr.io/civicsignals/api:${CIVIC_VERSION:-latest}
   env_file:
     - .env
   restart: unless-stopped
   depends_on:
-    - pgbouncer
-    - redis
-    - minio
+    pgbouncer:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    minio:
+      condition: service_started
 
 services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure services
+  # ---------------------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
     environment:
@@ -26,6 +41,12 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   pgbouncer:
     image: edoburu/pgbouncer:latest
@@ -36,9 +57,18 @@ services:
       DB_NAME: ${POSTGRES_DB}
       POOL_MODE: transaction
       AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "25"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   redis:
     image: redis:7-alpine
@@ -46,6 +76,11 @@ services:
     volumes:
       - redisdata:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   minio:
     image: minio/minio:latest
@@ -57,28 +92,46 @@ services:
       - miniodata:/data
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # API process types — all use the same ghcr.io/civicsignals/api image.
+  # The entrypoint selects the process based on the 'command' argument.
+  # ---------------------------------------------------------------------------
   api:
     <<: *api-image
     command: ["api"]
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   worker_ingest:
     <<: *api-image
     command: ["worker_ingest"]
+
   worker_extract:
     <<: *api-image
     command: ["worker_extract"]
+
   worker_score:
     <<: *api-image
     command: ["worker_score"]
+
   worker_notify:
     <<: *api-image
     command: ["worker_notify"]
+
   scheduler:
     <<: *api-image
     command: ["scheduler"]
 
+  # ---------------------------------------------------------------------------
+  # Web frontend
+  # ---------------------------------------------------------------------------
   web:
     image: ghcr.io/civicsignals/web:${CIVIC_VERSION:-latest}
     env_file:
@@ -87,8 +140,19 @@ services:
       - "3000:3000"
     restart: unless-stopped
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://localhost:3000/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
+  # ---------------------------------------------------------------------------
+  # Reverse proxy (nginx + TLS via Let's Encrypt in production)
+  # ---------------------------------------------------------------------------
   nginx:
     image: nginx:1.27-alpine
     ports:
@@ -97,8 +161,10 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - api
-      - web
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
