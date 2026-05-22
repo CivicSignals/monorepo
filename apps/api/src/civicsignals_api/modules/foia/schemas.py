@@ -298,9 +298,7 @@ class FoiaReminderConfigRead(BaseModel):
     reminder_interval_days: int = Field(
         description="Days between subsequent reminder emails after the first."
     )
-    reminder_max: int = Field(
-        description="Maximum reminder emails to send. 0 means unlimited."
-    )
+    reminder_max: int = Field(description="Maximum reminder emails to send. 0 means unlimited.")
     last_reminded_at: datetime | None = Field(
         default=None,
         description="UTC timestamp of the most recent reminder email; null if never sent.",

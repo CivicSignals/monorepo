@@ -257,9 +257,7 @@ class FoiaRequest(Base):
     # -----------------------------------------------------------------------
 
     #: Whether periodic reminder nudges are active for this request.
-    reminder_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default="true"
-    )
+    reminder_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
     #: Days after ``sent_at`` before the *first* reminder email fires.
     #: Seeded from the template's ``deadline_days`` at creation time (if the

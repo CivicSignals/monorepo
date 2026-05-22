@@ -383,7 +383,9 @@ async def _seed_entity(session: AsyncSession, name: str = "M5 Agency") -> uuid.U
     return entity.id
 
 
-async def _setup(session: AsyncSession, slug: str = "m5-ws") -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+async def _setup(
+    session: AsyncSession, slug: str = "m5-ws"
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     user_id = await _seed_user(session, suffix=slug)
     org_id = await _seed_org(session, user_id)
     ws_id = await _seed_workspace(session, org_id, user_id, slug=slug)
@@ -463,9 +465,7 @@ async def test_get_and_update_reminder_config(session: AsyncSession) -> None:
     req = await _create_request(session, ws_id=ws_id, user_id=user_id, entity_id=entity_id)
 
     async with session.begin():
-        config = await services.get_reminder_config(
-            session, request_id=req.id, workspace_id=ws_id
-        )
+        config = await services.get_reminder_config(session, request_id=req.id, workspace_id=ws_id)
     assert config.reminder_enabled is True
     assert config.reminder_days == DEFAULT_REMINDER_DAYS
 
@@ -673,9 +673,7 @@ async def test_beat_task_sends_via_recording_mailer(session: AsyncSession) -> No
 
     # State should be updated.
     async with session.begin():
-        refreshed = await services.get_request(
-            session, request_id=req.id, workspace_id=ws_id
-        )
+        refreshed = await services.get_request(session, request_id=req.id, workspace_id=ws_id)
     assert refreshed.reminder_count == 1
     assert refreshed.last_reminded_at is not None
 
@@ -734,9 +732,7 @@ async def test_beat_task_idempotent_same_day(session: AsyncSession) -> None:
     assert first >= 1
     assert second == 0  # idempotent: no second send on the same day
     async with session.begin():
-        refreshed = await services.get_request(
-            session, request_id=req.id, workspace_id=ws_id
-        )
+        refreshed = await services.get_request(session, request_id=req.id, workspace_id=ws_id)
     assert refreshed.reminder_count == 1
 
 
