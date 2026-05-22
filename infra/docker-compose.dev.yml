@@ -4,10 +4,18 @@
 #
 # This mirrors the Phase 0 single-VPS production layout (doc 06 §10) so we
 # dogfood the self-host distribution from day one.
+#
+# Startup ordering (enforced via healthchecks + depends_on):
+#   postgres (healthy) -> pgbouncer (healthy)
+#   pgbouncer/redis/minio (healthy) -> migrate (runs `alembic upgrade head`)
+#   migrate (completed) -> api + 4 workers + scheduler
+#   api (healthy) -> web
 
 name: civicsignals-dev
 
-x-api-build: &api-build
+# Shared build context for every process spawned from the API image. The image
+# is one artifact; the process type is chosen by the entrypoint arg (doc 18 §6.1).
+x-api-image: &api-image
   build:
     context: ../apps/api
     dockerfile: Dockerfile
@@ -15,13 +23,20 @@ x-api-build: &api-build
     - ../.env
   volumes:
     - ../apps/api:/app
+  restart: unless-stopped
+
+# Backing-service dependency block reused by every long-running API process.
+# `migrate` is the gate: app processes only start once schema is current.
+x-api-deps: &api-deps
   depends_on:
+    migrate:
+      condition: service_completed_successfully
     pgbouncer:
-      condition: service_started
+      condition: service_healthy
     redis:
-      condition: service_started
+      condition: service_healthy
     minio:
-      condition: service_started
+      condition: service_healthy
 
 services:
   postgres:
@@ -35,10 +50,11 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-civic}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-civic} -d ${POSTGRES_DB:-civicsignals}"]
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   pgbouncer:
     image: edoburu/pgbouncer:latest
@@ -56,6 +72,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      # The image ships no psql/nc, but a TCP open on 6432 is enough to know the
+      # pooler is accepting connections before app processes dial in.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/6432' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -64,6 +88,12 @@ services:
       - "6379:6379"
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
   minio:
     image: minio/minio:latest
@@ -76,37 +106,89 @@ services:
       - "9001:9001"
     volumes:
       - miniodata:/data
+    healthcheck:
+      # The server image ships curl; hit MinIO's built-in liveness endpoint.
+      # (Don't use `mc ready local` here — no `local` alias is configured in the
+      # server container, so it would hang and never report healthy.)
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: ensure the bucket the API/workers write raw docs to exists (TODO D3).
+  minio-init:
+    image: minio/mc:latest
+    env_file:
+      - ../.env
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set local "$${S3_ENDPOINT_URL:-http://minio:9000}" \
+          "$${S3_ACCESS_KEY_ID:-civic}" "$${S3_SECRET_ACCESS_KEY:-civic-secret}" &&
+        mc mb --ignore-existing "local/$${S3_RAW_BUCKET:-civic-raw}"
+    restart: "no"
 
   mailpit:
     image: axllent/mailpit:latest
     ports:
       - "1025:1025" # SMTP
       - "8025:8025" # web UI
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: apply Alembic migrations, then exit. App processes wait on this via
+  # `service_completed_successfully`, so a fresh stack always starts migrated.
+  # Runs against the *direct* Postgres URL (alembic/env.py picks that), bypassing
+  # PgBouncer transaction-mode pooling (doc 06 §4, doc 18 §6.3).
+  migrate:
+    <<: *api-image
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   api:
-    <<: *api-build
+    <<: [*api-image, *api-deps]
     command: ["api"]
     ports:
       - "8000:8000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   worker_ingest:
-    <<: *api-build
+    <<: [*api-image, *api-deps]
     command: ["worker_ingest"]
 
   worker_extract:
-    <<: *api-build
+    <<: [*api-image, *api-deps]
     command: ["worker_extract"]
 
   worker_score:
-    <<: *api-build
+    <<: [*api-image, *api-deps]
     command: ["worker_score"]
 
   worker_notify:
-    <<: *api-build
+    <<: [*api-image, *api-deps]
     command: ["worker_notify"]
 
   scheduler:
-    <<: *api-build
+    <<: [*api-image, *api-deps]
     command: ["scheduler"]
 
   web:
@@ -121,7 +203,9 @@ services:
       - ../:/repo
       - web_node_modules:/repo/node_modules
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:

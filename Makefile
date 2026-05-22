@@ -16,6 +16,10 @@ env: ## Create .env from .env.example if missing
 dev: env ## Bring up the full local stack (Postgres, Redis, MinIO, Mailpit, PgBouncer, api, web, workers)
 	$(COMPOSE) up --build
 
+.PHONY: config
+config: env ## Validate the dev compose file (renders the fully-resolved config)
+	$(COMPOSE) config
+
 .PHONY: dev-detached
 dev-detached: env ## Same as `dev`, detached
 	$(COMPOSE) up --build -d
@@ -33,12 +37,12 @@ logs: ## Tail stack logs
 	$(COMPOSE) logs -f
 
 .PHONY: migrate
-migrate: ## Apply Alembic migrations inside the api container
-	$(COMPOSE) exec api alembic upgrade head
+migrate: env ## Apply Alembic migrations (one-shot container; `make dev` already runs this on startup)
+	$(COMPOSE) run --rm migrate
 
 .PHONY: seed
-seed: ## Seed a demo workspace with synthetic signals (TODO A2)
-	$(COMPOSE) exec api python -m civicsignals_api.scripts.seed_demo
+seed: env ## Seed a demo workspace with synthetic signals (idempotent; TODO A2)
+	$(COMPOSE) run --rm api seed
 
 .PHONY: lint
 lint: ## Lint everything via Turborepo
