@@ -224,7 +224,7 @@ async def delete_stage(
     except services.StageNotFoundError as exc:
         await session.rollback()
         raise _not_found("Stage") from exc
-    except services.StageInUseError as exc:
+    except (services.StageInUseError, IntegrityError) as exc:
         await session.rollback()
         raise _conflict("Cannot delete a stage that still has pipeline items.") from exc
 
@@ -360,8 +360,8 @@ async def update_item(
     session: SessionDep,
 ) -> ItemOut:
     """Partial update: title, notes, value_estimate, status, owner_id."""
-    # Use _UNSET sentinel for nullable fields so the service can distinguish
-    # "field omitted" (no-op) from "field set to null" (clear the column).
+    # Use services.UNSET sentinel for nullable fields so the service can
+    # distinguish "field omitted" (no-op) from "field set to null" (clear col).
     set_fields = body.model_fields_set
     try:
         item = await services.update_item(
@@ -369,12 +369,12 @@ async def update_item(
             ctx.workspace_id,
             item_id,
             title=body.title,
-            notes=body.notes if "notes" in set_fields else services._UNSET,
+            notes=body.notes if "notes" in set_fields else services.UNSET,
             value_estimate=(
-                body.value_estimate if "value_estimate" in set_fields else services._UNSET
+                body.value_estimate if "value_estimate" in set_fields else services.UNSET
             ),
             status=body.status,
-            owner_id=body.owner_id if "owner_id" in set_fields else services._UNSET,
+            owner_id=body.owner_id if "owner_id" in set_fields else services.UNSET,
         )
         await session.commit()
     except services.ItemNotFoundError as exc:

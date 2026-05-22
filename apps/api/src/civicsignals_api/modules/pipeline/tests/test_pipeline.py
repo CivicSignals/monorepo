@@ -446,4 +446,4 @@ def test_items_require_workspace_header(client: TestClient) -> None:
     """Requests without a workspace are rejected."""
     token = _signup(client, "no-ws@example.com")
     resp = client.get(ITEMS, headers={"Authorization": f"Bearer {token}"})
-    assert resp.status_code in (400, 404)  # no last_active_workspace yet
+    assert resp.status_code == 400  # require_workspace returns 400 when no workspace id supplied

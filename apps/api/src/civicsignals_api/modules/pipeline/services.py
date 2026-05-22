@@ -36,7 +36,7 @@ MAX_LIMIT = 100
 
 # Sentinel for distinguishing "field omitted" from "field explicitly set to None"
 # in update payloads (used by update_item).
-_UNSET: object = object()
+UNSET: object = object()
 
 
 # ---------------------------------------------------------------------------
@@ -320,9 +320,12 @@ async def delete_stage(
     if has_items.first() is not None:
         raise StageInUseError(stage_id)
     await session.delete(stage)
+    # Flush the delete first so the stage row is gone from the session identity
+    # map before _recompact_positions queries remaining stages — otherwise the
+    # deleted row can still appear in the SELECT and produce gaps.
+    await session.flush()
     # Re-compact positions so there are no gaps after deletion.
     await _recompact_positions(session, workspace_id)
-    await session.flush()
 
 
 async def _recompact_positions(session: AsyncSession, workspace_id: uuid.UUID) -> None:
@@ -496,27 +499,27 @@ async def update_item(
     item_id: uuid.UUID,
     *,
     title: str | None = None,
-    notes: object = _UNSET,
-    value_estimate: object = _UNSET,
+    notes: object = UNSET,
+    value_estimate: object = UNSET,
     status: ItemStatus | None = None,
-    owner_id: object = _UNSET,
+    owner_id: object = UNSET,
 ) -> PipelineItem:
     """Partial update of a pipeline item.
 
-    Fields use ``_UNSET`` as a sentinel to distinguish "not provided" from
+    Fields use ``UNSET`` as a sentinel to distinguish "not provided" from
     "explicitly set to null". Passing ``notes=None``, ``value_estimate=None``,
     or ``owner_id=None`` clears those nullable fields. The caller commits.
     """
     item = await get_item(session, workspace_id, item_id)
     if title is not None:
         item.title = title
-    if notes is not _UNSET:
+    if notes is not UNSET:
         item.notes = None if notes is None else str(notes)
-    if value_estimate is not _UNSET:
+    if value_estimate is not UNSET:
         item.value_estimate = None if value_estimate is None else Decimal(str(value_estimate))
     if status is not None:
         item.status = status
-    if owner_id is not _UNSET:
+    if owner_id is not UNSET:
         item.owner_id = None if owner_id is None else uuid.UUID(str(owner_id))
     await session.flush()
     await session.refresh(item)
