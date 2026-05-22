@@ -1,0 +1,74 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: TX-PIA
+jurisdiction_name: Texas Public Information Act
+state: TX
+statute: "Tex. Gov. Code §§ 552.001–552.353"
+deadline_days: 10
+deadline_note: >
+  The governmental body must promptly produce public information that is not
+  excepted from disclosure. If the body intends to withhold any information,
+  it must request an Attorney General opinion within 10 business days of
+  receiving the request (Tex. Gov. Code § 552.301(b)). Requestors must be
+  notified of costs exceeding $40 before the agency proceeds (§ 552.261).
+fee_waiver_language: >
+  Pursuant to Tex. Gov. Code § 552.267, I request a waiver of fees because I
+  am indigent / because providing the information is in the public interest and
+  will primarily benefit the general public, as the records are sought to
+  advance the public interest and not for commercial gain.
+submission_method_hint: >
+  Submit in writing (email or mail) to the governmental body's public
+  information officer. Texas agencies must acknowledge receipt and produce
+  responsive records (or request an AG opinion) within 10 business days.
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  Public Information Officer
+  {entity_name}
+  {records_officer_name}
+
+  **RE: Public Information Act Request — Tex. Gov. Code Ch. 552**
+
+  Dear Public Information Officer:
+
+  Pursuant to the Texas Public Information Act, Tex. Gov. Code Ch. 552, I
+  hereby request access to and copies of the following public information
+  maintained by {entity_name}:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that responsive records be produced in electronic format
+  (email attachment or downloadable link) where available.
+
+  **Cost / Fee Waiver:**
+  {fee_waiver_language}
+
+  I am a {fee_waiver_basis}. Please notify me in writing if estimated
+  costs will exceed $40 before proceeding.
+
+  Pursuant to Tex. Gov. Code § 552.221, please produce responsive records
+  promptly. If you intend to withhold any information, please submit a
+  request for an Attorney General's opinion within 10 business days per
+  § 552.301 and provide me with a copy of that letter.
+
+  Please confirm receipt of this request.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}

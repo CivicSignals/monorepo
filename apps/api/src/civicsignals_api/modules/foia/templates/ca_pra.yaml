@@ -1,0 +1,75 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: CA-PRA
+jurisdiction_name: California Public Records Act
+state: CA
+statute: "Cal. Gov. Code §§ 7920.000–7931.000 (formerly Cal. Gov. Code § 6250 et seq.)"
+deadline_days: 10
+deadline_note: >
+  10 calendar days from receipt to acknowledge and determine whether records
+  are disclosable (Cal. Gov. Code § 7922.535(a)). In unusual circumstances
+  the agency may extend by 14 calendar days by written notice (§ 7922.535(b)).
+  Prompt inspection or production is required once records are identified.
+fee_waiver_language: >
+  Pursuant to Cal. Gov. Code § 7922.585, I request a waiver or reduction of
+  any fees associated with this request. The requested records are sought in
+  the public interest to shed light on the operations of a public agency and
+  not primarily in my commercial interest. If fees cannot be waived, please
+  provide an estimate before incurring costs.
+submission_method_hint: >
+  Submit by email, mail, or in-person to the agency's designated public
+  records contact. Many California agencies accept requests via their website.
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  Public Records Coordinator / Records Manager
+  {entity_name}
+  {records_officer_name}
+
+  **RE: California Public Records Act Request**
+
+  Dear Public Records Coordinator:
+
+  Pursuant to the California Public Records Act, Cal. Gov. Code §§ 7920.000
+  et seq., I hereby request access to and copies of the following public
+  records maintained by {entity_name}:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that these records be produced in electronic format where
+  available (email, USB drive, or downloadable link are all acceptable).
+
+  **Fee Waiver Request:**
+  {fee_waiver_language}
+
+  I am a {fee_waiver_basis}, and disclosure of these records will contribute
+  significantly to public understanding of the agency's operations.
+
+  Pursuant to Cal. Gov. Code § 7922.535(a), I expect a response within
+  10 calendar days of your receipt of this request indicating whether the
+  agency has responsive records and whether any exemptions apply.
+
+  If any portion of this request is denied, please specify the applicable
+  exemption and provide a written explanation pursuant to § 7923.100.
+
+  Please confirm receipt of this request at your earliest convenience.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}

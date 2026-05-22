@@ -1,0 +1,76 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: IL-FOIA
+jurisdiction_name: Illinois Freedom of Information Act
+state: IL
+statute: "5 ILCS 140/1 et seq."
+deadline_days: 5
+deadline_note: >
+  Agencies must respond within 5 business days of receipt (5 ILCS 140/3(d)).
+  For commercial requesters the deadline is 21 business days. Extensions of
+  5 additional business days are allowed in limited circumstances listed in
+  5 ILCS 140/3(e). Denial or failure to respond may be appealed to the
+  Public Access Counselor (PAC) within the Illinois Attorney General's office.
+fee_waiver_language: >
+  Pursuant to 5 ILCS 140/6(a), I request a fee waiver. I am a {fee_waiver_basis}.
+  Providing these records is in the public interest, as the records will
+  contribute significantly to public understanding of the operations of
+  {entity_name}. If fees cannot be waived, please provide a written estimate
+  before proceeding.
+submission_method_hint: >
+  Submit by email or mail to the agency's FOIA Officer. Illinois law
+  requires each public body to designate a FOIA Officer. Many Illinois
+  agencies accept requests via an online form.
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  FOIA Officer
+  {entity_name}
+  {records_officer_name}
+
+  **RE: Freedom of Information Act Request — 5 ILCS 140/1 et seq.**
+
+  Dear FOIA Officer:
+
+  Pursuant to the Illinois Freedom of Information Act, 5 ILCS 140/1 et seq.,
+  I hereby request access to and copies of the following public records
+  maintained by {entity_name}:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that responsive records be provided in electronic format
+  (email or downloadable link) where available.
+
+  **Fee Waiver Request:**
+  {fee_waiver_language}
+
+  I am not a commercial requester. Pursuant to 5 ILCS 140/3(d), I expect
+  a response within 5 business days of receipt of this request. If you
+  require additional time pursuant to 5 ILCS 140/3(e), please provide
+  written notice of the extension and the reasons for it.
+
+  If any records are withheld, please provide the applicable statutory
+  exemption, cite the specific section, and provide a brief description
+  of the withheld material sufficient for me to evaluate the exemption.
+
+  Please confirm receipt of this request.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}

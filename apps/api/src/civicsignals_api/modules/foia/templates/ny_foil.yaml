@@ -1,0 +1,80 @@
+# DRAFT — PENDING COUNSEL REVIEW. Not legal advice.
+jurisdiction: NY-FOIL
+jurisdiction_name: New York Freedom of Information Law
+state: NY
+statute: "N.Y. Pub. Off. Law §§ 84–90"
+deadline_days: 5
+deadline_note: >
+  The agency must acknowledge receipt within 5 business days (N.Y. Pub. Off.
+  Law § 89(3)(a)). If responsive records cannot be provided within 20 business
+  days, the agency must provide a written explanation and a date by which the
+  records will be available. Constructive denial (failure to respond) is
+  appealable after 10 business days from the acknowledged receipt date.
+fee_waiver_language: >
+  Pursuant to N.Y. Pub. Off. Law § 87(1)(c), I request a waiver of any fees
+  associated with this request on the ground that the records are sought for
+  journalistic / educational / non-commercial public-interest purposes and that
+  providing the information primarily benefits the general public.
+submission_method_hint: >
+  Submit by mail or email to the agency's Records Access Officer (RAO).
+  Many New York State agencies accept FOIL requests via their website or
+  through the NY.gov FOIL portal.
+status: draft
+placeholders:
+  - requester_name
+  - requester_address
+  - requester_email
+  - requester_phone
+  - requester_organization
+  - entity_name
+  - records_officer_name
+  - records_description
+  - date
+  - fee_waiver_basis
+body: |
+  {date}
+
+  Records Access Officer
+  {entity_name}
+  {records_officer_name}
+
+  **RE: Freedom of Information Law (FOIL) Request — N.Y. Pub. Off. Law Art. 6**
+
+  Dear Records Access Officer:
+
+  Pursuant to the New York Freedom of Information Law (FOIL), N.Y. Public
+  Officers Law §§ 84–90, I hereby request access to and copies of the
+  following records held by {entity_name}:
+
+  **Records Requested:**
+  {records_description}
+
+  I request that responsive records be provided in electronic format
+  (email or downloadable link) where available. If electronic production
+  is not possible, please advise on the available formats.
+
+  **Fee Waiver Request:**
+  {fee_waiver_language}
+
+  I am a {fee_waiver_basis}. These records are sought to contribute to
+  public understanding of the operations of {entity_name} and are not
+  primarily sought for commercial purposes.
+
+  Pursuant to N.Y. Pub. Off. Law § 89(3)(a), I expect an acknowledgement
+  of this request within 5 business days. If you anticipate that producing
+  the records will take more than 20 business days, please provide a
+  written explanation and an expected completion date.
+
+  If any portion of this request is denied, please provide the statutory
+  basis for the denial and advise me of my right to appeal pursuant to
+  § 89(4)(a).
+
+  Please confirm receipt of this request.
+
+  Sincerely,
+
+  {requester_name}
+  {requester_organization}
+  {requester_address}
+  Email: {requester_email}
+  Phone: {requester_phone}
