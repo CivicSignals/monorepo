@@ -98,6 +98,46 @@ class Settings(BaseSettings):
     api_v1_prefix: str = Field(default="/api/v1")
 
     # ---------------------------------------------------------------------------
+    # Outbound integrations framework (K1).  The generic OAuth2 + push-log seam
+    # that K2 (Salesforce), K3 (HubSpot), K4 (idempotent push), K5 (recovery),
+    # L1 (Slack), L3 (webhooks) build on.  All optional — empty/unset disables
+    # the providers that need them (the framework still loads).
+    # ---------------------------------------------------------------------------
+    # Symmetric key used to encrypt integration OAuth access/refresh tokens at
+    # rest (Fernet, threat-model §4.2). Unlike API tokens (hashed, never
+    # recovered), OAuth tokens must be decryptable to call the provider. A raw
+    # 32-byte urlsafe-base64 Fernet key, OR any passphrase (it is HKDF/SHA-256
+    # derived into a Fernet key — see integrations.services.token_cipher). Falls
+    # back to ``secret_key`` in development so tests/dev run without extra setup;
+    # production MUST set a dedicated key (rotating ``secret_key`` would also
+    # invalidate stored tokens). TODO LC: provision a dedicated key in Cloud.
+    integrations_token_encryption_key: str | None = None
+    # Public base URL the provider redirects back to after OAuth consent. The
+    # callback path (``/api/v1/integrations/oauth/callback``) is appended. In dev
+    # this points at the API; in Cloud it is the public ingress host.
+    integrations_oauth_redirect_base_url: str = "http://localhost:8000"
+    # OAuth ``state`` token TTL (seconds): the signed state minted at /start must
+    # be presented at /callback within this window (CSRF + replay guard).
+    integrations_oauth_state_ttl_seconds: int = 600  # 10 minutes
+    # Retry policy for failed pushes (K1 push-log; K5 recovery UI surfaces these).
+    # ``retry_failed_pushes`` (Celery beat) retries up to ``max_attempts`` total
+    # with exponential backoff (base * 2**(attempt-1), capped), then dead-letters.
+    integrations_push_max_attempts: int = 5
+    integrations_push_retry_base_seconds: int = 60
+    integrations_push_retry_max_seconds: int = 60 * 60  # 1 hour cap
+
+    # Per-provider OAuth2 client credentials (K2/K3/L1 wire the real clients;
+    # K1 only needs the config seam). Empty/unset means that provider cannot be
+    # connected via OAuth (POST returns a clear 422). TODO K2/K3/L1: document the
+    # required scopes per provider once their connectors land.
+    salesforce_client_id: str | None = None
+    salesforce_client_secret: str | None = None
+    hubspot_client_id: str | None = None
+    hubspot_client_secret: str | None = None
+    slack_client_id: str | None = None
+    slack_client_secret: str | None = None
+
+    # ---------------------------------------------------------------------------
     # Stripe billing (N1).  All optional — empty/unset means billing is inactive.
     # Live keys are provisioned by LC-13 (external Stripe account setup).
     # ``stripe_price_id_*`` are the Stripe price IDs for each self-serve plan;

@@ -24,6 +24,10 @@ AUTH_PASSWORD_RESET_COMPLETED = "auth.password_reset.completed"
 AUTH_LOGIN = "auth.login"
 AUTH_LOGOUT = "auth.logout"
 MEMBER_ROLE_CHANGED = "member.role_changed"
+# K1: integration connection lifecycle; B9 persists these via the admin listener.
+INTEGRATION_CONNECTION_CREATED = "integration.connection.created"
+INTEGRATION_CONNECTION_DELETED = "integration.connection.deleted"
+INTEGRATION_PUSH_FAILED = "integration.push.failed"
 
 Handler = Callable[[dict[str, Any]], Awaitable[None]]
 
