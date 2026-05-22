@@ -60,6 +60,20 @@ class Settings(BaseSettings):
     # Invitation token TTL (B6). 7 days per doc 04 J7.
     invitation_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
 
+    # --- Digest unsubscribe (H5) ---------------------------------------------
+    # Public base URL of the *API* itself, used to build the one-click
+    # unsubscribe endpoint embedded in the digest's ``List-Unsubscribe`` header
+    # (RFC 8058 requires a URI a mail client can POST to without a session).
+    # Unlike ``web_base_url`` (the browser app), this must point at the API. In
+    # any non-default deployment set ``API_BASE_URL`` explicitly; the default is
+    # the standard local dev layout (api on :8000).
+    api_base_url: str = "http://localhost:8000"
+    # One-click unsubscribe token TTL (H5). Long-lived because a digest email may
+    # sit in an inbox for weeks before the recipient unsubscribes; the token is
+    # single-scope (only flips one subscription to ``off``) so a long window is
+    # low-risk. HMAC-signed with ``secret_key`` (no DB row, like the OAuth state).
+    digest_unsubscribe_ttl_seconds: int = 60 * 60 * 24 * 90  # 90 days
+
     # --- MFA / TOTP (B4) -----------------------------------------------------
     # Fernet key used to encrypt TOTP secrets at rest. Falls back to
     # ``secret_key`` in dev/self-host so no extra setup is needed. Production

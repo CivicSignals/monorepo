@@ -14,25 +14,39 @@ the transactional-mail seam (verification, password reset, invites).
 from __future__ import annotations
 
 import smtplib
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from email.message import EmailMessage
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 import structlog
+from sqlalchemy import CursorResult, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.config import get_settings
+
+from .digest import DigestFrequency, is_due, period_key
+from .models import DigestSubscription
 
 logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
 class OutboundEmail:
-    """A rendered transactional email ready to send."""
+    """A rendered transactional email ready to send.
+
+    ``headers`` carries extra RFC 5322 headers (H5 uses it for ``List-Unsubscribe``
+    / ``List-Unsubscribe-Post`` so mail clients show a native one-click unsubscribe
+    button — RFC 8058). Empty by default; the SMTP transport sets each entry.
+    """
 
     to: str
     subject: str
     text_body: str
     html_body: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class EmailSender(Protocol):
@@ -60,6 +74,10 @@ class SMTPEmailSender:
         msg["From"] = self._from_addr
         msg["To"] = message.to
         msg["Subject"] = message.subject
+        # Extra headers (H5: List-Unsubscribe / List-Unsubscribe-Post) before the
+        # body so the mail client sees them at the top of the message.
+        for name, value in message.headers.items():
+            msg[name] = value
         msg.set_content(message.text_body)
         if message.html_body is not None:
             msg.add_alternative(message.html_body, subtype="html")
@@ -83,12 +101,16 @@ def default_email_sender() -> EmailSender:
     return SMTPEmailSender(settings.smtp_host, settings.smtp_port, settings.email_from)
 
 
-def send_email(message: OutboundEmail, *, sender: EmailSender | None = None) -> None:
+def send_email(message: OutboundEmail, *, sender: EmailSender | None = None) -> bool:
     """Send a transactional email through ``sender`` (defaults to SMTP).
 
     Failures are logged and swallowed so a flaky mail relay never breaks the
-    surrounding request (e.g. signup). Callers that must guarantee delivery
-    should enqueue via ``worker_notify`` instead (later epics).
+    surrounding request (e.g. signup): the request-path callers (signup,
+    password-reset, invites) ignore the return value, so this stays best-effort
+    for them. Returns ``True`` on a successful send and ``False`` on failure so
+    callers that *do* care about delivery — the H3 digest task, which only claims
+    a period after a confirmed send for at-least-once delivery — can observe the
+    outcome without the exception escaping.
     """
     transport = sender or default_email_sender()
     try:
@@ -97,3 +119,419 @@ def send_email(message: OutboundEmail, *, sender: EmailSender | None = None) -> 
         # Best-effort transactional send: never break the surrounding request
         # (e.g. signup) on a flaky mail relay.
         logger.warning("transactional_email_send_failed", to=message.to, subject=message.subject)
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# H3: saved-search digest subscriptions                                       #
+# --------------------------------------------------------------------------- #
+#
+# The notifications module owns delivery, so it owns the per-(saved-search, user)
+# digest schedule (``DigestSubscription``). Other modules call these functions
+# rather than touching the model directly (doc 06 §3). The dispatch beat task
+# (``tasks.py``) reads through :func:`list_due_subscriptions` / :func:`mark_sent`;
+# the routes write through :func:`upsert_digest_subscription` /
+# :func:`get_digest_subscription`.
+
+
+async def get_digest_subscription_by_id(
+    session: AsyncSession,
+    *,
+    subscription_id: uuid.UUID,
+) -> DigestSubscription | None:
+    """A digest subscription by its primary key, or ``None`` (delivery path)."""
+    return await session.get(DigestSubscription, subscription_id)
+
+
+async def get_digest_subscription(
+    session: AsyncSession,
+    *,
+    saved_search_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> DigestSubscription | None:
+    """The caller's digest subscription for a saved search, or ``None``."""
+    result = await session.execute(
+        select(DigestSubscription).where(
+            DigestSubscription.saved_search_id == saved_search_id,
+            DigestSubscription.user_id == user_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_digest_subscription(
+    session: AsyncSession,
+    *,
+    saved_search_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    frequency: DigestFrequency,
+    send_hour: int = 8,
+    weekday: int = 0,
+    timezone: str = "UTC",
+) -> DigestSubscription:
+    """Create or update the caller's digest schedule for one saved search (H3).
+
+    Idempotent on the unique ``(saved_search_id, user_id)`` pair via an
+    ``ON CONFLICT … DO UPDATE`` upsert, so re-setting the frequency from the UI
+    never collides. Changing the schedule clears ``last_sent_period`` so the next
+    due period sends under the new cadence rather than being suppressed by a stale
+    dedupe key. The caller commits.
+    """
+    stmt = (
+        pg_insert(DigestSubscription)
+        .values(
+            id=uuid.uuid4(),
+            saved_search_id=saved_search_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            frequency=frequency.value,
+            send_hour=send_hour,
+            weekday=weekday,
+            timezone=timezone,
+        )
+        .on_conflict_do_update(
+            constraint="uq_notifications_digest_subscription_search_user",
+            set_={
+                "frequency": frequency.value,
+                "send_hour": send_hour,
+                "weekday": weekday,
+                "timezone": timezone,
+                # A schedule change resets the dedupe so the new cadence's next
+                # period is honoured (not suppressed by the prior period key).
+                "last_sent_period": None,
+            },
+        )
+        .returning(DigestSubscription.id)
+    )
+    result = await session.execute(stmt)
+    sub_id = result.scalar_one()
+    await session.flush()
+    sub = await session.get(DigestSubscription, sub_id)
+    assert sub is not None  # just upserted
+    await session.refresh(sub)
+    return sub
+
+
+async def list_active_subscriptions(
+    session: AsyncSession,
+) -> list[DigestSubscription]:
+    """All subscriptions with a non-``off`` frequency (the dispatch sweep input).
+
+    The dispatch beat task pulls the (small) set of scheduled subscriptions and
+    applies the pure :func:`~notifications.digest.is_due` predicate per row, rather
+    than encoding the timezone math in SQL. The active partial index keeps this
+    scan cheap.
+    """
+    result = await session.execute(
+        select(DigestSubscription).where(DigestSubscription.frequency != DigestFrequency.OFF.value)
+    )
+    return list(result.scalars().all())
+
+
+def select_due_subscriptions(
+    subscriptions: list[DigestSubscription],
+    *,
+    now: datetime,
+) -> list[DigestSubscription]:
+    """Filter ``subscriptions`` to the ones due to send at ``now`` (pure).
+
+    Pure (no DB / clock) so the selection is unit-testable with a fake ``now``;
+    the timezone + daily/weekly + dedupe rules live in ``digest.is_due``.
+    """
+    return [
+        sub
+        for sub in subscriptions
+        if is_due(
+            frequency=sub.frequency_enum,
+            send_hour=sub.send_hour,
+            weekday=sub.weekday,
+            tz_name=sub.timezone,
+            now=now,
+            last_sent_period=sub.last_sent_period,
+        )
+    ]
+
+
+def already_sent_this_period(sub: DigestSubscription, *, now: datetime) -> bool:
+    """True iff ``now``'s local period is already the subscription's claimed period.
+
+    Pure read-only dedupe check (no DB write) used by the delivery task *before*
+    building/sending: a re-delivered task or a second sweep for the same period
+    short-circuits here without re-sending. The authoritative claim is the guarded
+    :func:`mark_sent` UPDATE, which the task runs only after a confirmed send (so the
+    period is never claimed for a send that failed). A ``None`` period key (frequency
+    ``off``) is treated as "not sent" — the sweep should not have enqueued it anyway.
+    """
+    key = period_key(sub.frequency_enum, now, sub.timezone)
+    return key is not None and key == sub.last_sent_period
+
+
+async def mark_sent(
+    session: AsyncSession,
+    *,
+    subscription_id: uuid.UUID,
+    now: datetime,
+) -> bool:
+    """Claim the current period for a subscription (distributed-safe dedupe).
+
+    Atomically sets ``last_sent_period`` to the current local period **only if it
+    differs** from the stored one (a guarded ``UPDATE … WHERE last_sent_period IS
+    DISTINCT FROM :key``). Returns ``True`` iff this call won the claim — so two
+    workers racing on the same due subscription, one wins and sends, the other
+    sees ``False`` and skips (mirrors the M5 FOIA ``mark_reminded`` guard and the
+    F6 lock intent). The caller commits.
+    """
+    sub = await session.get(DigestSubscription, subscription_id)
+    if sub is None:
+        return False
+    key = period_key(sub.frequency_enum, now, sub.timezone)
+    if key is None or key == sub.last_sent_period:
+        return False
+    # Guard on the period we read so a concurrent claim cannot double-send.
+    stmt = (
+        update(DigestSubscription)
+        .where(
+            DigestSubscription.id == subscription_id,
+            DigestSubscription.last_sent_period.is_distinct_from(key),
+        )
+        .values(last_sent_period=key, last_sent_at=now)
+    )
+    result = cast(CursorResult[Any], await session.execute(stmt))
+    return result.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# H5: unsubscribe + per-user preferences                                       #
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class UserSubscription:
+    """A digest subscription joined with its saved-search name (prefs list, H5)."""
+
+    subscription: DigestSubscription
+    saved_search_name: str
+
+
+async def list_user_subscriptions(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> list[UserSubscription]:
+    """The caller's digest subscriptions in one workspace, with search names (H5).
+
+    Powers the consolidated ``/settings/notifications`` preferences page: one row
+    per saved search the caller has a subscription for (any frequency, including
+    ``off`` so a previously-disabled digest can be re-enabled). The display name is
+    resolved through ``searches.services`` (never by importing that module's model —
+    doc 06 §3); workspace-scoped so a member only ever sees their own subscriptions
+    in the active workspace. A subscription whose saved search no longer exists in
+    the workspace is dropped (its name cannot be shown), matching the prior JOIN.
+    """
+    from civicsignals_api.modules.searches import services as searches_services
+
+    result = await session.execute(
+        select(DigestSubscription).where(
+            DigestSubscription.user_id == user_id,
+            DigestSubscription.workspace_id == workspace_id,
+        )
+    )
+    subs = list(result.scalars().all())
+    names = await searches_services.get_saved_search_names(
+        session,
+        workspace_id=workspace_id,
+        search_ids=[sub.saved_search_id for sub in subs],
+    )
+    rows = [
+        UserSubscription(subscription=sub, saved_search_name=names[sub.saved_search_id])
+        for sub in subs
+        if sub.saved_search_id in names
+    ]
+    # Preserve the old ORDER BY SavedSearch.name ordering (now sorted in Python).
+    rows.sort(key=lambda row: row.saved_search_name)
+    return rows
+
+
+class SubscriptionMissing:
+    """Sentinel type: the subscription does not exist (distinct from "exists, no name").
+
+    A dedicated class (not ``None``) so the GET confirm path can distinguish "no such
+    subscription" (a ``400`` bad link) from "exists but its search is unnamed/gone"
+    (a ``None`` name). The route narrows with ``isinstance(name, SubscriptionMissing)``.
+    """
+
+
+# Singleton instance returned by :func:`peek_subscription_name` for the missing case.
+SUBSCRIPTION_MISSING = SubscriptionMissing()
+
+
+async def peek_subscription_name(
+    session: AsyncSession,
+    *,
+    subscription_id: uuid.UUID,
+) -> str | None | SubscriptionMissing:
+    """Look up a subscription's saved-search name WITHOUT changing state (GET, H5).
+
+    Non-mutating counterpart to :func:`unsubscribe_by_id` for the confirm landing:
+    returns the saved-search name if the subscription exists, ``None`` if it exists
+    but the search is unnamed/gone, or :data:`SUBSCRIPTION_MISSING` if no such
+    subscription exists (the route turns that into a ``400`` bad link). The
+    saved-search name is resolved through ``searches.services`` (doc 06 §3).
+    """
+    from civicsignals_api.modules.searches import services as searches_services
+
+    sub = await session.get(DigestSubscription, subscription_id)
+    if sub is None:
+        return SUBSCRIPTION_MISSING
+    return await searches_services.get_saved_search_name(session, search_id=sub.saved_search_id)
+
+
+@dataclass(frozen=True)
+class UnsubscribeOutcome:
+    """Result of a token-driven unsubscribe (H5): whether a row matched + its name."""
+
+    unsubscribed: bool
+    saved_search_name: str | None
+
+
+async def unsubscribe_by_id(
+    session: AsyncSession,
+    *,
+    subscription_id: uuid.UUID,
+) -> UnsubscribeOutcome:
+    """Flip one subscription's frequency to ``off`` (the one-click unsubscribe, H5).
+
+    Idempotent: setting an already-``off`` subscription to ``off`` is a no-op that
+    still reports ``unsubscribed=True`` (the recipient's intent is satisfied either
+    way). Keeps the row so re-subscribing later remembers nothing was deleted.
+    Reports ``unsubscribed=False`` only when no such subscription exists. Also
+    returns the saved-search name (best effort) so the confirm page can name the
+    digest. The caller commits.
+
+    Unlike the B3 reset, the unsubscribe *token* is stateless (no DB consume step):
+    the action is idempotent, so there is nothing to mark used.
+    """
+    from civicsignals_api.modules.searches import services as searches_services
+
+    sub = await session.get(DigestSubscription, subscription_id)
+    if sub is None:
+        return UnsubscribeOutcome(unsubscribed=False, saved_search_name=None)
+
+    name = await searches_services.get_saved_search_name(session, search_id=sub.saved_search_id)
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            update(DigestSubscription)
+            .where(DigestSubscription.id == subscription_id)
+            .values(frequency=DigestFrequency.OFF.value)
+        ),
+    )
+    return UnsubscribeOutcome(unsubscribed=result.rowcount > 0, saved_search_name=name)
+
+
+async def build_digest_payload(
+    session: AsyncSession,
+    *,
+    subscription: DigestSubscription,
+    since: datetime | None,
+) -> dict[str, Any]:
+    """Produce the digest payload for a due subscription (H3).
+
+    Re-runs the saved search's stored filters against the workspace feed
+    (``signals.list_workspace_signals``) bounded to signals published since the
+    last send, and returns a serializable payload (recipient + saved search +
+    matched signals). The H4 renderer (``templates.render_digest_email``) turns
+    this into the email body that ``send_digest`` delivers.
+
+    Cross-module reads go through the sanctioned service surfaces only (doc 06 §3):
+    ``searches.services`` for the filter blob, ``signals.services`` for the feed,
+    ``accounts.services`` for the recipient's email (the H4 renderer's ``to``).
+    """
+    from civicsignals_api.modules.accounts import services as accounts_services
+    from civicsignals_api.modules.searches import services as searches_services
+    from civicsignals_api.modules.signals import services as signals_services
+
+    # Recipient address for the rendered digest (H4). May be ``None`` if the user
+    # row vanished; the delivery task treats a missing address as "nothing to send".
+    recipient = await accounts_services.get_user_by_id(session, subscription.user_id)
+    recipient_email = recipient.email if recipient is not None else None
+
+    search = await searches_services.get_saved_search(
+        session,
+        workspace_id=subscription.workspace_id,
+        user_id=subscription.user_id,
+        search_id=subscription.saved_search_id,
+    )
+    if search is None:
+        # The saved search vanished between sweep and delivery (CASCADE should have
+        # removed the subscription, but be defensive): empty payload, no signals.
+        return {
+            "saved_search_id": str(subscription.saved_search_id),
+            "saved_search_name": None,
+            "workspace_id": str(subscription.workspace_id),
+            "user_id": str(subscription.user_id),
+            "recipient_email": recipient_email,
+            "signals": [],
+        }
+
+    filters: dict[str, Any] = dict(search.filters or {})
+    # Bound to "new since last send": prefer the explicit ``since``; a stored
+    # ``published_at_gte`` in the saved filters still applies (list_workspace_signals
+    # takes the tighter of the two only if we pass the digest window — pass ``since``
+    # when present, else fall back to the saved filter's own bound).
+    published_at_gte = since if since is not None else _parse_dt(filters.get("published_at_gte"))
+
+    page = await signals_services.list_workspace_signals(
+        session,
+        workspace_id=subscription.workspace_id,
+        signal_type=filters.get("signal_type"),
+        statuses=filters.get("statuses"),
+        min_score=filters.get("min_score"),
+        published_at_gte=published_at_gte,
+        published_at_lt=_parse_dt(filters.get("published_at_lt")),
+        limit=signals_services.DEFAULT_LIMIT,
+    )
+
+    signals = [
+        {
+            "signal_id": str(item.signal.id),
+            "title": item.signal.title,
+            "signal_type": item.signal.signal_type,
+            "entity": item.signal.entity_name_raw,
+            "occurred_at": (
+                item.signal.occurred_at.isoformat() if item.signal.occurred_at else None
+            ),
+            "score": item.score,
+            "status": item.status,
+        }
+        for item in page.items
+    ]
+
+    # The H4 renderer (``templates.render_digest_email``) turns this payload into the
+    # branded HTML+text email; ``send_digest`` (tasks.py) renders + sends it.
+    return {
+        "saved_search_id": str(search.id),
+        "saved_search_name": search.name,
+        "workspace_id": str(subscription.workspace_id),
+        "user_id": str(subscription.user_id),
+        "recipient_email": recipient_email,
+        "since": since.isoformat() if since is not None else None,
+        "signals": signals,
+    }
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    """Coerce a stored ISO timestamp (or ``None``) to a ``datetime``."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
