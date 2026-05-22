@@ -22,4 +22,16 @@ def dedupe_recent() -> None:
 
 @celery_app.task(name="signals.rescore_workspace")
 def rescore_workspace(workspace_id: str) -> None:
-    """Re-score a workspace after an ICP change (TODO F3, F6)."""
+    """Re-score a workspace after an ICP change (F6 backfill, doc 14 §7).
+
+    The matcher + scorer F3 lands (``signals.services.score_workspace_candidates`` /
+    ``score_signal_for_workspace``) is what this task body drives: pre-filter the
+    historical signal window by the (new) ICP dimensions, full-score each candidate,
+    and sparse-upsert ``signals_workspace_score`` rows (idempotent ON CONFLICT, doc 14
+    §7.3). The live new-signal path already runs on ``signal.created`` (F3, see
+    ``signals.listeners``).
+
+    # TODO F6: implement the bounded backfill body — pull the lookback window via
+    # ``signals.services.list_signals`` filtered by the ICP pre-filter, then call
+    # ``score_workspace_candidates`` in CPU-budgeted batches (doc 14 §7.1-§7.2, §10.3).
+    """

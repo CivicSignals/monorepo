@@ -34,6 +34,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 from civicsignals_api.db import Base
 from civicsignals_api.ids import uuid7
 
+# F3's sparse per-workspace score table (doc 14 §5) lives in its own module file to
+# keep the two concerns readable. Re-export it here so Alembic's ``env.py`` (which
+# imports ``modules/*/models.py``) autoloads it onto the shared metadata, and so
+# cross-module callers find every signals table at ``signals.models``.
+from .workspace_score_model import WorkspaceScore  # noqa: F401
+
 # pgvector embedding dimension (doc 07 §2: ``vector_embedding VECTOR(1536)``).
 # The column is populated by I1 (embeddings); E4 only declares it nullable so I1
 # does not need a follow-up migration just to add the column.
