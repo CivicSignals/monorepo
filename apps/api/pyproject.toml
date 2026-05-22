@@ -86,12 +86,15 @@ plugins = ["pydantic.mypy"]
 strict = true
 warn_unused_ignores = true
 disallow_untyped_defs = true
+# Celery ships no py.typed marker, so `@celery_app.task` is an untyped decorator.
+# Relax just this one strict sub-flag rather than scatter per-task `type: ignore`s.
+disallow_untyped_decorators = false
 mypy_path = "src"
 explicit_package_bases = true
 namespace_packages = true
 
 [[tool.mypy.overrides]]
-module = ["pgvector.*", "feedparser.*", "pdfplumber.*"]
+module = ["pgvector.*", "feedparser.*", "pdfplumber.*", "celery.*"]
 ignore_missing_imports = true
 
 # ----------------------------------------------------------------------------

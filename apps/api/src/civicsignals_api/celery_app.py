@@ -1,4 +1,4 @@
-"""Celery application + beat schedule (doc 06 §8, doc 18 §6.1–6.2).
+"""Celery application + beat schedule (doc 06 §8, doc 18 §6.1-6.2).
 
 The same image runs different worker process types by binding to different
 queues. Six container commands share this codebase: ``api``, ``worker_ingest``,
