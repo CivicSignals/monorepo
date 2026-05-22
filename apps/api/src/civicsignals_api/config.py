@@ -179,6 +179,37 @@ class Settings(BaseSettings):
     stripe_price_id_starter: str | None = None
     stripe_price_id_pro: str | None = None
 
+    # ---------------------------------------------------------------------------
+    # Bounded-queue backpressure (D15; doc 18 §6.4).
+    #
+    # Per-queue soft + hard depth thresholds.  When the ``ingest`` queue depth
+    # reaches the hard threshold the scheduler pauses new recipe dispatches;
+    # once paused, it resumes only when the depth drops below the soft threshold
+    # (hysteresis prevents flapping at the boundary).
+    #
+    # Defaults are sized for a single-node VPS (Phase 0) where a large backlog
+    # signals that workers are behind and new enqueues would only worsen memory
+    # pressure.  Scale them up on multi-node deployments with more worker_ingest
+    # replicas.
+    #
+    # Env-vars: INGEST_QUEUE_SOFT_THRESHOLD / INGEST_QUEUE_HARD_THRESHOLD.
+    # Constraint: soft < hard (enforced at runtime by get_thresholds()).
+    # ---------------------------------------------------------------------------
+    ingest_queue_soft_threshold: int = Field(
+        default=500,
+        description=(
+            "Resume dispatching when the ingest queue depth drops below this value "
+            "(after a hard-threshold pause). Must be < ingest_queue_hard_threshold."
+        ),
+    )
+    ingest_queue_hard_threshold: int = Field(
+        default=1000,
+        description=(
+            "Pause new recipe dispatches when the ingest queue depth reaches this value. "
+            "Must be > ingest_queue_soft_threshold."
+        ),
+    )
+
     # Recipe DSL + runner (doc 18 §3). Both default to the monorepo layout
     # (discovered by walking up from the installed package) and can be overridden
     # in containers where the repo root sits elsewhere.
