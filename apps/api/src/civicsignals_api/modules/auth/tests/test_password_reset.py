@@ -19,7 +19,6 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import pytest
 from fastapi.testclient import TestClient
 
 from civicsignals_api import events
@@ -196,11 +195,16 @@ def test_reset_confirm_new_password_too_short_is_422(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_reset_request_emits_audit_event(
+def test_reset_request_emits_audit_event(
     client: TestClient, recorder: notifications_services.RecordingEmailSender
 ) -> None:
-    """The request endpoint publishes an auth.password_reset.requested event."""
+    """The request endpoint publishes an auth.password_reset.requested event.
+
+    TestClient drives the ASGI app via anyio in the same thread; ``events.publish``
+    is awaited inside the request handler so the handler fires synchronously before
+    the response is returned — the captured list is populated by the time the call
+    returns.
+    """
     _signup_and_login(client)
     recorder.sent.clear()
 
@@ -211,24 +215,16 @@ async def test_reset_request_emits_audit_event(
 
     events.subscribe(AUTH_PASSWORD_RESET_REQUESTED, _capture)
     try:
-        client.post(RESET_REQUEST, json={"email": EMAIL})
-        # The TestClient's sync transport drives the ASGI app in a separate
-        # thread; events are published synchronously inside that thread. For
-        # the in-process bus this is fire-and-forget so we just confirm the
-        # capture list was populated.
-        # Note: in TestClient mode the event loop is the app's; emitted list
-        # may be empty here if the publish is not awaited in sync context.
-        # This test asserts the happy path above works; the event bus itself
-        # is tested via its unit tests.
+        resp = client.post(RESET_REQUEST, json={"email": EMAIL})
+        assert resp.status_code == 204
+        assert len(emitted) == 1
+        assert emitted[0]["email"] == EMAIL.lower()
+        assert "user_id" in emitted[0]
     finally:
-        # Remove our test subscriber.
-        handlers = events._subscribers.get(AUTH_PASSWORD_RESET_REQUESTED, [])
-        if _capture in handlers:
-            handlers.remove(_capture)
+        events.unsubscribe(AUTH_PASSWORD_RESET_REQUESTED, _capture)
 
 
-@pytest.mark.asyncio
-async def test_reset_confirm_emits_audit_event(
+def test_reset_confirm_emits_audit_event(
     client: TestClient, recorder: notifications_services.RecordingEmailSender
 ) -> None:
     """The confirm endpoint publishes an auth.password_reset.completed event."""
@@ -244,8 +240,10 @@ async def test_reset_confirm_emits_audit_event(
     try:
         client.post(RESET_REQUEST, json={"email": EMAIL})
         token = _token_from_reset_email(recorder)
-        client.post(RESET_CONFIRM, json={"token": token, "new_password": NEW_PASSWORD})
+        resp = client.post(RESET_CONFIRM, json={"token": token, "new_password": NEW_PASSWORD})
+        assert resp.status_code == 200
+        assert len(emitted) == 1
+        assert emitted[0]["email"] == EMAIL.lower()
+        assert "user_id" in emitted[0]
     finally:
-        handlers = events._subscribers.get(AUTH_PASSWORD_RESET_COMPLETED, [])
-        if _capture in handlers:
-            handlers.remove(_capture)
+        events.unsubscribe(AUTH_PASSWORD_RESET_COMPLETED, _capture)

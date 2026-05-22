@@ -189,19 +189,27 @@ async def me(current_user: CurrentUser) -> UserOut:
 
 def _send_password_reset_email(email: str, raw_token: str, settings: Settings) -> None:
     link = f"{settings.web_base_url}/reset-password?token={raw_token}"
+    # Derive a human-readable TTL from settings rather than hard-coding "1 hour"
+    # so the copy stays accurate if the operator changes password_reset_ttl_seconds.
+    ttl_minutes = settings.password_reset_ttl_seconds // 60
+    if ttl_minutes < 60:
+        ttl_str = f"{ttl_minutes} minute{'s' if ttl_minutes != 1 else ''}"
+    else:
+        ttl_hours = ttl_minutes // 60
+        ttl_str = f"{ttl_hours} hour{'s' if ttl_hours != 1 else ''}"
     message = notifications_services.OutboundEmail(
         to=email,
         subject="Reset your CivicSignals password",
         text_body=(
             "You requested a password reset for your CivicSignals account.\n\n"
             f"Reset your password by visiting:\n{link}\n\n"
-            "This link expires in 1 hour and can only be used once.\n\n"
+            f"This link expires in {ttl_str} and can only be used once.\n\n"
             "If you did not request a password reset, you can ignore this message."
         ),
         html_body=(
             "<p>You requested a password reset for your CivicSignals account.</p>"
             f'<p><a href="{link}">Reset my password</a></p>'
-            "<p>This link expires in 1 hour and can only be used once.</p>"
+            f"<p>This link expires in {ttl_str} and can only be used once.</p>"
             "<p>If you did not request a password reset, you can ignore this message.</p>"
         ),
     )
@@ -235,10 +243,14 @@ async def password_reset_request(
         await session.commit()
         _send_password_reset_email(email, raw_token, settings)
         # TODO B9: persist audit entry — currently emitted on the in-process bus only.
-        await events.publish(
-            AUTH_PASSWORD_RESET_REQUESTED,
-            {"user_id": str(user.id), "email": email},
-        )
+        # Best-effort: a failing subscriber must not leak user existence via 500 vs 204.
+        try:
+            await events.publish(
+                AUTH_PASSWORD_RESET_REQUESTED,
+                {"user_id": str(user.id), "email": email},
+            )
+        except Exception:
+            logger.warning("password_reset_requested_event_failed", email=email)
     else:
         # No commit needed — nothing changed; rollback for cleanliness.
         await session.rollback()
@@ -275,8 +287,13 @@ async def password_reset_confirm(
         ) from exc
 
     # TODO B9: persist audit entry — currently emitted on the in-process bus only.
-    await events.publish(
-        AUTH_PASSWORD_RESET_COMPLETED,
-        {"user_id": str(user.id), "email": user.email},
-    )
+    # Best-effort: the password is already committed; a failing subscriber must not
+    # cause the client to see 500 and potentially retry with the now-consumed token.
+    try:
+        await events.publish(
+            AUTH_PASSWORD_RESET_COMPLETED,
+            {"user_id": str(user.id), "email": user.email},
+        )
+    except Exception:
+        logger.warning("password_reset_completed_event_failed", user_id=str(user.id))
     return MessageResponse(message="password reset")

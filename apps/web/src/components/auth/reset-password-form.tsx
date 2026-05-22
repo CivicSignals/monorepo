@@ -26,11 +26,15 @@ export function ResetPasswordForm() {
     defaultValues: { token },
   });
 
-  const onSubmit = handleSubmit((values) => {
-    resetConfirm.mutate({
-      token: values.token,
-      new_password: values.new_password,
-    });
+  const onSubmit = handleSubmit(async (values) => {
+    try {
+      await resetConfirm.mutateAsync({
+        token: values.token,
+        new_password: values.new_password,
+      });
+    } catch {
+      // Error is captured in resetConfirm.error; isSubmitting resets cleanly.
+    }
   });
 
   if (resetConfirm.isSuccess) {

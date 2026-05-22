@@ -29,6 +29,13 @@ def subscribe(event: str, handler: Handler) -> None:
     _subscribers[event].append(handler)
 
 
+def unsubscribe(event: str, handler: Handler) -> None:
+    """Remove a previously registered handler (idempotent — no-op if not found)."""
+    handlers = _subscribers.get(event)
+    if handlers and handler in handlers:
+        handlers.remove(handler)
+
+
 async def publish(event: str, payload: dict[str, Any]) -> None:
     for handler in _subscribers.get(event, []):
         await handler(payload)

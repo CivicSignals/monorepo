@@ -21,8 +21,12 @@ export function ForgotPasswordForm() {
     resolver: zodResolver(forgotPasswordSchema),
   });
 
-  const onSubmit = handleSubmit((values) => {
-    resetRequest.mutate({ email: values.email });
+  const onSubmit = handleSubmit(async (values) => {
+    try {
+      await resetRequest.mutateAsync({ email: values.email });
+    } catch {
+      // Error is captured in resetRequest.error; isSubmitting resets cleanly.
+    }
   });
 
   // Always show the "check your email" success state once submitted (even on 204
