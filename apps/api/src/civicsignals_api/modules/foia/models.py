@@ -1,7 +1,7 @@
-"""foia SQLAlchemy models (M2 + M5).
+"""foia SQLAlchemy models (M2 + M3 + M5).
 
 Tables are prefixed ``foia_`` and are migrated only by this module (doc 06 §3,
-§4). Two tables:
+§4). Three tables:
 
 - ``foia_request`` — workspace-scoped FOIA / public-records request with a
   four-status state machine (draft → sent → ack → response) and optional
@@ -11,6 +11,15 @@ Tables are prefixed ``foia_`` and are migrated only by this module (doc 06 §3,
   partial-index queries, future automation (M5 reminders), and audit are easy.
   This defers the J3-style audit-event bus (future) but uses the same shape so
   migration to the bus is a pure add.
+- ``foia_attachment`` — an uploaded response document (PDF) linked to a FOIA
+  request. Stores the file metadata and a reference to the ingestion
+  ``ingestion_raw_document`` row (D3 seam). The extraction pipeline is triggered
+  on upload (E1 seam); ``extraction_status`` tracks the job state. Signals
+  produced by extraction are linked back to the FOIA request via the
+  ``raw_document_ids`` array on ``signals_signal`` (the raw document was stored
+  with ``source=foia_upload, foia_request_id=<id>`` in its metadata) together
+  with the attachment's ``raw_document_id`` FK — callers cross-reference to find
+  which signals came from a given attachment/request (M3 linkage approach).
 
 State machine (doc 04 J8, doc 07 §4, task M2):
     draft → sent → ack → response
@@ -331,4 +340,118 @@ class FoiaRequestEvent(Base):
 
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# M3 — FOIA attachment (uploaded response PDFs)
+# ---------------------------------------------------------------------------
+
+
+class FoiaAttachmentExtractionStatus(StrEnum):
+    """Extraction pipeline status for a FOIA attachment (M3).
+
+    Lifecycle mirrors the extraction job statuses (doc 19 §1):
+    - ``pending``  — enqueued, extraction not yet started.
+    - ``running``  — the extraction pipeline is active.
+    - ``done``     — extraction completed; signals are in ``signals_signal``.
+    - ``failed``   — extraction pipeline failed after retries.
+    - ``skipped``  — the relevance gate (E8) found the document irrelevant.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class FoiaAttachment(Base):
+    """An uploaded FOIA response document (M3).
+
+    Linked to a :class:`FoiaRequest` via ``foia_request_id``. The uploaded bytes
+    are stored in S3 via the ingestion module's :func:`store_raw_document` seam
+    (D3); the resulting ``ingestion_raw_document`` row id is recorded as
+    ``raw_document_id`` (loose ref — not a cross-module FK per doc 06 §3). The
+    extraction pipeline is triggered via :func:`extraction.services.enqueue_extraction`
+    (E1 seam) immediately after upload.
+
+    **Signal linkage:** Signals produced by extraction carry the attachment's
+    ``raw_document_id`` in their ``raw_document_ids`` array (``signals_signal``).
+    The provenance metadata stored with the raw document (``source=foia_upload,
+    foia_request_id=<id>``) creates an additional audit trail. To find signals for
+    a given attachment: query ``signals_signal.raw_document_ids`` for the
+    attachment's ``raw_document_id``. To find signals for a whole FOIA request:
+    collect all attachment ``raw_document_id`` values for the request, then query.
+    This avoids a cross-module FK while keeping the linkage queryable.
+
+    ``extraction_status`` mirrors the extraction job state so the FOIA UI can
+    show progress without querying the extraction module (decoupled read path).
+    The extraction worker updates this field via
+    :func:`foia.services.update_attachment_extraction_status`.
+    """
+
+    __tablename__ = "foia_attachment"
+    __table_args__ = (
+        CheckConstraint(
+            "extraction_status IN ('pending', 'running', 'done', 'failed', 'skipped')",
+            name="ck_foia_attachment_extraction_status",
+        ),
+        Index("ix_foia_attachment_request_id", "foia_request_id"),
+        Index("ix_foia_attachment_raw_document_id", "raw_document_id"),
+        Index("ix_foia_attachment_uploaded_by", "uploaded_by"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+
+    # The FOIA request this attachment belongs to.
+    foia_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("foia_request.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Loose ref to ingestion_raw_document (no cross-module FK — doc 06 §3).
+    # The raw document stores provenance: source=foia_upload + foia_request_id.
+    raw_document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+    )
+
+    # The extraction job id (loose ref; no cross-module FK).
+    extraction_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+
+    # Original filename from the upload (for display only).
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+
+    # MIME type of the uploaded file, e.g. ``application/pdf``.
+    content_type: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # The user who uploaded this attachment.
+    uploaded_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_user.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Mirrors the extraction_job status so the FOIA UI can display progress
+    # without querying the extraction module.  Updated by the update_attachment_
+    # extraction_status service function (called from the worker or a webhook).
+    extraction_status: Mapped[str] = mapped_column(
+        Enum(
+            FoiaAttachmentExtractionStatus,
+            name="foia_attachment_extraction_status",
+            native_enum=False,
+            length=16,
+            values_callable=lambda e: [s.value for s in e],
+        ),
+        nullable=False,
+        server_default=FoiaAttachmentExtractionStatus.PENDING.value,
     )

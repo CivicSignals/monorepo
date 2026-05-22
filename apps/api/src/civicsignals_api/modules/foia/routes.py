@@ -15,6 +15,13 @@ FOIA request endpoints (M2)
 ``POST   /api/v1/foia/requests/{id}/transition`` — advance the state machine.
 ``GET    /api/v1/foia/requests/{id}/events``   — status-transition history.
 
+FOIA attachment endpoints (M3)
+-------------------------------
+``POST  /api/v1/foia/requests/{id}/attachments``          — upload a response PDF.
+``GET   /api/v1/foia/requests/{id}/attachments``          — list attachments (cursor-paginated).
+``GET   /api/v1/foia/requests/{id}/attachments/{att_id}`` — get one attachment.
+``GET   /api/v1/foia/requests/{id}/attachments/{att_id}/signals`` — signals from attachment.
+
 FOIA reminder config endpoints (M5)
 -------------------------------------
 ``GET   /api/v1/foia/requests/{id}/reminder``  — get reminder config.
@@ -36,10 +43,11 @@ Errors follow RFC 7807 ``application/problem+json`` via
 
 from __future__ import annotations
 
+import functools
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
@@ -49,6 +57,9 @@ from civicsignals_api.problems import ProblemException
 from . import services
 from .models import ALLOWED_TRANSITIONS, FoiaRequestStatus
 from .schemas import (
+    FoiaAttachmentPage,
+    FoiaAttachmentRead,
+    FoiaAttachmentSignalRef,
     FoiaReminderConfigRead,
     FoiaReminderConfigUpdate,
     FoiaRequestCreate,
@@ -440,6 +451,177 @@ async def list_request_events(
     except services.FoiaRequestNotFoundError:
         raise _request_not_found(request_id) from None
     return [FoiaRequestEventRead.model_validate(e) for e in events]
+
+
+# ---------------------------------------------------------------------------
+# M3 — Attachment endpoints (upload + list + signals)
+# ---------------------------------------------------------------------------
+
+
+def _attachment_not_found(attachment_id: uuid.UUID) -> ProblemException:
+    return ProblemException(
+        status=404,
+        code="foia_attachment_not_found",
+        title="FOIA attachment not found",
+        detail=f"FOIA attachment {attachment_id} not found for this request.",
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _get_storage() -> object:
+    """Return the RawDocumentStorage singleton for this process (D3 seam).
+
+    Imported lazily so the storage (boto3 / S3) is not constructed during
+    module import — keeps the API startup fast and lets tests inject a fake.
+    Cached via :func:`functools.lru_cache` so the boto3 S3 client is created
+    only once per process rather than on every upload request.
+    """
+    from civicsignals_api.modules.ingestion.storage import RawDocumentStorage
+
+    return RawDocumentStorage.from_settings()
+
+
+@router.post(
+    "/requests/{request_id}/attachments",
+    response_model=FoiaAttachmentRead,
+    status_code=201,
+    summary="Upload a FOIA response document",
+    description=(
+        "Upload a response file (PDF, HTML, DOCX…) to a FOIA request. "
+        "The file is stored in content-addressable storage (D3) and the "
+        "extraction pipeline is triggered automatically (E1). "
+        "If the request is in ``ack`` status it is automatically advanced to ``response``."
+    ),
+)
+async def upload_attachment(
+    request_id: uuid.UUID,
+    file: UploadFile,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+) -> FoiaAttachmentRead:
+    """Upload a response document and enqueue it through the extraction pipeline."""
+    content = await file.read()
+    filename = file.filename or "upload"
+    content_type = file.content_type or "application/octet-stream"
+
+    storage = _get_storage()
+    try:
+        att = await services.upload_attachment(
+            session,
+            storage,
+            foia_request_id=request_id,
+            workspace_id=ctx.workspace_id,
+            uploaded_by=ctx.user.id,
+            filename=filename,
+            content_type=content_type,
+            content=content,
+        )
+    except services.FoiaRequestNotFoundError:
+        raise _request_not_found(request_id) from None
+
+    await session.commit()
+    return FoiaAttachmentRead.model_validate(att)
+
+
+@router.get(
+    "/requests/{request_id}/attachments",
+    response_model=FoiaAttachmentPage,
+    summary="List FOIA request attachments",
+    description=(
+        "Return a cursor-paginated list of uploaded response documents for a FOIA request. "
+        "Ordered ascending by ``id`` (UUIDv7 — encodes creation time, so effectively oldest-first). "
+        "Use the ``cursor`` returned in ``next_cursor`` to fetch subsequent pages."
+    ),
+)
+async def list_attachments(
+    request_id: uuid.UUID,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+    cursor: Annotated[str | None, Query(description="Pagination cursor.")] = None,
+    limit: Annotated[int, Query(ge=1, le=100, description="Page size.")] = 25,
+) -> FoiaAttachmentPage:
+    """List attachments for a FOIA request (cursor-paginated)."""
+    try:
+        items, next_cursor = await services.list_attachments(
+            session,
+            foia_request_id=request_id,
+            workspace_id=ctx.workspace_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except services.FoiaRequestNotFoundError:
+        raise _request_not_found(request_id) from None
+    except ValueError as exc:
+        raise ProblemException(
+            status=400,
+            code="foia_invalid_cursor",
+            title="Invalid pagination cursor",
+            detail=str(exc),
+        ) from exc
+
+    return FoiaAttachmentPage(
+        items=[FoiaAttachmentRead.model_validate(a) for a in items],
+        next_cursor=next_cursor,
+    )
+
+
+@router.get(
+    "/requests/{request_id}/attachments/{attachment_id}",
+    response_model=FoiaAttachmentRead,
+    summary="Get one FOIA attachment",
+    description="Fetch a single attachment by id, workspace-scoped.",
+)
+async def get_attachment(
+    request_id: uuid.UUID,
+    attachment_id: uuid.UUID,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+) -> FoiaAttachmentRead:
+    """Return one FOIA attachment by id."""
+    try:
+        att = await services.get_attachment(
+            session,
+            attachment_id=attachment_id,
+            foia_request_id=request_id,
+            workspace_id=ctx.workspace_id,
+        )
+    except services.FoiaRequestNotFoundError:
+        raise _request_not_found(request_id) from None
+    except services.FoiaAttachmentNotFoundError:
+        raise _attachment_not_found(attachment_id) from None
+    return FoiaAttachmentRead.model_validate(att)
+
+
+@router.get(
+    "/requests/{request_id}/attachments/{attachment_id}/signals",
+    response_model=list[FoiaAttachmentSignalRef],
+    summary="List signals extracted from a FOIA attachment",
+    description=(
+        "Return the signals produced by extraction of this response document. "
+        "Signals are linked via the ``raw_document_ids`` array on "
+        "``signals_signal`` — the same raw document id used when the PDF was "
+        "stored (D3 seam). Ordered newest-first by ``observed_at``."
+    ),
+)
+async def list_attachment_signals(
+    request_id: uuid.UUID,
+    attachment_id: uuid.UUID,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+) -> list[FoiaAttachmentSignalRef]:
+    """Return signals linked to a FOIA attachment via raw_document_ids (M3)."""
+    try:
+        signals = await services.list_attachment_signals(
+            session,
+            attachment_id=attachment_id,
+            foia_request_id=request_id,
+            workspace_id=ctx.workspace_id,
+        )
+    except services.FoiaRequestNotFoundError:
+        raise _request_not_found(request_id) from None
+    except services.FoiaAttachmentNotFoundError:
+        raise _attachment_not_found(attachment_id) from None
+    return [FoiaAttachmentSignalRef.model_validate(s) for s in signals]
 
 
 # ---------------------------------------------------------------------------

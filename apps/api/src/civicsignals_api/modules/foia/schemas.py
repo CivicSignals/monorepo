@@ -1,4 +1,4 @@
-"""Pydantic request/response shapes for the foia module (doc 06 §3, M2 + M5).
+"""Pydantic request/response shapes for the foia module (doc 06 §3, M2 + M3 + M5).
 
 Template responses are **global reference data** — not workspace-scoped —
 so those shapes carry no workspace fields. The template list response uses
@@ -7,6 +7,12 @@ and static (M1).
 
 FOIA request shapes are workspace-scoped and use cursor pagination per
 doc 06 §5 (``cursor`` + ``limit`` query params, ``next_cursor`` in responses).
+
+M3 adds attachment shapes:
+- :class:`FoiaAttachmentRead` — one uploaded response document + extraction status.
+- :class:`FoiaAttachmentSignalRef` — a lightweight signal reference for the
+  attachment detail (signal id + type + title + confidence).
+- :class:`FoiaAttachmentPage` — cursor-paginated list of attachments.
 
 M5 adds reminder config shapes:
 - :class:`FoiaReminderConfigRead` — current reminder settings for a request.
@@ -20,7 +26,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import FoiaRequestStatus, SubmissionMethod
+from .models import FoiaAttachmentExtractionStatus, FoiaRequestStatus, SubmissionMethod
 
 # ---------------------------------------------------------------------------
 # Template shapes (M1, unchanged)
@@ -336,3 +342,88 @@ class FoiaReminderConfigUpdate(BaseModel):
         ge=0,
         description="Maximum reminders to send (0 = unlimited).",
     )
+
+
+# ---------------------------------------------------------------------------
+# M3 — Attachment shapes
+# ---------------------------------------------------------------------------
+
+
+class FoiaAttachmentRead(BaseModel):
+    """One uploaded FOIA response document and its extraction status (M3).
+
+    ``raw_document_id`` is the id of the ``ingestion_raw_document`` row that
+    stores the uploaded bytes (D3 seam). To find the signals produced by
+    extraction, query ``signals_signal.raw_document_ids`` for this id.
+
+    ``extraction_job_id`` is the extraction pipeline job id (E1 seam). It is
+    ``null`` for the brief moment between upload and the first DB flush, but
+    is populated before the response is returned to the caller.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    foia_request_id: uuid.UUID
+    raw_document_id: uuid.UUID
+    extraction_job_id: uuid.UUID | None = None
+    filename: str
+    content_type: str
+    uploaded_by: uuid.UUID
+    uploaded_at: datetime
+    extraction_status: str = Field(
+        description=(
+            "Mirrors the extraction job status: pending | running | done | failed | skipped."
+        )
+    )
+
+
+class FoiaAttachmentPage(BaseModel):
+    """Cursor-paginated list of FOIA attachments for a request (M3)."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    items: list[FoiaAttachmentRead]
+    next_cursor: str | None = Field(
+        default=None,
+        description="Opaque cursor for the next page; null when this is the last page.",
+    )
+
+
+class FoiaAttachmentSignalRef(BaseModel):
+    """A lightweight reference to a signal linked to a FOIA attachment (M3).
+
+    Returned by ``GET /api/v1/foia/requests/{id}/attachments/{att_id}/signals``.
+    Full signal detail is available from the signals module.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    signal_type: str
+    title: str
+    summary: str
+    confidence: float | None = None
+    status: str
+    observed_at: datetime
+
+
+#: Re-export so that ``FoiaAttachmentExtractionStatus`` is available from schemas.
+__all__ = [
+    "FoiaAttachmentExtractionStatus",
+    "FoiaAttachmentPage",
+    "FoiaAttachmentRead",
+    "FoiaAttachmentSignalRef",
+    "FoiaReminderConfigRead",
+    "FoiaReminderConfigUpdate",
+    "FoiaRequestCreate",
+    "FoiaRequestEventRead",
+    "FoiaRequestPage",
+    "FoiaRequestRead",
+    "FoiaRequestTransition",
+    "FoiaRequestUpdate",
+    "FoiaTemplateList",
+    "FoiaTemplateRead",
+    "FoiaTemplateRenderRequest",
+    "FoiaTemplateRenderResponse",
+]
