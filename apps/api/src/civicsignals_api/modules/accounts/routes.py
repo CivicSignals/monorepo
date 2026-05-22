@@ -22,10 +22,12 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
+import structlog
 from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from civicsignals_api import events
 from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import (
     CurrentUser,
@@ -44,6 +46,8 @@ from .schemas import (
     WorkspaceOut,
     WorkspacePage,
 )
+
+logger = structlog.get_logger(__name__)
 
 # Module namespace (account-level endpoints attach here in later epics).
 router = APIRouter()
@@ -291,8 +295,23 @@ async def update_member_role(
             title="Cannot change owner role",
             detail="The workspace owner's role cannot be changed.",
         )
+    old_role = target.role
     await services.set_member_role(session, membership=target, role=body.role)
     await session.commit()
+    # B9: emit audit event for role change (best-effort).
+    try:
+        await events.publish(
+            events.MEMBER_ROLE_CHANGED,
+            {
+                "user_id": str(ctx.user.id),
+                "workspace_id": str(workspace_id),
+                "target_user_id": str(user_id),
+                "old_role": old_role.value,
+                "new_role": body.role.value,
+            },
+        )
+    except Exception:
+        logger.warning("member_role_changed_event_failed", workspace_id=str(workspace_id))
     return MemberOut.model_validate(target)
 
 

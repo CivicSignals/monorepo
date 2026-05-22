@@ -25,7 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api import events
 from civicsignals_api.config import Settings, get_settings
 from civicsignals_api.db import get_session
-from civicsignals_api.events import AUTH_PASSWORD_RESET_COMPLETED, AUTH_PASSWORD_RESET_REQUESTED
+from civicsignals_api.events import (
+    AUTH_LOGIN,
+    AUTH_PASSWORD_RESET_COMPLETED,
+    AUTH_PASSWORD_RESET_REQUESTED,
+)
 from civicsignals_api.modules.accounts import services as accounts_services
 from civicsignals_api.modules.accounts.schemas import UserOut
 from civicsignals_api.modules.notifications import services as notifications_services
@@ -144,6 +148,12 @@ async def login(body: LoginRequest, session: SessionDep, settings: SettingsDep) 
             detail="Verify your email address before signing in.",
         ) from exc
 
+    # B9: emit login audit event (best-effort; never fails the response).
+    try:
+        await events.publish(AUTH_LOGIN, {"user_id": str(user.id), "email": user.email})
+    except Exception:
+        logger.warning("auth_login_event_failed", user_id=str(user.id))
+
     return AuthResponse(
         user=UserOut.model_validate(user),
         tokens=_token_pair(user.id, settings),
@@ -247,7 +257,7 @@ async def password_reset_request(
         )
         await session.commit()
         _send_password_reset_email(email, raw_token, settings)
-        # TODO B9: persist audit entry — currently emitted on the in-process bus only.
+        # B9: the admin audit listener persists this event as an audit row.
         # Best-effort: a failing subscriber must not leak user existence via 500 vs 204.
         try:
             # Use user.email (normalized/canonical) rather than the raw request
@@ -296,7 +306,7 @@ async def password_reset_confirm(
             detail="This reset link is invalid, expired, or already used.",
         ) from exc
 
-    # TODO B9: persist audit entry — currently emitted on the in-process bus only.
+    # B9: the admin audit listener persists this event as an audit row.
     # Best-effort: the password is already committed; a failing subscriber must not
     # cause the client to see 500 and potentially retry with the now-consumed token.
     try:
