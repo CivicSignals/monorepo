@@ -498,7 +498,7 @@ async def _make_icp(
         id=uuid.uuid4(),
         workspace_id=workspace_id,
         name="Test ICP",
-        countries=["US"],
+        countries=[],  # unrestricted: signals in tests have no entity/country
         states=[],
         entity_kinds=[],
         signal_types=signal_types if signal_types is not None else ["rfp_posted"],
