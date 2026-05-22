@@ -15,6 +15,11 @@ FOIA request endpoints (M2)
 ``POST   /api/v1/foia/requests/{id}/transition`` — advance the state machine.
 ``GET    /api/v1/foia/requests/{id}/events``   — status-transition history.
 
+FOIA reminder config endpoints (M5)
+-------------------------------------
+``GET   /api/v1/foia/requests/{id}/reminder``  — get reminder config.
+``PATCH /api/v1/foia/requests/{id}/reminder``  — update reminder config.
+
 **Workspace scoping (M2):** FOIA request endpoints require the
 ``X-Workspace-Id`` header (or a ``last_active_workspace_id`` fallback) via
 :data:`auth.dependencies.CurrentWorkspace`. Template endpoints are
@@ -44,6 +49,8 @@ from civicsignals_api.problems import ProblemException
 from . import services
 from .models import ALLOWED_TRANSITIONS, FoiaRequestStatus
 from .schemas import (
+    FoiaReminderConfigRead,
+    FoiaReminderConfigUpdate,
     FoiaRequestCreate,
     FoiaRequestEventRead,
     FoiaRequestPage,
@@ -433,3 +440,90 @@ async def list_request_events(
     except services.FoiaRequestNotFoundError:
         raise _request_not_found(request_id) from None
     return [FoiaRequestEventRead.model_validate(e) for e in events]
+
+
+# ---------------------------------------------------------------------------
+# M5 — Reminder config endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/requests/{request_id}/reminder",
+    response_model=FoiaReminderConfigRead,
+    summary="Get FOIA reminder configuration",
+    description=(
+        "Return the current reminder configuration for a FOIA request. "
+        "Reminder rules control when nudge emails are sent after a request "
+        "has been in ``sent`` status with no acknowledgement or response."
+    ),
+)
+async def get_reminder_config(
+    request_id: uuid.UUID,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+) -> FoiaReminderConfigRead:
+    """Return reminder config for a FOIA request (M5)."""
+    try:
+        config = await services.get_reminder_config(
+            session, request_id=request_id, workspace_id=ctx.workspace_id
+        )
+    except services.FoiaRequestNotFoundError:
+        raise _request_not_found(request_id) from None
+    return FoiaReminderConfigRead(
+        reminder_enabled=config.reminder_enabled,
+        reminder_days=config.reminder_days,
+        reminder_interval_days=config.reminder_interval_days,
+        reminder_max=config.reminder_max,
+        last_reminded_at=config.last_reminded_at,
+        reminder_count=config.reminder_count,
+    )
+
+
+@router.patch(
+    "/requests/{request_id}/reminder",
+    response_model=FoiaReminderConfigRead,
+    summary="Update FOIA reminder configuration",
+    description=(
+        "Patch the reminder configuration for a FOIA request. "
+        "All fields are optional; only supplied non-null values are applied. "
+        "``reminder_days`` sets the initial silence threshold (days after sent_at). "
+        "``reminder_interval_days`` controls how often to repeat. "
+        "``reminder_max`` caps the total number of nudges (0 = unlimited). "
+        "Returns a 422 error for invalid values."
+    ),
+)
+async def update_reminder_config(
+    request_id: uuid.UUID,
+    body: FoiaReminderConfigUpdate,
+    ctx: CurrentWorkspace,
+    session: SessionDep,
+) -> FoiaReminderConfigRead:
+    """Update reminder config for a FOIA request (M5)."""
+    try:
+        config = await services.update_reminder_config(
+            session,
+            request_id=request_id,
+            workspace_id=ctx.workspace_id,
+            reminder_enabled=body.reminder_enabled,
+            reminder_days=body.reminder_days,
+            reminder_interval_days=body.reminder_interval_days,
+            reminder_max=body.reminder_max,
+        )
+    except services.FoiaRequestNotFoundError:
+        raise _request_not_found(request_id) from None
+    except services.FoiaReminderConfigError as exc:
+        raise ProblemException(
+            status=422,
+            code="foia_reminder_config_invalid",
+            title="Invalid reminder configuration",
+            detail=str(exc),
+        ) from exc
+    await session.commit()
+    return FoiaReminderConfigRead(
+        reminder_enabled=config.reminder_enabled,
+        reminder_days=config.reminder_days,
+        reminder_interval_days=config.reminder_interval_days,
+        reminder_max=config.reminder_max,
+        last_reminded_at=config.last_reminded_at,
+        reminder_count=config.reminder_count,
+    )
