@@ -33,9 +33,9 @@ The Smart Search UI landing (epic I3) is under development. This page describes 
 
 ## Rate limits
 
-Smart Search is rate-limited per plan:
+Smart Search is rate-limited per billing month (calendar month, UTC):
 
-| Plan | Smart searches per day |
+| Plan | Smart searches per month |
 |---|---|
 | Solo | 20 |
 | Starter | 100 |

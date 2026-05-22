@@ -78,17 +78,25 @@ Each entity profile includes a **Contacts** section showing staff contacts sourc
 | **Email** | Validated email address (when public). |
 | **Phone** | Public phone number (when available). |
 | **Source URL** | The official directory page this contact was sourced from. |
-| **Last verified** | When CivicSignals last confirmed this contact was active. |
-| **Status** | `verified` (email bounced less than 30 days ago) or `stale` (email bounced or not re-verified in >30 days). |
+| **Last verified** | When CivicSignals last confirmed this contact's email was deliverable. |
+| **Verified** | Boolean flag set to `true` when the contact's email has passed validation. |
+| **Status** | One of `active`, `inactive`, `stale`, `bounced`, or `invalid` (see below). |
 
-### Verification status
+### Contact status
 
-CivicSignals validates contact emails on a 30-day cycle. If an email bounces:
+| Status | Meaning |
+|---|---|
+| **active** | The contact is current and the email has been successfully validated. |
+| **inactive** | The contact record exists but is no longer at the entity (e.g. has left the role). |
+| **stale** | The email has not been re-validated within the 30-day cycle. |
+| **bounced** | A recent email validation returned a bounce. Treat this address with caution. |
+| **invalid** | The address has been confirmed undeliverable or reported incorrect. |
 
-- After 1–2 bounces, the contact is marked **stale** and shown with a warning badge.
-- After 3 consecutive bounces, the contact is hidden from suggestions but kept in the record for reference.
+### Email verification
 
-A **stale** badge on a contact means the email address may no longer be deliverable — verify through LinkedIn or a direct call before using it in outreach.
+CivicSignals validates contact emails on a 30-day cycle. After 3 consecutive bounces, the contact is hidden from suggestions but kept in the record for historical reference.
+
+A **stale** or **bounced** status means the email address may no longer be deliverable — verify through a direct channel before using it in outreach.
 
 ### Contact export
 
@@ -96,9 +104,9 @@ Admins and Members can export contacts to CSV. Exports are quota-limited per pla
 
 | Plan | Contact exports per month |
 |---|---|
-| Solo | 20 |
-| Starter | 100 |
-| Pro | 500 |
+| Solo | 50 |
+| Starter | 500 |
+| Pro | Unlimited |
 | Enterprise / Self-hosted | Unlimited |
 
 The current quota usage appears in **Settings → Billing → Usage**.

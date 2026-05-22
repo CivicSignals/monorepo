@@ -74,11 +74,11 @@ All plans include a **14-day free trial** with no credit card required.
 
 ### Usage meters
 
-Go to **Settings → Billing** (`/settings/billing`) to see your current plan and usage for this billing period. Usage meters track:
+Go to **Settings → Billing** (`/settings/billing`) to see your current plan and usage for this billing period (calendar month, UTC). Usage meters track:
 
-- **Contact exports** — how many contacts you have exported to CSV this month.
-- **Smart searches** — how many natural-language searches have been run today.
-- **Signals ingested** — total signals received this month.
+- **Contact exports per month** — how many contacts you have exported to CSV this billing month.
+- **Smart searches per month** — how many natural-language searches have been run this billing month.
+- **Saved searches** — how many saved searches currently exist in the workspace (not a time-windowed counter).
 
 When a usage meter turns amber, you are approaching the plan limit. When it turns red, you have exceeded the limit and further actions of that type are blocked until the billing period resets or you upgrade.
 

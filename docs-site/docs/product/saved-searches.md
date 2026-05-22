@@ -37,7 +37,7 @@ Saved searches will support the same filters as the signal feed:
 
 | Plan | Saved searches per workspace |
 |---|---|
-| Solo | 50 |
+| Solo | 20 |
 | Starter | 50 |
 | Pro | 200 |
 | Enterprise / Self-hosted | Unlimited |

@@ -19,7 +19,7 @@ An ICP definition has six dimensions:
 | **Geography** | Countries and US states to include. Defaults to all US states. |
 | **Entity types (segments)** | Which kinds of public-sector organisations to target. |
 | **Entity size** | Minimum and maximum enrollment/population bands and deal-size range. |
-| **Signal types and weights** | Which of the twelve signal types to track and how much to weight each. |
+| **Signal types and weights** | Which of the six ICP signal types to track and the 0–100 % importance weight for each. |
 | **Keywords and threshold** | Required keywords, excluded keywords, and the minimum score a signal must reach to appear in your feed. |
 
 ## Scoring
@@ -82,22 +82,33 @@ The **deal band** (`deal_band_min_cents` and `deal_band_max_cents`) filters sign
 
 ## Signal types and weights
 
-Assign a weight from 1 (low) to 10 (high) to each signal type you care about. The weight multiplies into the ICP score calculation.
+The ICP wizard currently supports **six signal types**. For each type you select, you assign an **importance weight** expressed as a percentage (0–100 %). The weight controls how much that signal type contributes to the ICP score for incoming signals.
+
+| ICP signal type | Description |
+|---|---|
+| **RFP Posted** | Formal requests for proposals your target entities have issued. |
+| **Budget Drafted** | Draft or approved budget documents revealing spend plans. |
+| **Personnel Change** | Leadership or procurement-role changes at target entities. |
+| **Grant Awarded** | Federal or state grant awards flowing to target entities. |
+| **Board Decision** | Key votes, resolutions, and agenda items from board meetings. |
+| **News Mention** | News articles and press releases mentioning target entities. |
 
 **Example weighting for an EdTech SaaS vendor:**
 
 | Signal type | Suggested weight | Rationale |
 |---|---|---|
-| RFP posted | 10 | Highest purchase intent. |
-| Contract expiring | 9 | Competitor renewal window. |
-| Budget approved | 7 | Funding confirmed for the year. |
-| Leadership change | 6 | New buyer, often re-evaluates vendors. |
-| Board agenda item | 5 | Early signal, often precedes RFP. |
-| Grant awarded | 4 | Implementation spend typically follows. |
-| Strategic plan published | 3 | Long-lead indicator of future spend. |
-| News mention | 1 | Broad awareness, not purchase intent. |
+| RFP Posted | 100 % | Highest purchase intent. |
+| Budget Drafted | 80 % | Funding confirmed for the year. |
+| Personnel Change | 60 % | New buyer, often re-evaluates vendors. |
+| Board Decision | 50 % | Early signal, often precedes RFP. |
+| Grant Awarded | 40 % | Implementation spend typically follows. |
+| News Mention | 10 % | Broad awareness, not purchase intent. |
 
-Leave a signal type weight at 0 (or unselected) to exclude that type from scoring.
+Leave a signal type unselected to exclude it from scoring.
+
+:::info Full signal taxonomy
+CivicSignals ingests twelve canonical signal types total (including contract expiring, contract awarded, strategic plan, open job, grant opportunity, and RFI/RFQ — see the [signal feed overview](/product/feed)). The ICP wizard currently exposes the six types above for scoring; the remaining types will be added in a future release.
+:::
 
 ## Keywords
 

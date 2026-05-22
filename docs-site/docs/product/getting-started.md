@@ -54,9 +54,11 @@ There are three roles in a workspace:
 
 | Role | What they can do |
 |---|---|
-| **Admin** | Full access: ICP, members, billing, integrations, audit log. Also the workspace owner (for billing). |
+| **Admin** | Full access: ICP, members, integrations, audit log. Admins who created the workspace are also the **owner** — only the owner can manage billing and change the subscription plan. |
 | **Member** | Create saved searches, push signals to CRM, manage their own pipeline view, file FOIA requests, export contacts (within quota). |
 | **Viewer** | Read-only across all entities and signals; cannot create searches or push to CRM. |
+
+**Owner vs Admin:** The workspace owner has the admin role plus exclusive access to billing settings (changing plans, adding payment methods, managing seats). A workspace can have multiple admins but only one owner. The owner designation can be transferred to another admin.
 
 Admins invite new members via **Settings → Members → Invite member**. Invitation links are valid for 7 days.
 

@@ -47,22 +47,20 @@ Leave these blank to impose no size filter.
 
 ## Step 4 — Signal types and weights
 
-Choose which of the twelve signal types matter to you and assign a weight (1–10) to each. Higher-weight signal types contribute more to the ICP score on a signal.
+Choose which of the six signal types the ICP wizard currently supports and assign a weight to each. The weight is a percentage (0–100 %) that controls how much each signal type contributes to the ICP score.
 
 | Signal type | What it indicates |
 |---|---|
-| RFP posted | A formal request for proposals or invitation for bids has been published. |
-| RFI / RFQ | A pre-RFP information-gathering or quote request — early pipeline signal. |
-| Contract expiring | An existing contract is within the 6–12 month renewal window. |
-| Contract awarded | A contract award has been recorded on a procurement portal or board resolution. |
-| Budget approved | A budget document or line item has been approved. |
-| Grant awarded | The entity received a grant (potential implementation spend follows). |
-| Grant opportunity | A federal or state grant programme is now open. |
-| Leadership change | A new CIO, CTO, superintendent, city manager, or equivalent has been appointed. |
-| Board agenda item | An upcoming board meeting agenda item touching procurement, budget, or strategy. |
-| Strategic plan published | A new multi-year strategic, technology, or capital plan has been published. |
-| Open job | A posted role in a procurement-relevant position. |
-| News mention | A news article naming the entity in a procurement-relevant context. |
+| RFP Posted | A formal request for proposals your target entities have issued. |
+| Budget Drafted | Draft or approved budget documents revealing spend plans. |
+| Personnel Change | Leadership or procurement-role changes at target entities. |
+| Grant Awarded | Federal or state grant awards flowing to target entities. |
+| Board Decision | Key votes, resolutions, and agenda items from board meetings. |
+| News Mention | News articles and press releases mentioning target entities. |
+
+:::info Full signal taxonomy
+CivicSignals tracks twelve canonical signal types in the ingestion pipeline (RFP posted, contract expiring, leadership change, and more — see the [signal feed overview](/product/feed)). The ICP wizard currently exposes the six types above. Additional types will be wired into ICP scoring in a future release.
+:::
 
 ## Step 5 — Keywords and threshold
 
