@@ -35,6 +35,8 @@ celery_app.conf.task_routes = {
     "notifications.*": {"queue": "notify"},
     "searches.*": {"queue": "notify"},
     "integrations.*": {"queue": "notify"},
+    # M5: FOIA reminder emails are notification-flavoured work — notify worker.
+    "foia.*": {"queue": "notify"},
 }
 
 # Beat schedule (doc 06 §8). Tasks are defined in each module's tasks.py.
@@ -64,6 +66,13 @@ celery_app.conf.beat_schedule = {
     "telemetry.ping": {
         "task": "telemetry.ping",
         "schedule": crontab(hour=3, minute=0, day_of_week=1),  # weekly, Monday 03:00
+    },
+    # M5: FOIA reminder nudges — run every 6 hours so time zones don't cause
+    # a 24-hour delay; the mark_reminded idempotency guard prevents double-send
+    # within the same calendar day.
+    "foia.send_foia_reminders": {
+        "task": "foia.send_foia_reminders",
+        "schedule": crontab(minute=0, hour="*/6"),
     },
 }
 

@@ -1,4 +1,4 @@
-"""Pydantic request/response shapes for the foia module (doc 06 §3, M2).
+"""Pydantic request/response shapes for the foia module (doc 06 §3, M2 + M5).
 
 Template responses are **global reference data** — not workspace-scoped —
 so those shapes carry no workspace fields. The template list response uses
@@ -7,6 +7,10 @@ and static (M1).
 
 FOIA request shapes are workspace-scoped and use cursor pagination per
 doc 06 §5 (``cursor`` + ``limit`` query params, ``next_cursor`` in responses).
+
+M5 adds reminder config shapes:
+- :class:`FoiaReminderConfigRead` — current reminder settings for a request.
+- :class:`FoiaReminderConfigUpdate` — PATCH body for the reminder config endpoint.
 """
 
 from __future__ import annotations
@@ -266,3 +270,71 @@ class FoiaRequestEventRead(BaseModel):
     from_status: str
     to_status: str
     occurred_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# M5 — Reminder config shapes
+# ---------------------------------------------------------------------------
+
+
+class FoiaReminderConfigRead(BaseModel):
+    """Current reminder configuration for a FOIA request (M5).
+
+    Returned by ``GET /api/v1/foia/requests/{id}/reminder`` and by the PATCH
+    endpoint after a successful update.
+    """
+
+    model_config = ConfigDict(from_attributes=False)
+
+    reminder_enabled: bool = Field(
+        description="Whether periodic reminder nudges are active for this request."
+    )
+    reminder_days: int = Field(
+        description=(
+            "Days after sent_at before the first reminder email fires. "
+            "Seeded from the template's statutory deadline at creation time."
+        )
+    )
+    reminder_interval_days: int = Field(
+        description="Days between subsequent reminder emails after the first."
+    )
+    reminder_max: int = Field(
+        description="Maximum reminder emails to send. 0 means unlimited."
+    )
+    last_reminded_at: datetime | None = Field(
+        default=None,
+        description="UTC timestamp of the most recent reminder email; null if never sent.",
+    )
+    reminder_count: int = Field(description="Total reminder emails sent so far.")
+
+
+class FoiaReminderConfigUpdate(BaseModel):
+    """PATCH body for ``PATCH /api/v1/foia/requests/{id}/reminder`` (M5).
+
+    All fields are optional; only supplied non-null values are applied.
+
+    ``reminder_days`` and ``reminder_interval_days`` must be >= 1.
+    ``reminder_max`` must be >= 0 (0 = unlimited).
+    """
+
+    model_config = ConfigDict(from_attributes=False)
+
+    reminder_enabled: bool | None = Field(
+        default=None,
+        description="Enable or disable reminders for this request.",
+    )
+    reminder_days: int | None = Field(
+        default=None,
+        ge=1,
+        description="Days after sent_at before the first reminder fires.",
+    )
+    reminder_interval_days: int | None = Field(
+        default=None,
+        ge=1,
+        description="Days between subsequent reminders.",
+    )
+    reminder_max: int | None = Field(
+        default=None,
+        ge=0,
+        description="Maximum reminders to send (0 = unlimited).",
+    )

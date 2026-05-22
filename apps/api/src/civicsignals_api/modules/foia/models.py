@@ -1,11 +1,11 @@
-"""foia SQLAlchemy models (M2).
+"""foia SQLAlchemy models (M2 + M5).
 
 Tables are prefixed ``foia_`` and are migrated only by this module (doc 06 §3,
 §4). Two tables:
 
 - ``foia_request`` — workspace-scoped FOIA / public-records request with a
   four-status state machine (draft → sent → ack → response) and optional
-  template reference.
+  template reference. M5 adds reminder-config columns.
 - ``foia_request_event`` — immutable status-transition history (one row per
   transition). Preferred over a single ``status_history JSONB`` column so that
   partial-index queries, future automation (M5 reminders), and audit are easy.
@@ -27,6 +27,16 @@ Timestamps set by :func:`services.transition_request`:
 - ``sent_at``    — set on draft→sent transition.
 - ``ack_at``     — set on sent→ack transition.
 - ``response_at`` — set on ack→response transition.
+
+M5 reminder columns on ``foia_request``:
+- ``reminder_enabled``   — whether periodic nudge emails are active.
+- ``reminder_days``      — days after ``sent_at`` before first reminder fires.
+  Defaults to the template's ``deadline_days`` when the request has a
+  jurisdiction, otherwise :data:`DEFAULT_REMINDER_DAYS`.
+- ``reminder_interval_days`` — how often to repeat after the first reminder.
+- ``reminder_max``        — maximum number of reminder emails to send.
+- ``last_reminded_at``   — UTC timestamp of the most recent reminder email.
+- ``reminder_count``     — total reminder emails sent for this request.
 """
 
 from __future__ import annotations
@@ -36,11 +46,13 @@ from datetime import datetime
 from enum import StrEnum
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     func,
@@ -99,6 +111,20 @@ class SubmissionMethod(StrEnum):
     IN_PERSON = "in_person"
 
 
+# ---------------------------------------------------------------------------
+# M5 reminder defaults
+# ---------------------------------------------------------------------------
+
+#: Default initial-reminder threshold when no jurisdiction deadline is known.
+DEFAULT_REMINDER_DAYS: int = 20
+
+#: Default repeat interval between subsequent reminder emails.
+DEFAULT_REMINDER_INTERVAL_DAYS: int = 7
+
+#: Default maximum reminders to send before giving up.
+DEFAULT_REMINDER_MAX: int = 3
+
+
 class FoiaRequest(Base):
     """A FOIA / public-records request (workspace-scoped, M2).
 
@@ -139,6 +165,14 @@ class FoiaRequest(Base):
         Index("ix_foia_request_created_by", "created_by"),
         Index("ix_foia_request_entity_id", "entity_id"),
         Index("ix_foia_request_workspace_status", "workspace_id", "status"),
+        # M5: partial index for the beat-task reminder scan — only rows where
+        # reminders are enabled and no terminal response has arrived yet.
+        Index(
+            "ix_foia_request_reminder_scan",
+            "status",
+            "reminder_enabled",
+            postgresql_where="status = 'sent' AND reminder_enabled = true",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
@@ -216,6 +250,41 @@ class FoiaRequest(Base):
 
     # Free-text notes from the requester after receiving a response.
     response_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # -----------------------------------------------------------------------
+    # M5 reminder config — stored on the request so each request can be
+    # configured independently (different agencies have different cultures).
+    # -----------------------------------------------------------------------
+
+    #: Whether periodic reminder nudges are active for this request.
+    reminder_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+
+    #: Days after ``sent_at`` before the *first* reminder email fires.
+    #: Seeded from the template's ``deadline_days`` at creation time (if the
+    #: request has a jurisdiction); falls back to DEFAULT_REMINDER_DAYS.
+    reminder_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=str(DEFAULT_REMINDER_DAYS)
+    )
+
+    #: How often to re-send after the first reminder (days).
+    reminder_interval_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=str(DEFAULT_REMINDER_INTERVAL_DAYS)
+    )
+
+    #: Maximum number of reminders to send before stopping (0 = unlimited).
+    reminder_max: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=str(DEFAULT_REMINDER_MAX)
+    )
+
+    #: UTC timestamp of the most recent reminder email (NULL = never sent).
+    last_reminded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    #: Total number of reminder emails sent for this request.
+    reminder_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

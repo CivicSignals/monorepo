@@ -44,6 +44,29 @@ at MVP).
 #   calls the integration layer to send the rendered body via email / portal.
 #   At that point ``submission_method`` drives routing. This function is the
 #   seam — callers today call transition(req, SENT); v2 replaces or wraps this.
+
+FOIA reminder rules (M5)
+------------------------
+:func:`get_reminder_config` — return the current reminder config for a request.
+:func:`update_reminder_config` — patch reminder config (enabled/days/interval/max).
+:func:`list_overdue_reminders` — scan for requests that need a nudge right now
+  (called by the Celery beat task). Returns each request together with the
+  requester's email so the task can send without an extra query.
+:func:`mark_reminded` — record that a reminder was just sent (update
+  ``last_reminded_at`` + ``reminder_count``). Idempotent within the same day
+  (returns False if already sent today, True if the row was updated).
+
+Logic
+~~~~~
+A request is *due for a reminder* when ALL of the following are true:
+1. ``status == 'sent'`` (no ack or response yet).
+2. ``reminder_enabled`` is True.
+3. ``reminder_count < reminder_max`` (or ``reminder_max == 0`` for unlimited).
+4. ``sent_at`` is not None and is older than ``reminder_days`` days (for the
+   first reminder) or older than ``last_reminded_at + reminder_interval_days``
+   days (for subsequent reminders).
+5. ``last_reminded_at`` is None **or** more than ``reminder_interval_days`` days
+   ago (prevents double-send on the same day even if the task re-runs).
 """
 
 from __future__ import annotations
@@ -53,9 +76,10 @@ import binascii
 import re
 import string
 import uuid
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import yaml
 from sqlalchemy import select
@@ -63,6 +87,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
     ALLOWED_TRANSITIONS,
+    DEFAULT_REMINDER_DAYS,
+    DEFAULT_REMINDER_INTERVAL_DAYS,
+    DEFAULT_REMINDER_MAX,
     FoiaRequest,
     FoiaRequestEvent,
     FoiaRequestStatus,
@@ -185,6 +212,39 @@ class FoiaEntityNotFoundError(LookupError):
     def __init__(self, entity_id: uuid.UUID) -> None:
         self.entity_id = entity_id
         super().__init__(f"Entity {entity_id} not found in the entity directory.")
+
+
+class FoiaReminderConfigError(ValueError):
+    """Raised when reminder configuration values are invalid (M5)."""
+
+
+# ---------------------------------------------------------------------------
+# M5 data shapes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReminderConfig:
+    """Current reminder settings for a FOIA request (M5 response shape)."""
+
+    reminder_enabled: bool
+    reminder_days: int
+    reminder_interval_days: int
+    reminder_max: int
+    last_reminded_at: datetime | None
+    reminder_count: int
+
+
+@dataclass(frozen=True)
+class OverdueReminder:
+    """A request that needs a reminder email, together with the requester's email (M5)."""
+
+    request_id: uuid.UUID
+    workspace_id: uuid.UUID
+    subject: str
+    requester_email: str
+    sent_at: datetime
+    reminder_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +616,18 @@ async def create_request(
             "Either 'body' or both 'jurisdiction' and 'template_context' must be supplied."
         )
 
+    # M5: seed reminder_days from the template's statutory deadline when the
+    # request is created from a jurisdiction template. Callers can override
+    # this later via update_reminder_config.
+    initial_reminder_days: int = DEFAULT_REMINDER_DAYS
+    if jurisdiction is not None:
+        try:
+            tmpl = get_template(jurisdiction)
+            if tmpl.deadline_days and tmpl.deadline_days > 0:
+                initial_reminder_days = tmpl.deadline_days
+        except TemplateNotFoundError:
+            pass  # already raised above if body came from template render
+
     req = FoiaRequest(
         workspace_id=workspace_id,
         created_by=created_by,
@@ -566,6 +638,11 @@ async def create_request(
         submission_method=submission_method,
         submission_target=submission_target,
         status=FoiaRequestStatus.DRAFT.value,
+        reminder_days=initial_reminder_days,
+        reminder_interval_days=DEFAULT_REMINDER_INTERVAL_DAYS,
+        reminder_max=DEFAULT_REMINDER_MAX,
+        reminder_enabled=True,
+        reminder_count=0,
     )
     session.add(req)
     await session.flush()
@@ -754,3 +831,218 @@ async def list_request_events(
         .order_by(FoiaRequestEvent.occurred_at)
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+# ---------------------------------------------------------------------------
+# M5 — Reminder config get/set + beat-task helpers
+# ---------------------------------------------------------------------------
+
+
+async def get_reminder_config(
+    session: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> ReminderConfig:
+    """Return the current reminder configuration for a FOIA request (M5).
+
+    Raises :exc:`FoiaRequestNotFoundError` if the request is not found in the
+    workspace.
+    """
+    req = await get_request(session, request_id=request_id, workspace_id=workspace_id)
+    return ReminderConfig(
+        reminder_enabled=req.reminder_enabled,
+        reminder_days=req.reminder_days,
+        reminder_interval_days=req.reminder_interval_days,
+        reminder_max=req.reminder_max,
+        last_reminded_at=req.last_reminded_at,
+        reminder_count=req.reminder_count,
+    )
+
+
+async def update_reminder_config(
+    session: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    reminder_enabled: bool | None = None,
+    reminder_days: int | None = None,
+    reminder_interval_days: int | None = None,
+    reminder_max: int | None = None,
+) -> ReminderConfig:
+    """Patch the reminder configuration for a FOIA request (M5).
+
+    All parameters are optional; only supplied non-None values are applied.
+
+    Raises:
+        FoiaRequestNotFoundError: if the request is not found.
+        FoiaReminderConfigError: if any supplied value is out of range
+            (reminder_days < 1, reminder_interval_days < 1, reminder_max < 0).
+    """
+    if reminder_days is not None and reminder_days < 1:
+        raise FoiaReminderConfigError("reminder_days must be >= 1")
+    if reminder_interval_days is not None and reminder_interval_days < 1:
+        raise FoiaReminderConfigError("reminder_interval_days must be >= 1")
+    if reminder_max is not None and reminder_max < 0:
+        raise FoiaReminderConfigError("reminder_max must be >= 0 (0 = unlimited)")
+
+    req = await get_request(session, request_id=request_id, workspace_id=workspace_id)
+
+    if reminder_enabled is not None:
+        req.reminder_enabled = reminder_enabled
+    if reminder_days is not None:
+        req.reminder_days = reminder_days
+    if reminder_interval_days is not None:
+        req.reminder_interval_days = reminder_interval_days
+    if reminder_max is not None:
+        req.reminder_max = reminder_max
+
+    await session.flush()
+    return ReminderConfig(
+        reminder_enabled=req.reminder_enabled,
+        reminder_days=req.reminder_days,
+        reminder_interval_days=req.reminder_interval_days,
+        reminder_max=req.reminder_max,
+        last_reminded_at=req.last_reminded_at,
+        reminder_count=req.reminder_count,
+    )
+
+
+class _ReminderCheckable(Protocol):
+    """Structural type accepted by :func:`is_reminder_due` (M5).
+
+    Separating this from :class:`.models.FoiaRequest` lets tests pass a plain
+    ``types.SimpleNamespace`` or ``dataclasses.dataclass`` without constructing
+    a live SQLAlchemy-mapped row.
+    """
+
+    status: str
+    reminder_enabled: bool
+    sent_at: datetime | None
+    reminder_max: int
+    reminder_count: int
+    last_reminded_at: datetime | None
+    reminder_days: int
+    reminder_interval_days: int
+
+
+def is_reminder_due(req: _ReminderCheckable, *, now: datetime | None = None) -> bool:
+    """Return True if *req* needs a reminder email right now.
+
+    Pure function — no I/O.  Used by the beat task and by tests.
+
+    A request is *due* when:
+    1. ``status == 'sent'``.
+    2. ``reminder_enabled`` is True.
+    3. ``reminder_max == 0`` (unlimited) **or** ``reminder_count < reminder_max``.
+    4. ``sent_at`` is not None.
+    5. For the *first* reminder (``reminder_count == 0``):
+       ``now - sent_at >= reminder_days``.
+    6. For *subsequent* reminders:
+       ``now - last_reminded_at >= reminder_interval_days``.
+    7. Idempotency guard: ``last_reminded_at`` is None **or** its calendar
+       *date* is before today (prevents double-send if the task re-runs on the
+       same calendar day).
+    """
+    _now = now if now is not None else datetime.now(UTC)
+
+    if req.status != FoiaRequestStatus.SENT.value:
+        return False
+    if not req.reminder_enabled:
+        return False
+    if req.sent_at is None:
+        return False
+    if req.reminder_max > 0 and req.reminder_count >= req.reminder_max:
+        return False
+
+    # Idempotency: don't re-send on the same calendar day.
+    if req.last_reminded_at is not None:
+        last_date: date = req.last_reminded_at.astimezone(UTC).date()
+        today: date = _now.astimezone(UTC).date()
+        if last_date >= today:
+            return False
+
+    if req.reminder_count == 0:
+        # First reminder: check against initial threshold.
+        threshold = req.sent_at + timedelta(days=req.reminder_days)
+    else:
+        # Subsequent reminders: check against last remind time.
+        if req.last_reminded_at is None:
+            # Defensive: treat as if first.
+            threshold = req.sent_at + timedelta(days=req.reminder_days)
+        else:
+            threshold = req.last_reminded_at + timedelta(days=req.reminder_interval_days)
+
+    return _now >= threshold
+
+
+async def list_overdue_reminders(session: AsyncSession) -> list[OverdueReminder]:
+    """Return all requests across all workspaces that need a reminder now (M5).
+
+    Called by the Celery beat task.  Joins to ``accounts_user`` so the requester's
+    email is available without a second query.  Only considers requests in ``sent``
+    status with ``reminder_enabled = true``.
+    """
+    from civicsignals_api.modules.accounts.models import User
+
+    stmt = (
+        select(FoiaRequest, User.email)
+        .join(User, User.id == FoiaRequest.created_by)
+        .where(
+            FoiaRequest.status == FoiaRequestStatus.SENT.value,
+            FoiaRequest.reminder_enabled.is_(True),
+        )
+    )
+    rows = list((await session.execute(stmt)).all())
+
+    now = datetime.now(UTC)
+    result: list[OverdueReminder] = []
+    for req, requester_email in rows:
+        if is_reminder_due(req, now=now):
+            result.append(
+                OverdueReminder(
+                    request_id=req.id,
+                    workspace_id=req.workspace_id,
+                    subject=req.subject,
+                    requester_email=requester_email,
+                    sent_at=req.sent_at,
+                    reminder_count=req.reminder_count,
+                )
+            )
+    return result
+
+
+async def mark_reminded(
+    session: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    now: datetime | None = None,
+) -> bool:
+    """Record that a reminder was just sent for *request_id* (M5).
+
+    Updates ``last_reminded_at`` and increments ``reminder_count``.
+
+    Idempotency: if ``last_reminded_at`` is already today's date (UTC), returns
+    ``False`` without updating (caller should not re-send).  Returns ``True``
+    when the row was updated.
+
+    Note: this function fetches by ``request_id`` only — no workspace scope
+    because it is called by the system beat task, not a user request.
+    """
+    _now = now if now is not None else datetime.now(UTC)
+
+    stmt = select(FoiaRequest).where(FoiaRequest.id == request_id)
+    req = (await session.execute(stmt)).scalar_one_or_none()
+    if req is None:
+        return False
+
+    if req.last_reminded_at is not None:
+        last_date = req.last_reminded_at.astimezone(UTC).date()
+        today = _now.astimezone(UTC).date()
+        if last_date >= today:
+            return False
+
+    req.last_reminded_at = _now
+    req.reminder_count = req.reminder_count + 1
+    await session.flush()
+    return True
