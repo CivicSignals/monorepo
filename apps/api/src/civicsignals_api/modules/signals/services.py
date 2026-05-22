@@ -14,6 +14,15 @@ E4 lands:
   by entity / signal type / date, not by workspace — per-workspace scoring is a
   separate table (``signals_workspace_score``, F3).
 
+E10 adds:
+
+- :func:`store_signal` now calls :func:`~signals.fuzzy_dedupe.run_fuzzy_dedupe`
+  after exact-match finds nothing, for high-stakes types (``rfp_posted``,
+  ``contract_expiring``) — doc 19 §7.4.
+- Fuzzy-dedupe helpers (:func:`get_fuzzy_review`, :func:`list_fuzzy_reviews`,
+  :func:`decide_fuzzy_review`) exposed through this public surface so the routes
+  module and any cross-module caller uses this seam only.
+
 Cursor pagination uses the same keyset strategy as the other modules (doc 06 §5):
 the UUID v7 id is time-ordered, so ``observed_at DESC, id DESC`` is a stable feed
 order and a base64-encoded id is the opaque cursor.
@@ -46,10 +55,29 @@ from .embedding import (
     embed_signals,
     embedding_text_for_signal,
 )
+from .fuzzy_dedupe import (
+    DEFAULT_FUZZY_CONFIG,
+    FUZZY_COSINE_THRESHOLD,
+    GRADUATION_COUNT,
+    HIGH_STAKES_TYPES,
+    FuzzyDedupeConfig,
+    FuzzyDedupeResult,
+    FuzzyReviewAlreadyDecidedError,
+    FuzzyReviewNotFoundError,
+    apply_fuzzy_review,
+    is_high_stakes_type,
+    run_fuzzy_dedupe,
+)
 from .models import (
     SIGNAL_STATUS_NEW,
     SIGNAL_STATUS_PENDING_REVIEW,
     Signal,
+)
+from .models_fuzzy_review import (
+    REVIEW_STATUS_APPROVED,
+    REVIEW_STATUS_PENDING,
+    REVIEW_STATUS_REJECTED,
+    SignalFuzzyReview,
 )
 from .schemas import (
     PAYLOAD_BY_TYPE,
@@ -138,10 +166,12 @@ class CandidateInput:
 async def promote_candidate_to_signal(
     session: AsyncSession,
     candidate: CandidateInput,
+    *,
+    fuzzy_config: FuzzyDedupeConfig = DEFAULT_FUZZY_CONFIG,
 ) -> Signal:
-    """Validate + promote a candidate into a global ``signals_signal`` row (E4).
+    """Validate + promote a candidate into a global ``signals_signal`` row (E4/E10).
 
-    The funnel's "store" step (doc 19 §1, §6.1). Two parts:
+    The funnel's "store" step (doc 19 §1, §6.1). Three parts:
 
     1. **Strict gate** (doc 19 §6.1, hard gate): the candidate's ``signal_type`` +
        ``fields`` are validated against the matching per-type schema via
@@ -149,13 +179,16 @@ async def promote_candidate_to_signal(
        :class:`SignalValidationError` — the extraction task turns that into the
        retry → dead-letter path with the surfaced error. **No partial signal is
        written on a validation failure.**
-    2. **Windowed dedupe** (doc 19 §7): compute the canonical per-type dedupe hash
-       from ``entity_id + signal_type + normalized_key_fields`` (``signals.dedupe``),
-       look for an existing signal with that hash within the type-specific window
-       (90d RFP, 365d contracts/budgets, 730d leadership, 60d board agenda — doc 19
-       §7.1); on a hit **merge** the new corroborating document(s) + higher
-       confidence into the surviving signal (doc 19 §7.3, no source doc lost); else
-       INSERT a new signal.
+    2. **Exact-key windowed dedupe** (doc 19 §7.1-§7.3; E5): compute the canonical
+       per-type dedupe hash from ``entity_id + signal_type + normalized_key_fields``,
+       look for an existing signal with that hash within the type-specific window;
+       on a hit **merge** the new corroborating document(s) + higher confidence into
+       the surviving signal (doc 19 §7.3, no source doc lost); else INSERT a new row.
+    3. **Embedding-based fuzzy dedupe** (doc 19 §7.4; E10) — only for high-stakes
+       types (``rfp_posted``, ``contract_expiring``) when exact-match found nothing:
+       embed the candidate's title+summary, ANN-query for ≥ 0.92 cosine similarity
+       within entity + signal_type + window. First 100 matches per type → human
+       review queue; after graduation → auto-merge (see :func:`run_fuzzy_dedupe`).
 
     The caller owns the transaction (this flushes, not commits).
 
@@ -164,18 +197,17 @@ async def promote_candidate_to_signal(
     ``candidate.confidence`` against the default thresholds otherwise; it sets the
     row's ``status``/``is_degraded``/``review_required`` flags. A ``rejected``-band
     candidate must not reach here — the pipeline drops it before store (doc 19 §6.3).
-
-    # TODO E10/I1: the embedding-based **fuzzy** dedupe fallback (doc 19 §7.4) for
-    # high-stakes types — this is the exact-key half (doc 19 §7.1-§7.3) only.
     """
     payload = parse_signal_payload(candidate.signal_type, candidate.fields)
-    return await store_signal(session, payload, candidate)
+    return await store_signal(session, payload, candidate, fuzzy_config=fuzzy_config)
 
 
 async def store_signal(
     session: AsyncSession,
     payload: SignalPayload,
     candidate: CandidateInput,
+    *,
+    fuzzy_config: FuzzyDedupeConfig = DEFAULT_FUZZY_CONFIG,
 ) -> Signal:
     """Store a validated payload into ``signals_signal`` with windowed dedupe (doc 19 §7).
 
@@ -183,7 +215,8 @@ async def store_signal(
     holds a validated :class:`SignalPayload` (e.g. a backfill or a test) can store
     it directly. Computes the canonical per-type dedupe hash, runs the type-windowed
     duplicate lookup (doc 19 §7.2), and either merges into the surviving signal
-    (doc 19 §7.3) or inserts a new one. The caller commits.
+    (doc 19 §7.3) or inserts a new one. For high-stakes types with no exact match,
+    runs embedding-based fuzzy dedupe (doc 19 §7.4; E10). The caller commits.
     """
     band = _resolve_band(candidate)
     review = band is ConfidenceBand.PENDING_REVIEW or candidate.entity_id is None
@@ -217,7 +250,11 @@ async def store_signal(
         await session.flush()
         return existing
 
-    # No duplicate within the window — a new signal (doc 19 §7.2 step 3).
+    # No exact duplicate within the window — insert a new signal row.
+    # For high-stakes types (doc 19 §7.4; E10) we then run the embedding-based
+    # fuzzy fallback against the newly-inserted row: insert first so the row
+    # has an id (needed by the review table FK-lookalike) and the ANN query
+    # can exclude it from its own results.
     row = Signal(
         id=uuid.uuid4(),
         entity_id=candidate.entity_id,
@@ -239,7 +276,21 @@ async def store_signal(
         review_required=review,
     )
     session.add(row)
-    await session.flush()
+    await session.flush()  # assign id before fuzzy path needs it
+
+    # E10: embedding-based fuzzy dedupe for high-stakes types (doc 19 §7.4).
+    # Only runs when exact-match found nothing (we are here) and the type qualifies.
+    if is_high_stakes_type(payload.signal_type, config=fuzzy_config):
+        await run_fuzzy_dedupe(
+            session,
+            candidate_signal=row,
+            signal_type=payload.signal_type,
+            new_doc_ids=raw_doc_ids,
+            new_confidence=candidate.confidence,
+            config=fuzzy_config,
+            now=now,
+        )
+
     return row
 
 
@@ -293,6 +344,84 @@ def dedupe_key_for_candidate(
     except ValueError:
         return None
     return compute_dedupe_hash(type_enum, entity_id, fields)
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy-review read / decision seam (E10 — doc 19 §7.4)
+# ---------------------------------------------------------------------------
+
+
+async def get_fuzzy_review(
+    session: AsyncSession,
+    review_id: uuid.UUID,
+) -> SignalFuzzyReview | None:
+    """Fetch one fuzzy-review row by id (E10 review endpoint read seam)."""
+    return await session.get(SignalFuzzyReview, review_id)
+
+
+async def list_fuzzy_reviews(
+    session: AsyncSession,
+    *,
+    signal_type: str | None = None,
+    status: str | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> tuple[list[SignalFuzzyReview], str | None]:
+    """Cursor-paginated list of fuzzy-review rows (E10; doc 19 §7.4).
+
+    Ordered ``created_at DESC, id DESC`` (newest first). Filters by ``signal_type``
+    and/or ``status`` (pending / approved / rejected). Returns ``(items, next_cursor)``
+    where ``next_cursor`` is a base64-encoded id or ``None`` if no further pages.
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    stmt = select(SignalFuzzyReview)
+    if signal_type is not None:
+        stmt = stmt.where(SignalFuzzyReview.signal_type == signal_type)
+    if status is not None:
+        stmt = stmt.where(SignalFuzzyReview.status == status)
+    if cursor is not None:
+        cursor_id = decode_cursor(cursor)
+        cursor_row = await session.get(SignalFuzzyReview, cursor_id)
+        if cursor_row is None:
+            raise ValueError("invalid cursor")
+        stmt = stmt.where(
+            (SignalFuzzyReview.created_at < cursor_row.created_at)
+            | (
+                (SignalFuzzyReview.created_at == cursor_row.created_at)
+                & (SignalFuzzyReview.id < cursor_id)
+            )
+        )
+    stmt = stmt.order_by(SignalFuzzyReview.created_at.desc(), SignalFuzzyReview.id.desc()).limit(
+        limit + 1
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = encode_cursor(items[-1].id) if has_more and items else None
+    return items, next_cursor
+
+
+async def decide_fuzzy_review(
+    session: AsyncSession,
+    review_id: uuid.UUID,
+    *,
+    approved: bool,
+    reviewer_note: str | None = None,
+) -> SignalFuzzyReview:
+    """Approve or reject a pending fuzzy-review row (E10; doc 19 §7.4).
+
+    Public seam so the routes module + any cross-module caller never imports
+    :mod:`signals.fuzzy_dedupe` directly (doc 06 §3). Delegates to
+    :func:`~signals.fuzzy_dedupe.apply_fuzzy_review`. Raises
+    :class:`FuzzyReviewNotFoundError` (404) or
+    :class:`FuzzyReviewAlreadyDecidedError` (409) on precondition failures.
+    """
+    return await apply_fuzzy_review(
+        session,
+        review_id,
+        approved=approved,
+        reviewer_note=reviewer_note,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -365,16 +494,28 @@ __all__ = [
     "DEDUPE_WINDOWS",
     "DEFAULT_CONFIG",
     "DEFAULT_DEDUPE_WINDOW",
+    "DEFAULT_FUZZY_CONFIG",
     "DEFAULT_LIMIT",
+    "FUZZY_COSINE_THRESHOLD",
+    "GRADUATION_COUNT",
+    "HIGH_STAKES_TYPES",
     "MAX_LIMIT",
     "PAYLOAD_BY_TYPE",
+    "REVIEW_STATUS_APPROVED",
+    "REVIEW_STATUS_PENDING",
+    "REVIEW_STATUS_REJECTED",
     "BandThresholds",
     "CandidateInput",
     "ConfidenceBand",
     "ConfidenceConfig",
     "ConfidenceWeights",
     "EmbeddingDimMismatchError",
+    "FuzzyDedupeConfig",
+    "FuzzyDedupeResult",
+    "FuzzyReviewAlreadyDecidedError",
+    "FuzzyReviewNotFoundError",
     "ScoreResult",
+    "SignalFuzzyReview",
     "SignalPage",
     "SignalPayload",
     "SignalRead",
@@ -385,17 +526,22 @@ __all__ = [
     "compute_dedupe_hash",
     "compute_dedupe_hash_for_payload",
     "config_from_recipe",
+    "decide_fuzzy_review",
     "decode_cursor",
     "dedupe_key_for_candidate",
     "embed_signals",
     "embedding_text_for_signal",
     "encode_cursor",
     "find_duplicate",
+    "get_fuzzy_review",
     "get_signal",
+    "is_high_stakes_type",
+    "list_fuzzy_reviews",
     "list_signals",
     "merge_signal",
     "parse_signal_payload",
     "promote_candidate_to_signal",
+    "run_fuzzy_dedupe",
     "score_candidate_confidence",
     "store_signal",
     "window_for",
