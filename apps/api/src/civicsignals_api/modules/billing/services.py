@@ -14,10 +14,14 @@ N1 implements:
   - :func:`record_webhook_event` — write to the idempotency event-log.
   - :func:`is_event_already_processed` — dedupe check before side-effects.
 
+N2 implements:
+  - :func:`get_workspace_plan` — resolve a workspace's effective plan (cheap, no Stripe call).
+  - :func:`plan_allows` — check whether a plan includes a feature flag.
+  - :func:`plan_limit` — retrieve a numeric quota limit for a plan/dimension pair.
+
 All Stripe network calls are mediated through the ``StripeClient`` protocol so
 tests can inject a mock without hitting the Stripe API.
 
-# TODO N2: add ``assign_plan(workspace_id, plan)`` once plan definitions land.
 # TODO N3: add ``record_usage(workspace_id, metric, delta)`` for metering.
 # TODO N4: add ``check_limit(workspace_id, metric)`` for hard limits.
 # TODO N5: add ``create_checkout_session`` / ``change_plan`` for self-serve flow.
@@ -42,6 +46,16 @@ from civicsignals_api.modules.billing.models import (
     BillingWebhookEvent,
     SubscriptionPlan,
     SubscriptionStatus,
+)
+from civicsignals_api.modules.billing.plans import (
+    Dimension,
+    Feature,
+)
+from civicsignals_api.modules.billing.plans import (
+    plan_allows as _plan_allows_impl,
+)
+from civicsignals_api.modules.billing.plans import (
+    plan_limit as _plan_limit_impl,
 )
 
 # ---------------------------------------------------------------------------
@@ -94,9 +108,7 @@ class _StripeSubscriptions:
         self._api_key = api_key
 
     def retrieve(self, subscription_id: str, **kwargs: Any) -> Any:
-        return stripe_sdk.Subscription.retrieve(
-            subscription_id, api_key=self._api_key, **kwargs
-        )
+        return stripe_sdk.Subscription.retrieve(subscription_id, api_key=self._api_key, **kwargs)
 
 
 class _DefaultStripeClient:
@@ -440,3 +452,61 @@ async def apply_invoice_payment_failed(
         sub.status = SubscriptionStatus.PAST_DUE
     await session.flush()
     return sub
+
+
+# ---------------------------------------------------------------------------
+# N2: Plan resolution + feature-gate helpers
+# ---------------------------------------------------------------------------
+
+# Plans that represent an active subscription (N2 § effective-plan resolution).
+# A workspace in READ_ONLY or PAST_DUE still holds its plan (the rep can still
+# read data); CANCELLED and SUSPENDED fall through to SELF_HOSTED.
+_ACTIVE_LIKE_STATUSES: frozenset[SubscriptionStatus] = frozenset(
+    {
+        SubscriptionStatus.TRIALING,
+        SubscriptionStatus.ACTIVE,
+        SubscriptionStatus.PAST_DUE,
+        SubscriptionStatus.READ_ONLY,
+    }
+)
+
+
+async def get_workspace_plan(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+) -> SubscriptionPlan:
+    """Return the effective :class:`SubscriptionPlan` for a workspace (N2).
+
+    Resolution logic (no Stripe call — reads only from ``billing_subscription``):
+
+    1. If no subscription row exists → ``SELF_HOSTED`` (free default).
+    2. If the subscription status is ``CANCELLED`` or ``SUSPENDED`` → ``SELF_HOSTED``.
+    3. Otherwise → the plan stored on the subscription row.
+
+    This is cheap (one DB read) and safe to call on every request. The
+    ``billing_subscription`` row is kept current by N1's webhook handlers.
+    """
+    sub = await get_subscription(session, workspace_id)
+    if sub is None:
+        return SubscriptionPlan.SELF_HOSTED
+    if sub.status not in _ACTIVE_LIKE_STATUSES:
+        return SubscriptionPlan.SELF_HOSTED
+    return sub.plan
+
+
+def plan_allows(plan: SubscriptionPlan, feature: Feature) -> bool:
+    """Return ``True`` if ``plan`` includes ``feature`` (N2).
+
+    Thin wrapper around :func:`plans.plan_allows` so other modules can import
+    from ``billing.services`` without knowing about ``plans.py``.
+    """
+    return _plan_allows_impl(plan, feature)
+
+
+def plan_limit(plan: SubscriptionPlan, dimension: Dimension) -> int | None:
+    """Return the numeric cap for ``dimension`` on ``plan``, or ``None`` if unlimited (N2).
+
+    Thin wrapper around :func:`plans.plan_limit` so other modules import from
+    ``billing.services`` only.
+    """
+    return _plan_limit_impl(plan, dimension)
