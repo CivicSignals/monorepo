@@ -43,7 +43,7 @@ const config: Config = {
   ],
 
   themeConfig: {
-    image: "img/civicsignals-social.png",
+    image: "img/logo.svg",
     navbar: {
       title: "CivicSignals Docs",
       logo: {
