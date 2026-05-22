@@ -483,13 +483,23 @@ async def test_viewer_is_forbidden_403(session: AsyncSession) -> None:
 @_db_skip
 @pytest.mark.asyncio
 async def test_emits_one_event_per_moved_signal(session: AsyncSession) -> None:
-    """A bulk transition emits one SIGNAL_STATUS_CHANGED per actually-moved signal."""
+    """A bulk transition emits one SIGNAL_STATUS_CHANGED per actually-moved signal.
+
+    A signal already at the target status is an idempotent no-op: it counts as
+    ``succeeded`` but is **not** moved, so it must emit no audit event (the route's
+    docstring guarantees "one event per actually-transitioned signal"). The batch here
+    mixes two real moves, one idempotent no-op, and one not-in-workspace signal — only
+    the two real moves should produce an event.
+    """
     ws = await _workspace(session, email="bulk-event@example.com")
     s1 = await _signal(session, title="moved 1")
     s2 = await _signal(session, title="moved 2")
+    s_noop = await _signal(session, title="already dismissed (no-op)")
     s_no_row = await _signal(session, title="no row")
     await _score(session, workspace_id=ws, signal_id=s1.id, status="new")
     await _score(session, workspace_id=ws, signal_id=s2.id, status="new")
+    # Already at the target — an idempotent no-op that must NOT emit an audit event.
+    await _score(session, workspace_id=ws, signal_id=s_noop.id, status="dismissed")
     await session.commit()
 
     captured: list[dict[str, object]] = []
@@ -507,20 +517,30 @@ async def test_emits_one_event_per_moved_signal(session: AsyncSession) -> None:
                 "/api/v1/signals/bulk-status",
                 headers={"X-Workspace-Id": str(ws)},
                 json={
-                    "signal_ids": [str(s1.id), str(s2.id), str(s_no_row.id)],
+                    "signal_ids": [
+                        str(s1.id),
+                        str(s2.id),
+                        str(s_noop.id),
+                        str(s_no_row.id),
+                    ],
                     "status": "dismissed",
                 },
             )
         assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # The no-op row counts as succeeded (it's at the target) ...
+        assert str(s_noop.id) in body["succeeded"]
     finally:
         events.unsubscribe(events.SIGNAL_STATUS_CHANGED, _capture)
         main_app.dependency_overrides.pop(get_session, None)
         main_app.dependency_overrides.pop(require_workspace, None)
         await engine.dispose()  # type: ignore[attr-defined]
 
-    # One event per moved signal (the no-row signal emits nothing).
+    # ... but only the two real moves emit an event — the no-op and the no-row signal
+    # emit nothing.
     assert len(captured) == 2
     moved_ids = {str(s1.id), str(s2.id)}
     assert {c["signal_id"] for c in captured} == moved_ids
+    assert str(s_noop.id) not in {c["signal_id"] for c in captured}
     assert all(c["status"] == "dismissed" for c in captured)
     assert all(c["workspace_id"] == str(ws) for c in captured)

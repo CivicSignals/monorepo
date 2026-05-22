@@ -27,7 +27,7 @@ import type {
   SignalType,
   FeedStatus,
 } from "@/lib/signals-api";
-import { SIGNAL_TYPE_LABELS } from "@/lib/signals-api";
+import { MAX_BULK_STATUS_BATCH, SIGNAL_TYPE_LABELS } from "@/lib/signals-api";
 import { useWorkspaceFeed } from "@/hooks/use-signals";
 import { StatusControls } from "@/components/signals/status-controls";
 import { BulkActionBar } from "@/components/signals/bulk-action-bar";
@@ -407,8 +407,16 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
     () => visibleIds.filter((id) => selectedIds.has(id)),
     [visibleIds, selectedIds],
   );
-  const allVisibleSelected =
-    visibleIds.length > 0 && selectedList.length === visibleIds.length;
+  // "Select all visible" clamps to the bulk cap (mirrors services.MAX_BULK_STATUS_BATCH)
+  // so a single click can never build an over-cap selection the API would 422 (doc 14
+  // §5.3). With infinite scroll, visibleIds can exceed the cap; we take the first N.
+  const selectableIds = useMemo(
+    () => visibleIds.slice(0, MAX_BULK_STATUS_BATCH),
+    [visibleIds],
+  );
+  const allSelectableSelected =
+    selectableIds.length > 0 &&
+    selectableIds.every((id) => selectedIds.has(id));
 
   const toggleSelect = useCallback((signalId: string) => {
     setSelectedIds((prev) => {
@@ -421,12 +429,13 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
 
   const toggleSelectAll = useCallback(() => {
     setSelectedIds((prev) => {
-      // If every visible row is already selected, clear; otherwise select all visible.
+      // If every selectable row is already selected, clear; otherwise select all
+      // selectable (capped at MAX_BULK_STATUS_BATCH).
       const everySelected =
-        visibleIds.length > 0 && visibleIds.every((id) => prev.has(id));
-      return everySelected ? new Set() : new Set(visibleIds);
+        selectableIds.length > 0 && selectableIds.every((id) => prev.has(id));
+      return everySelected ? new Set() : new Set(selectableIds);
     });
-  }, [visibleIds]);
+  }, [selectableIds]);
 
   const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
 
@@ -503,14 +512,16 @@ export function FeedList({ filters = {}, onFiltersChange }: FeedListProps) {
               type="checkbox"
               data-testid="feed-select-all"
               aria-label="Select all visible signals"
-              checked={allVisibleSelected}
+              checked={allSelectableSelected}
               onChange={toggleSelectAll}
               className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
             />
             <label className="text-xs text-gray-500">
               {selectedList.length > 0
                 ? `${selectedList.length} selected`
-                : "Select all"}
+                : visibleIds.length > MAX_BULK_STATUS_BATCH
+                  ? `Select all (max ${MAX_BULK_STATUS_BATCH})`
+                  : "Select all"}
             </label>
           </div>
 

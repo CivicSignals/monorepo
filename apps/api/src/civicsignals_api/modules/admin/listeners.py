@@ -135,8 +135,8 @@ async def _on_signal_created(payload: dict[str, object]) -> None:
 
 
 async def _on_signal_status_changed(payload: dict[str, object]) -> None:
-    # G4: a member transitioned a per-workspace score row's status (the from/to
-    # states ride along in the payload metadata).
+    # G4/G3: a member transitioned a per-workspace score row's status (the new ``status``
+    # rides along in the payload; the G4/G3 routes do not currently carry the prior state).
     await _persist(
         action="signal.status_changed",
         payload=payload,

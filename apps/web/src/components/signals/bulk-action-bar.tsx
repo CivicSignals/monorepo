@@ -13,6 +13,7 @@
 "use client";
 
 import type { SettableStatus } from "@/lib/signals-api";
+import { MAX_BULK_STATUS_BATCH } from "@/lib/signals-api";
 import { useBulkChangeSignalStatus } from "@/hooks/use-signals";
 
 export interface BulkActionBarProps {
@@ -29,13 +30,23 @@ export interface BulkActionBarProps {
  * Pin / Dismiss action pair, and a Clear button. Each action fires the bulk mutation;
  * while in flight the buttons are disabled. On success the selection is cleared; on
  * error the message surfaces inline (the optimistic write rolls back via the hook).
+ *
+ * The selection is capped at {@link MAX_BULK_STATUS_BATCH} (mirrors the server's
+ * per-request limit, doc 14 §5.3). The select-all path clamps to the cap, but an
+ * over-cap selection can still arise (e.g. many individual toggles across infinite
+ * scroll), so the actions are disabled with a hint above the cap rather than letting
+ * the API 422 it.
  */
 export function BulkActionBar({ selectedIds, onClear }: BulkActionBarProps) {
   const mutation = useBulkChangeSignalStatus();
   const count = selectedIds.length;
   if (count === 0) return null;
 
+  const overCap = count > MAX_BULK_STATUS_BATCH;
+  const disabled = mutation.isPending || overCap;
+
   const apply = (status: SettableStatus) => {
+    if (overCap) return;
     mutation.mutate(
       { signalIds: selectedIds, status },
       { onSuccess: () => onClear() },
@@ -60,7 +71,7 @@ export function BulkActionBar({ selectedIds, onClear }: BulkActionBarProps) {
         <button
           type="button"
           data-testid="bulk-action-pinned"
-          disabled={mutation.isPending}
+          disabled={disabled}
           onClick={() => apply("pinned")}
           className="rounded-md border border-indigo-300 bg-white px-3 py-1 text-xs font-medium text-indigo-700 transition-colors hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500"
         >
@@ -69,7 +80,7 @@ export function BulkActionBar({ selectedIds, onClear }: BulkActionBarProps) {
         <button
           type="button"
           data-testid="bulk-action-dismissed"
-          disabled={mutation.isPending}
+          disabled={disabled}
           onClick={() => apply("dismissed")}
           className="rounded-md border border-gray-300 bg-white px-3 py-1 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-500"
         >
@@ -86,6 +97,17 @@ export function BulkActionBar({ selectedIds, onClear }: BulkActionBarProps) {
       >
         Clear
       </button>
+
+      {overCap && (
+        <span
+          data-testid="bulk-over-cap"
+          role="alert"
+          className="w-full text-xs text-amber-600"
+        >
+          Select up to {MAX_BULK_STATUS_BATCH} signals at a time — narrow your
+          selection to apply a bulk action.
+        </span>
+      )}
 
       {mutation.isError && (
         <span

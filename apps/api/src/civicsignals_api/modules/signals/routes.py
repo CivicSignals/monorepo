@@ -706,8 +706,9 @@ async def change_status_bulk(
     await session.commit()
 
     # Best-effort audit (B9 persists), one event per actually-transitioned signal. A
-    # broken audit sink must not fail the action.
-    for signal_id in result.succeeded:
+    # broken audit sink must not fail the action. ``result.moved`` excludes idempotent
+    # no-ops (already-at-target rows land in ``succeeded`` but not ``moved``).
+    for signal_id in result.moved:
         try:
             await events.publish(
                 events.SIGNAL_STATUS_CHANGED,

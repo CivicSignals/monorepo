@@ -1101,14 +1101,17 @@ class BulkStatusResult:
     """The per-item outcome of a bulk status transition (G3, doc 14 §5.3).
 
     ``succeeded`` lists the signal ids whose score row now holds ``target_status``
-    (including idempotent no-ops — the row already held it). ``skipped`` carries the
-    ids that could not be transitioned, each with a reason. A duplicate id in the
-    request is collapsed (de-duplicated) before processing, so each id appears at most
-    once across the two lists.
+    (including idempotent no-ops — the row already held it). ``moved`` is the subset of
+    ``succeeded`` whose status **actually changed** (a no-op is in ``succeeded`` but not
+    in ``moved``), so the route can emit one audit event per real transition only.
+    ``skipped`` carries the ids that could not be transitioned, each with a reason. A
+    duplicate id in the request is collapsed (de-duplicated) before processing, so each
+    id appears at most once across the three lists.
     """
 
     target_status: str
     succeeded: list[uuid.UUID] = field(default_factory=list)
+    moved: list[uuid.UUID] = field(default_factory=list)
     skipped: list[BulkStatusSkip] = field(default_factory=list)
 
 
@@ -1198,6 +1201,7 @@ async def change_workspace_score_status_bulk(
 
         row.status = target_status
         result.succeeded.append(signal_id)
+        result.moved.append(signal_id)
         mutated = True
 
     if mutated:

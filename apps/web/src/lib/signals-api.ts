@@ -339,8 +339,10 @@ export function changeSignalStatus(
 
 /**
  * The largest bulk-status batch the API accepts in one request (mirrors
- * ``services.MAX_BULK_STATUS_BATCH``). The UI caps a multi-select at this so the
- * request is never rejected for size.
+ * ``services.MAX_BULK_STATUS_BATCH``). The UI caps a multi-select at this: select-all
+ * clamps to the first {@link MAX_BULK_STATUS_BATCH} visible rows, and the bulk-action
+ * bar disables its actions (with a hint) above the cap, so a request is never rejected
+ * for size. The server still returns 422 as the backstop if one slips through.
  */
 export const MAX_BULK_STATUS_BATCH = 200;
 

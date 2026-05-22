@@ -51,6 +51,7 @@ vi.mock("@/store/ui", () => ({
 import { BulkActionBar } from "@/components/signals/bulk-action-bar";
 import { useBulkChangeSignalStatus, feedKeys } from "@/hooks/use-signals";
 import type { FeedPage } from "@/lib/signals-api";
+import { MAX_BULK_STATUS_BATCH } from "@/lib/signals-api";
 
 // ---- Wrappers --------------------------------------------------------------
 
@@ -181,6 +182,59 @@ describe("BulkActionBar — visibility + actions", () => {
         "pinned",
       );
     });
+  });
+
+  it("disables the actions + shows a hint when the selection exceeds the cap", () => {
+    const client = makeClient();
+    // One past the cap — the actions must be disabled and a hint shown so we never
+    // fire a request the API would 422 for size.
+    const overCap = Array.from(
+      { length: MAX_BULK_STATUS_BATCH + 1 },
+      (_, i) => `s-${i}`,
+    );
+    render(<BulkActionBar selectedIds={overCap} onClear={vi.fn()} />, {
+      wrapper: wrapperFor(client),
+    });
+    expect(
+      (screen.getByTestId("bulk-action-pinned") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByTestId("bulk-action-dismissed") as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(screen.getByTestId("bulk-over-cap")).toBeTruthy();
+  });
+
+  it("does not fire the mutation when over the cap is clicked", () => {
+    const client = makeClient();
+    const overCap = Array.from(
+      { length: MAX_BULK_STATUS_BATCH + 1 },
+      (_, i) => `s-${i}`,
+    );
+    render(<BulkActionBar selectedIds={overCap} onClear={vi.fn()} />, {
+      wrapper: wrapperFor(client),
+    });
+    // The button is disabled; assert the handler is a no-op even if invoked. The mock
+    // is module-scoped (shared across tests), so compare against its current count
+    // rather than asserting zero calls.
+    const before = changeSignalStatusBulkMock.mock.calls.length;
+    fireEvent.click(screen.getByTestId("bulk-action-pinned"));
+    expect(changeSignalStatusBulkMock.mock.calls.length).toBe(before);
+  });
+
+  it("allows actions exactly at the cap", () => {
+    const client = makeClient();
+    const atCap = Array.from(
+      { length: MAX_BULK_STATUS_BATCH },
+      (_, i) => `s-${i}`,
+    );
+    render(<BulkActionBar selectedIds={atCap} onClear={vi.fn()} />, {
+      wrapper: wrapperFor(client),
+    });
+    expect(
+      (screen.getByTestId("bulk-action-pinned") as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(screen.queryByTestId("bulk-over-cap")).toBeNull();
   });
 });
 
