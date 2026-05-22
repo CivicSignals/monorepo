@@ -7,8 +7,9 @@
 // never touches Zustand (doc 06 §2).
 //
 // Seams:
-// - TODO F4: a richer "Why this signal?" panel renders human-readable bullets
-//   from score_breakdown; this view shows the structured breakdown raw for now.
+// - F4: the "Why this signal?" panel (WhyThisSignal) renders human-readable bullets
+//   + component contributions from score_breakdown; the Inspect panel still keeps the
+//   raw JSON below for debugging / transparency.
 // - TODO G4: per-signal status transitions (dismiss / pin / push) attach to the
 //   header action area.
 // - TODO G5: polished loading skeleton / empty / error states.
@@ -18,6 +19,7 @@
 import Link from "next/link";
 import {
   SIGNAL_TYPE_LABELS,
+  type ScoreBreakdown,
   type SignalType,
   type SourceDocumentRead,
   type SuggestedContactRead,
@@ -25,6 +27,7 @@ import {
 } from "@/lib/signals-api";
 import { useSignalDetail } from "@/hooks/use-signals";
 import { ProblemError } from "@/lib/auth-api";
+import { WhyThisSignal } from "./why-this-signal";
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -322,6 +325,12 @@ export function SignalDetail({ id }: SignalDetailProps) {
         <p className="text-sm text-gray-700">{signal.summary}</p>
       </section>
 
+      {/* Why this signal? — human-readable score explanation (F4). */}
+      <WhyThisSignal
+        breakdown={(data.score_breakdown as ScoreBreakdown | null) ?? null}
+        score={data.score}
+      />
+
       {/* Extracted fields */}
       <section aria-labelledby="fields-heading" data-testid="signal-fields">
         <h2 id="fields-heading" className="mb-3 text-xl font-semibold">
@@ -350,7 +359,8 @@ export function SignalDetail({ id }: SignalDetailProps) {
       <RelatedSignals related={data.related_signals} />
 
       {/* Inspect panel — raw score breakdown + details JSON (debug/transparency).
-          TODO F4: replace the raw breakdown with human-readable "Why this signal?" bullets. */}
+          The human-readable explanation now lives in the WhyThisSignal panel above (F4);
+          this keeps the raw JSON for engineers / support. */}
       <section aria-labelledby="inspect-heading" data-testid="signal-inspect">
         <h2 id="inspect-heading" className="mb-3 text-xl font-semibold">
           Inspect

@@ -17,7 +17,13 @@
 "use client";
 
 import Link from "next/link";
-import type { FeedItemRead, FeedFilters, SignalType, FeedStatus } from "@/lib/signals-api";
+import type {
+  FeedItemRead,
+  FeedFilters,
+  ScoreBreakdown,
+  SignalType,
+  FeedStatus,
+} from "@/lib/signals-api";
 import { SIGNAL_TYPE_LABELS } from "@/lib/signals-api";
 import { useWorkspaceFeed } from "@/hooks/use-signals";
 
@@ -44,11 +50,24 @@ function signalTypeLabel(type: string): string {
   return SIGNAL_TYPE_LABELS[type as SignalType] ?? type;
 }
 
+/**
+ * The single top "why this signal?" bullet for a compact feed-row hint (F4).
+ * Returns the first scorer-seeded bullet, sentence-cased; null when the breakdown
+ * carries none (the full explanation lives on the detail page's WhyThisSignal panel).
+ */
+function topWhyBullet(breakdown: Record<string, unknown>): string | null {
+  const bullets = (breakdown as ScoreBreakdown).bullets;
+  const first = bullets?.find((b) => b.trim().length > 0)?.trim();
+  if (!first) return null;
+  return first.charAt(0).toUpperCase() + first.slice(1);
+}
+
 // ---- Sub-components ---------------------------------------------------------
 
 function FeedItemCard({ item }: { item: FeedItemRead }) {
   const { label: bandLabel, className: bandClass } = scoreBand(item.score);
   const sig = item.signal;
+  const why = topWhyBullet(item.score_breakdown);
 
   return (
     <article
@@ -99,6 +118,17 @@ function FeedItemCard({ item }: { item: FeedItemRead }) {
               </a>
             )}
           </div>
+          {/* Compact "why this signal?" hint — the top scorer bullet (F4). The full
+              explanation lives on the detail page's WhyThisSignal panel. */}
+          {why && (
+            <p
+              data-testid="feed-item-why"
+              className="mt-2 text-[11px] text-gray-500 line-clamp-1"
+              title={why}
+            >
+              <span className="font-medium text-gray-600">Why:</span> {why}
+            </p>
+          )}
         </div>
         {/* Score badge */}
         <div className="flex-shrink-0 text-right">

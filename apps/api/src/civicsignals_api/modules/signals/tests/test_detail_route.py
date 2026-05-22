@@ -184,14 +184,22 @@ async def _raw_document(session: AsyncSession, *, url: str = "https://x.gov/rfp"
     return doc
 
 
-async def _contact(session: AsyncSession, *, entity_id: uuid.UUID, name: str) -> Contact:
+async def _contact(
+    session: AsyncSession,
+    *,
+    entity_id: uuid.UUID,
+    name: str,
+    status: str = "active",
+    verified: bool = True,
+) -> Contact:
     c = Contact(
         id=uuid7(),
         entity_id=entity_id,
         name=name,
         title="Procurement Director",
         canonical_email=f"{name.lower().replace(' ', '.')}@x.gov",
-        verified=True,
+        status=status,
+        verified=verified,
     )
     session.add(c)
     await session.flush()
@@ -364,6 +372,41 @@ async def test_detail_suggested_contacts_for_entity(session: AsyncSession) -> No
         names = {c["name"] for c in contacts}
         assert names == {"Jane Doe", "John Roe"}
         assert all(c["title"] == "Procurement Director" for c in contacts)
+    finally:
+        _teardown(engine)
+        await engine.dispose()  # type: ignore[attr-defined]
+
+
+@_db_skip
+@pytest.mark.asyncio
+async def test_detail_suggested_contacts_filter_and_order(session: AsyncSession) -> None:
+    """Bounced/invalid contacts are dropped; verified/active are surfaced first (G2 fix)."""
+    ws = await _workspace(session, email="detail-contacts-filter@example.com")
+    ent = await _entity(session)
+    sig = await _signal(session, entity=ent)
+    # Known-bad contacts must not appear at all.
+    await _contact(session, entity_id=ent.id, name="Bounced Bob", status="bounced")
+    await _contact(session, entity_id=ent.id, name="Invalid Ivy", status="invalid", verified=False)
+    # Usable contacts: an unverified/stale one and a verified/active one.
+    await _contact(session, entity_id=ent.id, name="Stale Sam", status="stale", verified=False)
+    await _contact(session, entity_id=ent.id, name="Verified Val", status="active", verified=True)
+    await session.commit()
+
+    client, engine = _client(ws)
+    try:
+        async with client:
+            resp = await client.get(
+                f"/api/v1/signals/{sig.id}/detail", headers={"X-Workspace-Id": str(ws)}
+            )
+        assert resp.status_code == 200, resp.text
+        contacts = resp.json()["suggested_contacts"]
+        names = [c["name"] for c in contacts]
+        # Bounced/invalid filtered out.
+        assert "Bounced Bob" not in names
+        assert "Invalid Ivy" not in names
+        assert set(names) == {"Verified Val", "Stale Sam"}
+        # Verified/active contact leads.
+        assert names[0] == "Verified Val"
     finally:
         _teardown(engine)
         await engine.dispose()  # type: ignore[attr-defined]

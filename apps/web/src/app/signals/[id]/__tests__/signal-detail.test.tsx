@@ -220,6 +220,22 @@ describe("SignalDetail — loaded view", () => {
     expect(screen.getByTestId("inspect-breakdown").textContent).toContain("keywords");
   });
 
+  it("wires the WhyThisSignal panel from score_breakdown bullets (F4)", () => {
+    mockUseSignalDetail.mockReturnValue(stub({ data: makeDetail() }) as MockReturn);
+    render(<SignalDetail id="sig-001" />, { wrapper });
+    const why = screen.getByTestId("why-this-signal");
+    expect(why.textContent).toContain("Why this signal?");
+    expect(screen.getByTestId("why-bullet").textContent).toContain("Matched WA");
+  });
+
+  it("shows the WhyThisSignal no-score state when the signal has no workspace score", () => {
+    mockUseSignalDetail.mockReturnValue(
+      stub({ data: makeDetail({ score: null, status: null, score_breakdown: null }) }) as MockReturn,
+    );
+    render(<SignalDetail id="sig-001" />, { wrapper });
+    expect(screen.getByTestId("why-no-score")).toBeTruthy();
+  });
+
   it("hides the score band when the signal has no workspace score", () => {
     mockUseSignalDetail.mockReturnValue(
       stub({ data: makeDetail({ score: null, status: null, score_breakdown: null }) }) as MockReturn,

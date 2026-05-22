@@ -1015,6 +1015,13 @@ class WorkspaceFeedPage:
 RELATED_SIGNALS_LIMIT: int = 10
 SUGGESTED_CONTACTS_LIMIT: int = 10
 
+# Contact statuses we never suggest as actionable on the detail page: a bounced or
+# invalid contact is known-bad (C6 correction lifecycle, doc 07 §4), so surfacing it
+# would just send the user to a dead address. We over-fetch from the contacts module
+# (its list is status-agnostic — shared with the entity profile) and drop these here.
+# (Mirrors the exact ``bounced``/``invalid`` values in ``contacts.models.CONTACT_STATUSES``.)
+UNUSABLE_CONTACT_STATUSES: frozenset[str] = frozenset({"bounced", "invalid"})
+
 
 @dataclass(slots=True)
 class SignalSourceDocument:
@@ -1138,9 +1145,16 @@ async def _source_documents_for_signal(
     for doc_id in raw_document_ids:
         stored = await ingestion_services.get_raw_document(session, doc_id)
         if stored is None:
-            docs.append(SignalSourceDocument(raw_document_id=doc_id, recipe_id=None,
-                                             source_url=None, fetched_at=None,
-                                             content_type=None, missing=True))
+            docs.append(
+                SignalSourceDocument(
+                    raw_document_id=doc_id,
+                    recipe_id=None,
+                    source_url=None,
+                    fetched_at=None,
+                    content_type=None,
+                    missing=True,
+                )
+            )
             continue
         docs.append(
             SignalSourceDocument(
@@ -1208,8 +1222,20 @@ async def get_signal_detail(
         entity = await entity_services.get_entity(session, entity_id)
         if entity is not None:
             entity_name = entity.name
+        # Over-fetch so dropping known-bad rows (bounced/invalid) does not starve the
+        # list below the cap when an entity carries a few dead contacts. The contacts
+        # module's list is status-agnostic (shared with the entity profile), so we do
+        # the usability filter + verified-first ordering here, in the consuming view.
         contact_page = await contact_services.list_contacts_for_entity(
-            session, entity_id, limit=SUGGESTED_CONTACTS_LIMIT
+            session, entity_id, limit=SUGGESTED_CONTACTS_LIMIT * 2
+        )
+        usable_contacts = [
+            c for c in contact_page.items if c.status not in UNUSABLE_CONTACT_STATUSES
+        ]
+        # Surface verified/active contacts first so the most-actionable person leads;
+        # stable within each tier (the contacts module already orders by id).
+        usable_contacts.sort(
+            key=lambda c: (not c.verified, c.status != "active"),
         )
         suggested_contacts = [
             SuggestedContact(
@@ -1221,7 +1247,7 @@ async def get_signal_detail(
                 status=c.status,
                 verified=c.verified,
             )
-            for c in contact_page.items
+            for c in usable_contacts[:SUGGESTED_CONTACTS_LIMIT]
         ]
         related_signals = await _related_signals_for_entity(
             session,
@@ -1375,6 +1401,7 @@ __all__ = [
     "REVIEW_STATUS_REJECTED",
     "SIGNAL_STATUS_MERGED",
     "SUGGESTED_CONTACTS_LIMIT",
+    "UNUSABLE_CONTACT_STATUSES",
     "BandThresholds",
     "CandidateInput",
     "ConfidenceBand",

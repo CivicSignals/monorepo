@@ -102,6 +102,51 @@ export interface FeedPage {
   };
 }
 
+// ---- Score breakdown shape (F4; mirrors workspace_scoring.score_signal_against_icp) --
+//
+// The per-workspace score_breakdown JSONB persisted on WorkspaceScore (F3). Every
+// field is optional on the client because the breakdown is a free-form JSONB blob —
+// older rows / non-pipeline inserts may carry a partial (or empty) map, so the F4
+// "Why this signal?" panel must degrade gracefully rather than assume the full shape.
+
+/** One scorer component's contribution toward the 0..100 blended score. */
+export interface ScoreComponent {
+  /** Raw component value in [0, 1] before weighting. */
+  value?: number;
+  /** Normalised weight in [0, 1] (renormalised when semantic is absent). */
+  weight?: number;
+  /** Points this component contributed toward the 0..100 total. */
+  points?: number;
+}
+
+/** Which ICP dimensions a signal satisfied (the matched flags). */
+export interface ScoreMatched {
+  signal_type?: boolean;
+  country?: boolean;
+  state?: boolean;
+  entity_kind?: boolean;
+  size_band?: boolean;
+  states?: string[];
+  keywords?: string[];
+}
+
+export interface ScoreBreakdown {
+  components?: Record<string, ScoreComponent>;
+  matched?: ScoreMatched;
+  /** Pre-formatted human-readable bullets seeded by the scorer (doc 14 §6.2). */
+  bullets?: string[];
+}
+
+/** Display labels for the scorer components (mirrors workspace_scoring weights). */
+export const SCORE_COMPONENT_LABELS: Record<string, string> = {
+  signal_type_weight: "Signal type",
+  dimensions: "ICP dimensions",
+  recency: "Recency",
+  confidence: "Extraction confidence",
+  keywords: "Keyword match",
+  semantic: "Semantic similarity",
+};
+
 // ---- Signal detail shapes (G2; mirrors signals.schemas.SignalDetailRead) ----
 
 export interface SourceDocumentRead {
