@@ -41,7 +41,24 @@ def _stored_doc(*, content_type: str | None = "text/plain") -> StoredRawDocument
 
 
 def _extract_gateway(*responses: str) -> LLMGateway:
-    backend = FakeBackend(responses=list(responses))
+    # E11: extract_candidates now runs entity extraction (Pass 1) before signal
+    # detection. Prepend a minimal entity extraction response so the FIFO queue
+    # serves signal-extraction tests with their intended scripted reply.
+    _entity_reply = json.dumps(
+        {
+            "organizations": [{"name": "Test District", "confidence": 0.85}],
+            "persons": [{"name": "Alice", "role": "CIO", "confidence": 0.8}],
+            "monetary_amounts": [{"amount_cents": 1000000, "currency": "USD", "confidence": 0.9}],
+            "dates": [],
+            "products_categories": [],
+            "vendors_mentioned": [],
+            "contract_terms_mentions": [],
+            "raw_keywords": [],
+            "extraction_confidence": 0.82,
+            "extraction_warnings": [],
+        }
+    )
+    backend = FakeBackend(responses=[_entity_reply, *responses])
     policy = TaskModelPolicy(overrides={TASK_EXTRACTION: ModelChoice("fake", "sonnet")})
     return LLMGateway({"fake": backend}, policy=policy)
 
