@@ -125,6 +125,10 @@ class HttpxFetcher:
         self, url: str, *, headers: Mapping[str, str], max_redirects: int
     ) -> httpx.Response:
         client = self._get_client()
+        # Cap redirects so a redirect loop fails visibly (doc 18 §4 static-HTML
+        # "Redirect loop"). httpx enforces this client-side; an excess raises
+        # ``httpx.TooManyRedirects`` (a ``HTTPError``), which we treat as transient.
+        client.max_redirects = max_redirects
         retrying = Retrying(
             stop=stop_after_attempt(self._config.max_attempts),
             wait=wait_exponential(multiplier=self._config.backoff_seconds),
@@ -139,7 +143,6 @@ class HttpxFetcher:
                             url,
                             headers=dict(headers),
                             follow_redirects=True,
-                            extensions={"max_redirects": max_redirects},
                         )
                     except httpx.HTTPError as exc:
                         # Connection/timeout/redirect-loop errors are transient.

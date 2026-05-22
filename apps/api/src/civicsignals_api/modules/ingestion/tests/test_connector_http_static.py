@@ -133,6 +133,18 @@ def test_4xx_not_retried() -> None:
     assert calls["n"] == 1  # 4xx is a definitive answer, not retried
 
 
+def test_redirect_loop_capped_and_fails_visibly() -> None:
+    # An endless redirect chain must fail rather than loop forever (doc 18 §4).
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Always redirect to a new path -> exceeds max_redirects.
+        n = int(request.url.params.get("n", "0"))
+        return httpx.Response(302, headers={"Location": f"/loop?n={n + 1}"})
+
+    fetcher = _fetcher_with_handler(handler, HttpStaticConfig(max_attempts=1, backoff_seconds=0.0))
+    with pytest.raises(httpx.HTTPError):
+        fetcher.fetch("https://x.gov/loop?n=0", user_agent="UA", max_redirects=3)
+
+
 def test_conditional_get_sends_validators_and_handles_304() -> None:
     seen_headers: list[dict[str, str]] = []
 

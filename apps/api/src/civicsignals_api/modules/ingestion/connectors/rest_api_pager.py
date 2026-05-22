@@ -202,6 +202,7 @@ class RestApiPagerFetcher:
         self, url: str, *, headers: dict[str, str], max_redirects: int
     ) -> httpx.Response:
         client = self._get_client()
+        client.max_redirects = max_redirects
         retrying = Retrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1.0),
@@ -216,7 +217,6 @@ class RestApiPagerFetcher:
                             url,
                             headers=headers,
                             follow_redirects=True,
-                            extensions={"max_redirects": max_redirects},
                         )
                     except httpx.HTTPError as exc:
                         raise _TransientApiError(exc) from exc
