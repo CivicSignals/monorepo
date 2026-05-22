@@ -19,7 +19,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -276,21 +276,252 @@ def test_slack_refresh_raises_provider_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# push raises NotImplementedError (L2 seam)
+# push (L2): chat.postMessage with a Block Kit alert (mocked transport)
 # ---------------------------------------------------------------------------
 
 
-def test_slack_push_raises_not_implemented() -> None:
+def test_slack_push_posts_block_kit_message() -> None:
+    """push posts blocks to chat.postMessage and returns the message ts."""
     from civicsignals_api.modules.integrations.providers import PushRequest
 
-    prov = SlackProvider(_settings(), _mock_http(lambda r: httpx.Response(200)))
-    with pytest.raises(NotImplementedError):
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["auth"] = request.headers.get("authorization")
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"ok": True, "channel": "C0001", "ts": "1700000000.000100"})
+
+    prov = SlackProvider(_settings(), _mock_http(handler))
+    result = asyncio.run(
+        prov.push(
+            access_token="xoxb-bot-token",
+            request=PushRequest(
+                target="C0001",
+                payload={
+                    "signal_id": "sig-123",
+                    "title": "Acme RFP",
+                    "signal_type": "rfp_posted",
+                    "entity": "City of Springfield",
+                    "score": 87,
+                    "summary": "RFP for civic data platform.",
+                    "__channel__": "C0001",
+                    "__workspace_id__": "ws-9",
+                },
+            ),
+        )
+    )
+    assert result.external_id == "1700000000.000100"
+    assert result.created is True
+    assert result.response["channel"] == "C0001"
+    assert "chat.postMessage" in captured["url"]
+    assert captured["auth"] == "Bearer xoxb-bot-token"
+    body = captured["body"]
+    assert body["channel"] == "C0001"
+    assert "blocks" in body and body["text"]  # fallback text present
+    # Control keys never reach Slack.
+    assert "__channel__" not in json.dumps(body)
+    assert "__workspace_id__" not in json.dumps(body)
+
+
+def test_slack_push_uses_target_when_no_channel_control_key() -> None:
+    from civicsignals_api.modules.integrations.providers import PushRequest
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"ok": True, "channel": "C0042", "ts": "1.2"})
+
+    prov = SlackProvider(_settings(), _mock_http(handler))
+    asyncio.run(
+        prov.push(
+            access_token="xoxb-bot-token",
+            request=PushRequest(target="C0042", payload={"title": "T"}),
+        )
+    )
+    assert captured["body"]["channel"] == "C0042"
+
+
+def test_slack_push_maps_channel_not_found_to_not_found() -> None:
+    from civicsignals_api.modules.integrations.providers import PushRequest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "channel_not_found"})
+
+    prov = SlackProvider(_settings(), _mock_http(handler))
+    with pytest.raises(ProviderError) as exc_info:
         asyncio.run(
             prov.push(
                 access_token="xoxb-bot-token",
-                request=PushRequest(target="slack.channel", payload={}),
+                request=PushRequest(target="C0001", payload={"title": "T"}),
             )
         )
+    assert exc_info.value.code is PushErrorCode.NOT_FOUND
+    assert "channel_not_found" in exc_info.value.message
+
+
+def test_slack_push_maps_invalid_auth_to_auth() -> None:
+    from civicsignals_api.modules.integrations.providers import PushRequest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "invalid_auth"})
+
+    prov = SlackProvider(_settings(), _mock_http(handler))
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            prov.push(
+                access_token="xoxb-revoked",
+                request=PushRequest(target="C0001", payload={"title": "T"}),
+            )
+        )
+    assert exc_info.value.code is PushErrorCode.AUTH
+
+
+def test_slack_push_maps_missing_scope_to_permission() -> None:
+    from civicsignals_api.modules.integrations.providers import PushRequest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "missing_scope"})
+
+    prov = SlackProvider(_settings(), _mock_http(handler))
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            prov.push(
+                access_token="xoxb-bot-token",
+                request=PushRequest(target="C0001", payload={"title": "T"}),
+            )
+        )
+    assert exc_info.value.code is PushErrorCode.PERMISSION
+
+
+def test_slack_push_requires_channel() -> None:
+    """An empty target + no __channel__ control key is a validation error."""
+    from civicsignals_api.modules.integrations.providers import PushRequest
+
+    prov = SlackProvider(_settings(), _mock_http(lambda r: httpx.Response(200)))
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            prov.push(
+                access_token="xoxb-bot-token",
+                request=PushRequest(target="", payload={"title": "T"}),
+            )
+        )
+    assert exc_info.value.code is PushErrorCode.VALIDATION
+
+
+# ---------------------------------------------------------------------------
+# build_slack_signal_blocks (L2; pure function, no provider/HTTP)
+# ---------------------------------------------------------------------------
+
+
+def _full_signal() -> dict[str, object]:
+    return {
+        "signal_id": "sig-123",
+        "title": "Acme RFP for Civic Data",
+        "signal_type": "rfp_posted",
+        "entity": "City of Springfield",
+        "score": 87.4,
+        "occurred_at": "2026-05-20T10:00:00+00:00",
+        "summary": "The city posted an RFP for a civic data platform.",
+    }
+
+
+def _action_elements(blocks: list[dict[str, object]]) -> list[dict[str, Any]]:
+    """The ``elements`` of the (single) Block Kit ``actions`` block."""
+    actions = next(b for b in blocks if b.get("type") == "actions")
+    elements = actions["elements"]
+    assert isinstance(elements, list)
+    return cast("list[dict[str, Any]]", elements)
+
+
+def test_build_blocks_includes_signal_fields_and_deep_link() -> None:
+    from civicsignals_api.modules.integrations.providers import build_slack_signal_blocks
+
+    blocks = build_slack_signal_blocks(
+        _full_signal(), workspace_id="ws-9", web_base_url="https://app.example.com"
+    )
+    blob = json.dumps(blocks)
+    # Title (escaped, no special chars here) + summary present.
+    assert "Acme RFP for Civic Data" in blob
+    assert "civic data platform" in blob
+    # Context line: type label (RFP capitalised), entity, rounded score, date.
+    assert "RFP Posted" in blob
+    assert "City of Springfield" in blob
+    assert "Score 87" in blob
+    assert "2026-05-20" in blob
+    assert "10:00:00" not in blob  # only the date portion is shown
+    # Deep link points at the G2 signal detail route on the configured web base.
+    assert "https://app.example.com/signals/sig-123" in blob
+
+
+def test_build_blocks_has_dismiss_and_push_crm_buttons() -> None:
+    from civicsignals_api.modules.integrations.providers import (
+        SLACK_ACTION_DISMISS,
+        SLACK_ACTION_PUSH_CRM,
+        build_slack_signal_blocks,
+    )
+
+    blocks = build_slack_signal_blocks(
+        _full_signal(), workspace_id="ws-9", web_base_url="https://app.example.com"
+    )
+    assert sum(1 for b in blocks if b.get("type") == "actions") == 1
+    elements = _action_elements(blocks)
+    by_action = {e.get("action_id"): e for e in elements if "action_id" in e}
+    assert SLACK_ACTION_DISMISS in by_action
+    assert SLACK_ACTION_PUSH_CRM in by_action
+    # Both action buttons carry the signal + workspace ids in their JSON value.
+    for action_id in (SLACK_ACTION_DISMISS, SLACK_ACTION_PUSH_CRM):
+        value = json.loads(by_action[action_id]["value"])
+        assert value == {"signal_id": "sig-123", "workspace_id": "ws-9"}
+    # A "View signal" link button carries the deep link (no value, just a url).
+    view = next(e for e in elements if e.get("action_id") == "cs_signal_view")
+    assert view["url"] == "https://app.example.com/signals/sig-123"
+
+
+def test_build_blocks_handles_missing_optional_fields() -> None:
+    from civicsignals_api.modules.integrations.providers import (
+        SLACK_ACTION_DISMISS,
+        SLACK_ACTION_PUSH_CRM,
+        build_slack_signal_blocks,
+    )
+
+    # Only a signal_id — no title/type/entity/score/summary.
+    blocks = build_slack_signal_blocks(
+        {"signal_id": "sig-bare"}, workspace_id="ws-1", web_base_url="https://app.example.com"
+    )
+    blob = json.dumps(blocks)
+    assert "Untitled signal" in blob
+    # No summary section and no context block when those fields are absent.
+    assert sum(1 for b in blocks if b.get("type") == "context") == 0
+    # The action block (with both buttons) is always present.
+    action_ids = {e.get("action_id") for e in _action_elements(blocks)}
+    assert SLACK_ACTION_DISMISS in action_ids
+    assert SLACK_ACTION_PUSH_CRM in action_ids
+
+
+def test_build_blocks_with_no_signal_id_links_to_feed() -> None:
+    from civicsignals_api.modules.integrations.providers import build_slack_signal_blocks
+
+    blocks = build_slack_signal_blocks(
+        {"title": "Untitled"}, workspace_id="ws-1", web_base_url="https://app.example.com/"
+    )
+    view = next(e for e in _action_elements(blocks) if e.get("action_id") == "cs_signal_view")
+    assert view["url"] == "https://app.example.com/feed"
+
+
+def test_build_blocks_escapes_special_characters() -> None:
+    from civicsignals_api.modules.integrations.providers import build_slack_signal_blocks
+
+    blocks = build_slack_signal_blocks(
+        {"signal_id": "s1", "title": "A & B <script>", "summary": "x > y & z"},
+        workspace_id="ws-1",
+        web_base_url="https://app.example.com",
+    )
+    blob = json.dumps(blocks)
+    assert "&amp;" in blob and "&lt;script&gt;" in blob
+    # The raw, unescaped form must not leak into the rendered text.
+    assert "<script>" not in blob
 
 
 # ---------------------------------------------------------------------------
