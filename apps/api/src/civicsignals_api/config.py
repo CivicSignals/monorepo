@@ -37,10 +37,21 @@ class Settings(BaseSettings):
     secret_key: str = "dev-only-change-me"
     access_token_ttl_seconds: int = 3600
 
+    # LLM gateway (doc 06 §7, doc 18 §6.6). Vendor SDKs are imported lazily by
+    # the backends; only the keys/base URLs configured here are needed.
     llm_default_provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
     anthropic_api_key: str | None = None
+    anthropic_base_url: str | None = None
     openai_api_key: str | None = None
+    openai_base_url: str | None = None
     ollama_base_url: str = "http://localhost:11434"
+    # Retry attempts (incl. the first) on transient LLM errors.
+    llm_max_attempts: int = 3
+    # Per-task model overrides: task name -> "provider:model" (or just "model",
+    # which uses llm_default_provider). Empty by default; the gateway falls back
+    # to its built-in cheap-Haiku/Sonnet defaults (DEFAULT_TASK_MODELS).
+    # Example: {"classify": "anthropic:claude-3-5-haiku-latest"}.
+    llm_task_models: dict[str, str] = Field(default_factory=dict)
 
     api_v1_prefix: str = Field(default="/api/v1")
 
