@@ -90,7 +90,10 @@ async def session() -> AsyncIterator[AsyncSession]:
         await conn.run_sync(Base.metadata.create_all, tables=_get_tables(tuple(create_order)))
 
     try:
-        async with AsyncSession(engine) as sess:
+        # expire_on_commit=False mirrors the app's SessionLocal config (db.py) and
+        # prevents MissingGreenlet errors when accessing ORM attributes after a
+        # transaction commits in async tests.
+        async with AsyncSession(engine, expire_on_commit=False) as sess:
             yield sess
     finally:
         async with engine.begin() as conn:
