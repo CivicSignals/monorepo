@@ -23,11 +23,15 @@ clear seam:
 - **score**: the E6 banded confidence blend (doc 19 §6.2-§6.3) — assigns each
   candidate a blended confidence + band; a ``rejected``-band candidate is dropped
   before store.
-- **dedupe**: ``# TODO E5`` per-type dedup key + merge — passthrough now.
-- **store**: persists candidates to ``extraction_candidate`` (the staging row E5
-  reads) **and** promotes each validated candidate into a global
-  ``signals_signal`` row via ``signals.services.promote_candidate_to_signal`` (E4).
-  A candidate that fails the strict schema gate raises and dead-letters the job
+- **dedupe**: stamps the candidate with the canonical per-type dedupe key via the
+  signals service (doc 19 §7.1; E5). The windowed lookup + merge (doc 19 §7.2-§7.3)
+  needs the DB session, so it runs in the store path; the embedding-based fuzzy
+  fallback (doc 19 §7.4) is E10/I1.
+- **store**: persists candidates to ``extraction_candidate`` **and** promotes each
+  validated candidate into a global ``signals_signal`` row via
+  ``signals.services.promote_candidate_to_signal`` (E4), which now dedups within the
+  type window and merges corroborating documents into a surviving signal (doc 19 §7;
+  E5). A candidate that fails the strict schema gate raises and dead-letters the job
   with the surfaced validation error (doc 19 §6.1) — the candidate row is still
   persisted (rejected, for the audit) but no signal is written.
 """
@@ -509,31 +513,38 @@ def candidate_is_rejected(candidate: CandidateRecord) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: dedupe — passthrough stub
+# Stage 6: dedupe — canonical per-type key (E5)
 # ---------------------------------------------------------------------------
 
 
 def dedupe_candidate(candidate: CandidateRecord) -> CandidateRecord:
-    """Compute the dedup key and (eventually) merge duplicates (doc 19 §7).
+    """Compute the canonical per-type dedup key for the candidate (doc 19 §7.1; E5).
 
-    # TODO E5: the per-signal-type dedup key (doc 19 §7.1), the windowed lookup
-    # against ``signals_signal`` (doc 19 §7.2), the merge logic (doc 19 §7.3), and
-    # the embedding-based fuzzy fallback (doc 19 §7.4). Passthrough now: compute a
-    # coarse placeholder key so the column is populated and E5 has a starting
-    # point, but perform no merge (every candidate is stored as new).
+    Stage 6 (doc 19 §7): stamp the candidate with the canonical per-type dedupe hash
+    (``entity_id + signal_type + normalized_key_fields``) via the signals service
+    seam (``signals.services.dedupe_key_for_candidate`` — never ``signals.dedupe``
+    directly; doc 06 §3). The windowed lookup + merge (doc 19 §7.2-§7.3) needs the
+    DB session, so it runs in the store path (``signals.services.store_signal``,
+    which recomputes the authoritative hash from the *validated* payload). Stamping
+    it here keeps the staged ``extraction_candidate.dedup_key`` aligned with the
+    signal's ``content_hash`` for the audit trail and gives the store path a key even
+    before validation.
+
+    ``entity_id`` is resolution-pending at this stage (doc 19 §4.3 / E10 not wired),
+    so the hash is computed with ``entity_id=None`` here; the store path recomputes
+    with the resolved id once E10 supplies one. An unknown/absent ``signal_type``
+    yields no key (the store path's validated-payload hash takes over).
+
+    # TODO E10/I1: embedding-based **fuzzy** dedupe (doc 19 §7.4) for high-stakes
+    # types; this is the exact-key half only.
     """
     if candidate.dedup_key is not None:
         return candidate
-    title = ""
-    if isinstance(candidate.fields, dict):
-        raw_title = candidate.fields.get("title") or candidate.fields.get("summary")
-        title = str(raw_title).strip() if raw_title is not None else ""
-    # Without any title/summary text the key would be a bare ``type:`` with no
-    # distinguishing content — useless for dedupe — so leave it None for E5 to fill.
-    if not title:
+    fields = candidate.fields if isinstance(candidate.fields, dict) else {}
+    key = signals_services.dedupe_key_for_candidate(candidate.signal_type, fields)
+    if key is None:
         return candidate
-    placeholder = f"{candidate.signal_type or 'unknown'}:{title}".lower()[:255]
-    return candidate.model_copy(update={"dedup_key": placeholder})
+    return candidate.model_copy(update={"dedup_key": key})
 
 
 # ---------------------------------------------------------------------------
@@ -548,13 +559,15 @@ CANDIDATE_STATUS_REJECTED: Final = "rejected"
 
 
 def _candidate_content_hash(candidate: CandidateRecord) -> str:
-    """Derive a coarse dedupe ``content_hash`` for the signal row (doc 19 §7.1).
+    """Provisional ``content_hash`` carried into the store path (doc 19 §7.1; E5).
 
-    E5 lands the real per-signal-type canonical dedupe key + windowed merge. Until
-    then we hash the dedupe-stage placeholder key (or, if it computed none, the
-    signal type + a stable digest of the fields) so the ``signals_signal`` unique
-    dedupe index is populated and re-promotion of the *same* candidate is idempotent
-    rather than tripping the constraint.
+    The dedupe stage (:func:`dedupe_candidate`) stamps ``dedup_key`` with the
+    canonical per-type hash (already a SHA-256 hex), so we pass it straight through.
+    The store path (``signals.services.store_signal``) is the **authority**: it
+    recomputes the hash from the *validated* payload and runs the windowed merge
+    (doc 19 §7.2-§7.3), so this value is only the provisional ``CandidateInput``
+    seed. When the dedupe stage produced no key (unknown signal type), fall back to
+    a stable digest of the type + fields so the seed is still populated.
     """
     basis = candidate.dedup_key
     if not basis:
@@ -597,8 +610,10 @@ async def store_candidates(
     not commits), so on the raised error nothing is committed and the raw snapshot
     stays replayable.
 
-    # TODO E5: dedupe before store (per-type key + windowed merge, doc 19 §7) —
-    # E4 promotes with the exact-key upsert only.
+    Promotion dedups within the type-specific window and merges corroborating
+    documents into a surviving signal (doc 19 §7; E5) — the same RFP seen on the
+    portal, a newspaper and the entity's own site collapses to one signal.
+
     # TODO E6: the real confidence blend feeds ``confidence`` (doc 19 §6.2).
     """
     rows: list[ExtractionCandidate] = []

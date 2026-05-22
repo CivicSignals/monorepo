@@ -223,16 +223,44 @@ def test_score_candidate_respects_config_override() -> None:
     assert out.band == "normal"
 
 
-def test_dedupe_candidate_computes_placeholder_key() -> None:
-    c = CandidateRecord(signal_type="rfp_posted", fields={"title": "ERP RFP"})
+def test_dedupe_candidate_computes_canonical_key() -> None:
+    """The dedupe stage stamps the canonical per-type hash (doc 19 §7.1; E5)."""
+    from civicsignals_api.modules.signals import services as signals_services
+
+    c = CandidateRecord(
+        signal_type="rfp_posted",
+        fields={"title": "ERP RFP", "due_at": "2026-06-01T17:00:00Z"},
+    )
     out = pipeline.dedupe_candidate(c)
-    assert out.dedup_key == "rfp_posted:erp rfp"
+    # A SHA-256 hex digest of entity_id + signal_type + normalized key fields — equal
+    # to what the signals service computes for the same fields (entity_id pending).
+    assert out.dedup_key is not None
+    assert len(out.dedup_key) == 64
+    assert out.dedup_key == signals_services.dedupe_key_for_candidate(
+        "rfp_posted", {"title": "ERP RFP", "due_at": "2026-06-01T17:00:00Z"}
+    )
+
+
+def test_dedupe_candidate_normalizes_title_case_and_whitespace() -> None:
+    """Casing / whitespace differences hash identically (doc 19 §7.1, §7.3)."""
+    a = pipeline.dedupe_candidate(
+        CandidateRecord(
+            signal_type="rfp_posted", fields={"title": "ERP RFP", "due_at": "2026-06-01"}
+        )
+    )
+    b = pipeline.dedupe_candidate(
+        CandidateRecord(
+            signal_type="rfp_posted", fields={"title": "  erp   rfp ", "due_at": "2026-06-01"}
+        )
+    )
+    assert a.dedup_key == b.dedup_key
 
 
 def test_dedupe_candidate_unknown_type() -> None:
     c = CandidateRecord(signal_type=None, fields={})
     out = pipeline.dedupe_candidate(c)
-    # No title/summary -> empty placeholder collapses to None (E5 fills the real key).
+    # Unknown/absent signal type -> no key here; the store path's validated-payload
+    # hash takes over (E5).
     assert out.dedup_key is None
 
 
