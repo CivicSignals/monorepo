@@ -1,4 +1,4 @@
-// Public entities API — server-side fetch helpers (C5).
+// Public entities API — server-side fetch helpers (C5, P1).
 //
 // Used exclusively by Next.js server components / RSC in the /directory routes.
 // These functions run on the server; they call the API directly with `fetch`
@@ -7,11 +7,57 @@
 // The entities API is public/global: no auth header, no X-Workspace-Id.
 // Doc 07 §3, C1 req 5, C5 req 1.
 //
+// P1 extends this with public contacts and signals fetch helpers.
 // Sitemap cap: SITEMAP_ENTITY_LIMIT entities max (paginated in batches).
 
 import type { EntityPage, EntityRead, EntityFilters } from "@/lib/entities-api";
 
 export type { EntityRead, EntityPage };
+
+// ---- P1: Contact types (mirrors contacts/schemas.py ContactRead) ----
+
+export interface PublicContactRead {
+  id: string;
+  entity_id: string;
+  name: string;
+  department: string | null;
+  title: string | null;
+  status: string;
+  // canonical_email is intentionally omitted from the public display
+  // (C2 req: don't expose raw emails without auth; show only verified + sourced info).
+  source: string | null;
+  source_url: string | null;
+  confidence: number | null;
+  verified: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PublicContactPage {
+  items: PublicContactRead[];
+  next_cursor: string | null;
+}
+
+// ---- P1: Signal types (mirrors signals/schemas.py SignalRead, public subset) ----
+
+export interface PublicSignalRead {
+  id: string;
+  entity_id: string | null;
+  entity_name_raw: string | null;
+  signal_type: string;
+  title: string;
+  summary: string;
+  occurred_at: string | null;
+  observed_at: string;
+  confidence: number | null;
+  status: string;
+  created_at: string;
+}
+
+export interface PublicSignalPage {
+  items: PublicSignalRead[];
+  next_cursor: string | null;
+}
 
 // Re-export the same types for convenience in server components.
 
@@ -111,4 +157,60 @@ export async function fetchAllEntityIdsForSitemap(): Promise<string[]> {
   }
 
   return ids;
+}
+
+// ---- P1: public contacts + signals helpers ----
+
+/**
+ * Fetch public contacts for an entity (P1 req 2 — public contact subset).
+ * Contacts are a global/public resource; no auth needed.
+ * Returns first page only (limit=5) for the profile teaser.
+ * Non-fatal: returns empty page on error so entity profile still renders.
+ */
+export async function fetchPublicEntityContacts(
+  entityId: string,
+  opts: { limit?: number } = {},
+): Promise<PublicContactPage> {
+  const params = new URLSearchParams();
+  params.set("entity_id", entityId);
+  params.set("limit", String(opts.limit ?? 5));
+
+  const url = `${API_BASE_URL}/contacts?${params.toString()}`;
+  const res = await fetch(url, {
+    headers: { Accept: "application/json" },
+    next: { revalidate: DIRECTORY_REVALIDATE_SECONDS },
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Failed to fetch contacts for entity ${entityId}: ${res.status} ${res.statusText}`,
+    );
+  }
+  return (await res.json()) as PublicContactPage;
+}
+
+/**
+ * Fetch recent public signals for an entity (P1 req 2 — recent-signal teaser).
+ * Signals are a global/public resource; no auth needed.
+ * Returns first page only (limit=3) for the profile teaser.
+ * TODO P2: link to full public signal pages when G1+P2 are implemented.
+ */
+export async function fetchPublicEntitySignals(
+  entityId: string,
+  opts: { limit?: number } = {},
+): Promise<PublicSignalPage> {
+  const params = new URLSearchParams();
+  params.set("entity_id", entityId);
+  params.set("limit", String(opts.limit ?? 3));
+
+  const url = `${API_BASE_URL}/signals?${params.toString()}`;
+  const res = await fetch(url, {
+    headers: { Accept: "application/json" },
+    next: { revalidate: DIRECTORY_REVALIDATE_SECONDS },
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Failed to fetch signals for entity ${entityId}: ${res.status} ${res.statusText}`,
+    );
+  }
+  return (await res.json()) as PublicSignalPage;
 }
