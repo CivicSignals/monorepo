@@ -44,6 +44,15 @@ entities via per-tenant recipes — TODO D7):
   fetching (:mod:`._deferred_federal`): ``discover`` emits no pointers and the
   fetcher refuses any fetch.
 
+**Wave 5 — human workflow** (doc 18 §5 wave 5; D10):
+
+* :mod:`.manual_upload` — FOIA-response / customer-CSV upload path. Routes
+  uploaded bytes directly into the shared extraction pipeline (E1) so downstream
+  signal processing is identical to scraped content.  ``discover`` is a no-op
+  (bytes are already in D3 storage); ``fetch`` is never called; the connector is
+  registered so ``ingestion_raw_document.connector = "manual_upload"`` provenance
+  rows are valid.
+
 Importing this package registers every connector (its module's ``@register``
 runs), so :func:`~.base.get_connector` / :func:`~.base.connector_for` resolve a
 recipe's ``connector`` field to its class. The recipe runner dispatches through
@@ -128,6 +137,10 @@ from .ipeds import (
     IpedsConfig,
     IpedsConnector,
 )
+from .manual_upload import (
+    ManualUploadConfig,
+    ManualUploadConnector,
+)
 from .nces_ccd import (
     NcesCcdConfig,
     NcesCcdConnector,
@@ -201,6 +214,8 @@ __all__ = [
     "IonwaveConnector",
     "IpedsConfig",
     "IpedsConnector",
+    "ManualUploadConfig",
+    "ManualUploadConnector",
     "NcesCcdConfig",
     "NcesCcdConnector",
     "PaginationConfig",

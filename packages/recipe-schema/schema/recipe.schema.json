@@ -336,6 +336,19 @@
           "type": "object",
           "additionalProperties": true,
           "description": "Grants.gov opportunities — DEFERRED TO V2 (doc 18 §5 wave 3 #13). Federal coverage is out of MVP scope (TODO.md 'Out of scope'); this connector is registered but not wired for live fetching (discover() emits no pointers). The block is intentionally permissive so a forward-looking recipe documenting intended v2 coverage still validates. # TODO v2."
+        },
+        "manual_upload": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Human-workflow connector (doc 18 §1 cat. H, §5 wave 5; D10). Routes uploaded FOIA responses and customer CSV imports through the same extraction pipeline as scraped content. discover() is a no-op (bytes are already stored via D3); fetch() is never called; the connector is registered so ingestion_raw_document.connector = 'manual_upload' provenance rows are valid.",
+          "properties": {
+            "prefilter": {
+              "type": "string",
+              "enum": ["classifier", "assume_relevant"],
+              "default": "assume_relevant",
+              "description": "Relevance gate behaviour for manual uploads. Defaults to assume_relevant since uploaded documents are pre-vetted by a human (doc 19 §3)."
+            }
+          }
         }
       }
     },
