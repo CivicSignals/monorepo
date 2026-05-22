@@ -630,7 +630,12 @@ async def rollup_by_stage(
     report always shows all configured stages even when empty. Results are
     ordered by stage position. Workspace-isolated — callers pass workspace_id;
     no cross-workspace data leaks.
+
+    Auto-provisions default stages (same lazy-provisioning pattern as
+    ``list_stages`` / ``create_item``) so a fresh workspace returns nine rows
+    with zero counts rather than an empty list.
     """
+    await provision_default_stages(session, workspace_id=workspace_id)
     # LEFT JOIN so stages with 0 items still appear.
     stmt = (
         select(

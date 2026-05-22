@@ -121,6 +121,9 @@ async def get_pipeline_report(
     RFC 7807 errors on unexpected failures.
     """
     rollup = await services.rollup_by_stage(session, ctx.workspace_id)
+    # Commit so lazy-provisioned stages are visible across requests (same
+    # pattern as list_stages; no-op when workspace already had stages).
+    await session.commit()
     stage_out = [
         StageRollup(
             stage_id=r.stage_id,
