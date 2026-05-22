@@ -169,7 +169,10 @@ export function getVerificationStatus(contact: Pick<ContactRead, "verified" | "l
   if (!contact.verified) return "Stale";
   if (!contact.last_verified_at) return "Stale";
   const verifiedAt = new Date(contact.last_verified_at).getTime();
+  // Guard against invalid timestamps (NaN) and future timestamps (negative age)
+  if (Number.isNaN(verifiedAt)) return "Stale";
   const ageMs = Date.now() - verifiedAt;
+  if (ageMs < 0) return "Stale";
   const ageDays = ageMs / (1000 * 60 * 60 * 24);
   if (ageDays > STALE_DAYS) return "Stale";
   return "Verified";

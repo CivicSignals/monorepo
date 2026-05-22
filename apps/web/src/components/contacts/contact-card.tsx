@@ -65,8 +65,8 @@ export function ContactCard({ contact }: ContactCardProps) {
         )}
       </div>
 
-      {/* Title / Department */}
-      {(contact.title ?? contact.department) && (
+      {/* Title / Department — use || so empty strings fall through to the other field */}
+      {(contact.title || contact.department) && (
         <p className="mt-0.5 text-xs text-muted-foreground">
           {[contact.title, contact.department].filter(Boolean).join(" · ")}
         </p>
