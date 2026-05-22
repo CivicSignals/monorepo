@@ -17,7 +17,11 @@ H5 adds the unsubscribe + preferences surface:
   POST /notifications/digests/unsubscribe?token= — one-click unsubscribe (public, RFC 8058)
 
 The unsubscribe endpoints take the signed one-click token minted into each digest
-email; they require no login and flip exactly that one subscription to ``off``.
+email; they require no login. The **GET** is deliberately non-mutating — it only
+validates the token and reports the saved-search name so the web confirm page can
+ask "really unsubscribe?"; a mail-client link prefetch or security scanner that
+follows the GET therefore cannot silently unsubscribe anyone. Only the **POST**
+(RFC 8058 one-click) flips that one subscription to ``off``.
 """
 
 from __future__ import annotations
@@ -94,18 +98,46 @@ def _bad_token() -> ProblemException:
     )
 
 
-async def _do_unsubscribe(session: AsyncSession, token: str) -> UnsubscribeResult:
-    """Verify the token and flip the identified subscription to ``off`` (H5).
+def _verify_token(token: str) -> uuid.UUID:
+    """Decode a one-click token to a subscription id, or raise ``400`` (H5).
 
-    Shared by the GET (confirm landing) and POST (one-click) handlers. A bad,
-    tampered, expired, or wrong-scope token is a ``400``; an unknown subscription
-    (CASCADE-deleted) is also a ``400`` so the endpoint never reveals which ids
-    exist. The token alone is the authorization — no login, no workspace header.
+    A bad, tampered, expired, or wrong-scope token is a ``400``. The token alone
+    is the authorization — no login, no workspace header.
     """
     try:
-        subscription_id = verify_unsubscribe_token(token)
+        return verify_unsubscribe_token(token)
     except InvalidUnsubscribeToken as exc:
         raise _bad_token() from exc
+
+
+async def _peek_unsubscribe(session: AsyncSession, token: str) -> UnsubscribeResult:
+    """Validate the token and report the digest WITHOUT changing state (GET, H5).
+
+    Non-mutating: the GET confirm landing only checks the token is good and looks
+    up the saved-search name so the web page can name the digest before the user
+    confirms. A link prefetch / scanner that follows this GET therefore cannot
+    silently unsubscribe — the destructive flip lives in the POST. An unknown
+    subscription (CASCADE-deleted) is a ``400`` so the endpoint never reveals which
+    ids exist. ``unsubscribed=False`` signals "not yet acted on" to the confirm page.
+    """
+    subscription_id = _verify_token(token)
+    name = await services.peek_subscription_name(session, subscription_id=subscription_id)
+    if isinstance(name, services.SubscriptionMissing):
+        # Valid signature but no such subscription (e.g. the saved search was
+        # deleted, cascading the subscription away). Treat as a bad link.
+        raise _bad_token()
+    # ``name`` is now ``str | None`` (the sentinel is ruled out above).
+    return UnsubscribeResult(unsubscribed=False, saved_search_name=name)
+
+
+async def _do_unsubscribe(session: AsyncSession, token: str) -> UnsubscribeResult:
+    """Verify the token and flip the identified subscription to ``off`` (POST, H5).
+
+    The POST one-click path (RFC 8058) — the only side-effecting unsubscribe. An
+    unknown subscription (CASCADE-deleted) is a ``400`` so the endpoint never
+    reveals which ids exist. The token alone is the authorization.
+    """
+    subscription_id = _verify_token(token)
 
     outcome = await services.unsubscribe_by_id(session, subscription_id=subscription_id)
     if not outcome.unsubscribed:
@@ -147,18 +179,21 @@ async def list_digests(
 @router.get(
     "/digests/unsubscribe",
     response_model=UnsubscribeResult,
-    summary="One-click unsubscribe — confirm landing (public, no auth)",
+    summary="One-click unsubscribe — confirm landing (public, non-mutating)",
 )
 async def unsubscribe_landing(
     session: SessionDep,
     token: Annotated[str, Query(description="The signed one-click unsubscribe token.")],
 ) -> UnsubscribeResult:
-    """Confirm + apply a one-click unsubscribe from a digest-email link (H5).
+    """Validate a one-click token and name the digest, WITHOUT changing state (H5).
 
-    Public (no auth): the signed token is the authorization. The web confirm page
-    calls this to action the unsubscribe and show which digest was turned off.
+    Public (no auth): the signed token is the authorization. Deliberately
+    non-mutating — the web confirm page calls this to check the link is valid and
+    show *which* digest will be turned off; the user then POSTs to actually
+    unsubscribe. A link prefetch / scanner following this GET cannot silently
+    unsubscribe (the side effect is POST-only, per RFC 8058 one-click).
     """
-    return await _do_unsubscribe(session, token)
+    return await _peek_unsubscribe(session, token)
 
 
 @router.post(

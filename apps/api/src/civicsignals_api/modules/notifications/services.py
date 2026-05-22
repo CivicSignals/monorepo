@@ -101,12 +101,16 @@ def default_email_sender() -> EmailSender:
     return SMTPEmailSender(settings.smtp_host, settings.smtp_port, settings.email_from)
 
 
-def send_email(message: OutboundEmail, *, sender: EmailSender | None = None) -> None:
+def send_email(message: OutboundEmail, *, sender: EmailSender | None = None) -> bool:
     """Send a transactional email through ``sender`` (defaults to SMTP).
 
     Failures are logged and swallowed so a flaky mail relay never breaks the
-    surrounding request (e.g. signup). Callers that must guarantee delivery
-    should enqueue via ``worker_notify`` instead (later epics).
+    surrounding request (e.g. signup): the request-path callers (signup,
+    password-reset, invites) ignore the return value, so this stays best-effort
+    for them. Returns ``True`` on a successful send and ``False`` on failure so
+    callers that *do* care about delivery — the H3 digest task, which only claims
+    a period after a confirmed send for at-least-once delivery — can observe the
+    outcome without the exception escaping.
     """
     transport = sender or default_email_sender()
     try:
@@ -115,6 +119,8 @@ def send_email(message: OutboundEmail, *, sender: EmailSender | None = None) -> 
         # Best-effort transactional send: never break the surrounding request
         # (e.g. signup) on a flaky mail relay.
         logger.warning("transactional_email_send_failed", to=message.to, subject=message.subject)
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -248,6 +254,20 @@ def select_due_subscriptions(
     ]
 
 
+def already_sent_this_period(sub: DigestSubscription, *, now: datetime) -> bool:
+    """True iff ``now``'s local period is already the subscription's claimed period.
+
+    Pure read-only dedupe check (no DB write) used by the delivery task *before*
+    building/sending: a re-delivered task or a second sweep for the same period
+    short-circuits here without re-sending. The authoritative claim is the guarded
+    :func:`mark_sent` UPDATE, which the task runs only after a confirmed send (so the
+    period is never claimed for a send that failed). A ``None`` period key (frequency
+    ``off``) is treated as "not sent" — the sweep should not have enqueued it anyway.
+    """
+    key = period_key(sub.frequency_enum, now, sub.timezone)
+    return key is not None and key == sub.last_sent_period
+
+
 async def mark_sent(
     session: AsyncSession,
     *,
@@ -305,23 +325,68 @@ async def list_user_subscriptions(
 
     Powers the consolidated ``/settings/notifications`` preferences page: one row
     per saved search the caller has a subscription for (any frequency, including
-    ``off`` so a previously-disabled digest can be re-enabled). Joined to
-    ``searches_saved_search`` for the display name; workspace-scoped so a member
-    only ever sees their own subscriptions in the active workspace.
+    ``off`` so a previously-disabled digest can be re-enabled). The display name is
+    resolved through ``searches.services`` (never by importing that module's model —
+    doc 06 §3); workspace-scoped so a member only ever sees their own subscriptions
+    in the active workspace. A subscription whose saved search no longer exists in
+    the workspace is dropped (its name cannot be shown), matching the prior JOIN.
     """
-    from civicsignals_api.modules.searches.models import SavedSearch
+    from civicsignals_api.modules.searches import services as searches_services
 
-    stmt = (
-        select(DigestSubscription, SavedSearch.name)
-        .join(SavedSearch, SavedSearch.id == DigestSubscription.saved_search_id)
-        .where(
+    result = await session.execute(
+        select(DigestSubscription).where(
             DigestSubscription.user_id == user_id,
             DigestSubscription.workspace_id == workspace_id,
         )
-        .order_by(SavedSearch.name)
     )
-    rows = await session.execute(stmt)
-    return [UserSubscription(subscription=sub, saved_search_name=name) for sub, name in rows.all()]
+    subs = list(result.scalars().all())
+    names = await searches_services.get_saved_search_names(
+        session,
+        workspace_id=workspace_id,
+        search_ids=[sub.saved_search_id for sub in subs],
+    )
+    rows = [
+        UserSubscription(subscription=sub, saved_search_name=names[sub.saved_search_id])
+        for sub in subs
+        if sub.saved_search_id in names
+    ]
+    # Preserve the old ORDER BY SavedSearch.name ordering (now sorted in Python).
+    rows.sort(key=lambda row: row.saved_search_name)
+    return rows
+
+
+class SubscriptionMissing:
+    """Sentinel type: the subscription does not exist (distinct from "exists, no name").
+
+    A dedicated class (not ``None``) so the GET confirm path can distinguish "no such
+    subscription" (a ``400`` bad link) from "exists but its search is unnamed/gone"
+    (a ``None`` name). The route narrows with ``isinstance(name, SubscriptionMissing)``.
+    """
+
+
+# Singleton instance returned by :func:`peek_subscription_name` for the missing case.
+SUBSCRIPTION_MISSING = SubscriptionMissing()
+
+
+async def peek_subscription_name(
+    session: AsyncSession,
+    *,
+    subscription_id: uuid.UUID,
+) -> str | None | SubscriptionMissing:
+    """Look up a subscription's saved-search name WITHOUT changing state (GET, H5).
+
+    Non-mutating counterpart to :func:`unsubscribe_by_id` for the confirm landing:
+    returns the saved-search name if the subscription exists, ``None`` if it exists
+    but the search is unnamed/gone, or :data:`SUBSCRIPTION_MISSING` if no such
+    subscription exists (the route turns that into a ``400`` bad link). The
+    saved-search name is resolved through ``searches.services`` (doc 06 §3).
+    """
+    from civicsignals_api.modules.searches import services as searches_services
+
+    sub = await session.get(DigestSubscription, subscription_id)
+    if sub is None:
+        return SUBSCRIPTION_MISSING
+    return await searches_services.get_saved_search_name(session, search_id=sub.saved_search_id)
 
 
 @dataclass(frozen=True)
@@ -349,15 +414,13 @@ async def unsubscribe_by_id(
     Unlike the B3 reset, the unsubscribe *token* is stateless (no DB consume step):
     the action is idempotent, so there is nothing to mark used.
     """
-    from civicsignals_api.modules.searches.models import SavedSearch
+    from civicsignals_api.modules.searches import services as searches_services
 
     sub = await session.get(DigestSubscription, subscription_id)
     if sub is None:
         return UnsubscribeOutcome(unsubscribed=False, saved_search_name=None)
 
-    name = await session.scalar(
-        select(SavedSearch.name).where(SavedSearch.id == sub.saved_search_id)
-    )
+    name = await searches_services.get_saved_search_name(session, search_id=sub.saved_search_id)
     result = cast(
         CursorResult[Any],
         await session.execute(

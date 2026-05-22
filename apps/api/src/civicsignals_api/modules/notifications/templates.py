@@ -119,6 +119,9 @@ def _format_date(value: Any) -> str | None:
 
 
 def _digest_subject(saved_search_name: str | None, count: int) -> str:
+    # TODO(NIT): a saved-search name may contain control chars (it's user input);
+    # they're harmless in the HTML/text body (escaped) but a raw control char in the
+    # Subject header is technically out of spec. Trivial to strip if it ever matters.
     name = saved_search_name or "your saved search"
     if count == 0:
         return f"{_BRAND_NAME}: no new signals for '{name}'"

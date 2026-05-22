@@ -49,6 +49,21 @@ class _NeverLock(_AlwaysLock):
         return False
 
 
+class _FailingSender:
+    """A sender whose transport always fails (simulates an SMTP relay outage).
+
+    Records the attempt so the test can assert a send was attempted, but raising
+    here makes ``services.send_email`` return ``False`` (it swallows + reports).
+    """
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def send(self, message: services.OutboundEmail) -> None:
+        self.attempts += 1
+        raise RuntimeError("smtp down")
+
+
 async def _seed(
     session: AsyncSession, *, frequency: DigestFrequency, send_hour: int = 8
 ) -> uuid.UUID:
@@ -183,3 +198,44 @@ async def test_send_digest_renders_and_sends_via_mailer(
     assert message.html_body is not None
     assert "Hot RFPs" in message.html_body
     assert "Hot RFPs" in message.text_body
+
+
+async def test_failed_send_does_not_mark_sent_and_later_run_resends(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """At-least-once: a send failure leaves the period unclaimed so a later run resends.
+
+    The prior "claim then send" order committed ``mark_sent`` before sending, so a
+    swallowed SMTP error silently lost that period's digest. Now the claim only lands
+    after a confirmed send.
+    """
+    sub_id = await _seed_via(session_factory, DigestFrequency.DAILY, send_hour=8)
+    now = _utc(2026, 1, 15, 9)
+
+    failing = _FailingSender()
+    with patch.object(tasks, "SessionLocal", session_factory):
+        result = await tasks._send_digest_async(sub_id, now, sender=failing)
+
+    # The send was attempted but failed -> the run reports it did not send.
+    assert result is False
+    assert failing.attempts == 1
+
+    # The period was NOT claimed (no last_sent_*), so the digest is not lost.
+    async with session_factory() as session:
+        sub = await services.get_digest_subscription_by_id(session, subscription_id=sub_id)
+        assert sub is not None
+        assert sub.last_sent_at is None
+        assert sub.last_sent_period is None
+
+    # A later run with a working transport resends and now claims the period.
+    recorder = services.RecordingEmailSender()
+    with patch.object(tasks, "SessionLocal", session_factory):
+        retried = await tasks._send_digest_async(sub_id, now, sender=recorder)
+
+    assert retried is True
+    assert len(recorder.sent) == 1
+    async with session_factory() as session:
+        sub = await services.get_digest_subscription_by_id(session, subscription_id=sub_id)
+        assert sub is not None
+        assert sub.last_sent_at is not None
+        assert sub.last_sent_period == "daily:2026-01-15"

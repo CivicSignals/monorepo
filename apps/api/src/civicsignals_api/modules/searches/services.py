@@ -30,7 +30,7 @@ import base64
 import binascii
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,6 +139,49 @@ async def get_saved_search(
     return await _get_visible(
         session, workspace_id=workspace_id, user_id=user_id, search_id=search_id
     )
+
+
+async def get_saved_search_name(
+    session: AsyncSession,
+    *,
+    search_id: uuid.UUID,
+) -> str | None:
+    """The display name of a saved search by id, or ``None`` if it does not exist.
+
+    Cross-module read seam (doc 06 §3): the notifications digest path resolves a
+    saved-search name from a subscription without importing :class:`SavedSearch`.
+    Not workspace-scoped on purpose — the caller already holds a subscription row
+    whose own ``workspace_id`` establishes tenancy, and this is a name lookup, not
+    an access check.
+    """
+    return cast(
+        "str | None",
+        await session.scalar(select(SavedSearch.name).where(SavedSearch.id == search_id)),
+    )
+
+
+async def get_saved_search_names(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    search_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, str]:
+    """Map ``search_id`` -> name for the given ids within one workspace (doc 06 §3).
+
+    Cross-module read seam for the notifications preferences list: resolve the
+    display names for a batch of saved searches without importing
+    :class:`SavedSearch`. Workspace-scoped, so an id from another workspace simply
+    does not appear in the result; ids with no matching row are likewise omitted.
+    """
+    if not search_ids:
+        return {}
+    rows = await session.execute(
+        select(SavedSearch.id, SavedSearch.name).where(
+            SavedSearch.workspace_id == workspace_id,
+            SavedSearch.id.in_(search_ids),
+        )
+    )
+    return {row.id: row.name for row in rows.all()}
 
 
 async def list_saved_searches(

@@ -180,17 +180,36 @@ def test_one_click_unsubscribe_sets_off(client: TestClient) -> None:
     assert got.json()["frequency"] == "off"
 
 
-def test_unsubscribe_landing_get_also_works(client: TestClient) -> None:
+def test_unsubscribe_landing_get_is_non_mutating(client: TestClient) -> None:
+    """GET only validates + names the digest; it must NOT flip the subscription off.
+
+    A mail-client link prefetch or scanner that follows the GET cannot silently
+    unsubscribe — only the RFC 8058 POST mutates (see ``test_one_click_...`` below).
+    """
     token = _signup(client, "unsub-get@example.com")
     ws = _make_workspace(client, token)
     search_id = _make_search(client, token, ws)
     sub_id = _set_digest(client, token, ws, search_id, "weekly")
 
-    resp = client.get(f"{UNSUB}?token={_mint_token_for(sub_id)}")
+    unsub_token = _mint_token_for(sub_id)
+    resp = client.get(f"{UNSUB}?token={unsub_token}")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["unsubscribed"] is True
+    # GET reports the digest name but reports it is NOT yet unsubscribed.
+    assert body["unsubscribed"] is False
     assert body["saved_search_name"] == "Hot RFPs"
+
+    # The subscription is untouched by the GET (still weekly).
+    got = client.get(_digest_path(search_id), headers=_scoped(token, ws))
+    assert got.status_code == 200
+    assert got.json()["frequency"] == "weekly"
+
+    # The POST is what actually flips it off (RFC 8058 one-click).
+    posted = client.post(f"{UNSUB}?token={unsub_token}")
+    assert posted.status_code == 200
+    assert posted.json()["unsubscribed"] is True
+    after = client.get(_digest_path(search_id), headers=_scoped(token, ws))
+    assert after.json()["frequency"] == "off"
 
 
 def test_tampered_token_is_rejected(client: TestClient) -> None:
