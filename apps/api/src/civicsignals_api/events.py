@@ -16,6 +16,9 @@ SIGNAL_CREATED = "signal.created"
 SIGNAL_SCORED = "signal.scored"
 SIGNAL_PUSHED = "signal.pushed"
 MEMBER_INVITED = "member.invited"
+# B3: password reset audit events. B9 will consume and persist these.
+AUTH_PASSWORD_RESET_REQUESTED = "auth.password_reset.requested"
+AUTH_PASSWORD_RESET_COMPLETED = "auth.password_reset.completed"
 
 Handler = Callable[[dict[str, Any]], Awaitable[None]]
 

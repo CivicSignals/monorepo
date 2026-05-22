@@ -1,9 +1,11 @@
 """HTTP endpoints for the auth module, mounted under ``/api/v1/auth`` (doc 08 §3.1).
 
 Email/password identity (B1): signup, login, logout, email verification, and the
-current-user lookup. Errors are RFC 7807 ``application/problem+json`` (doc 08
-§1.7) raised as :class:`ProblemException`. Bearer JWTs are issued by
-``auth.services``; the reusable ``get_current_user`` dependency guards ``/me``.
+current-user lookup. Password reset (B3): request + confirm.
+
+Errors are RFC 7807 ``application/problem+json`` (doc 08 §1.7) raised as
+:class:`ProblemException`. Bearer JWTs are issued by ``auth.services``; the
+reusable ``get_current_user`` dependency guards ``/me``.
 
 # TODO B1: per-IP / per-account rate limiting attaches to /signup, /login, and
 #   /verify-email (5/15min/IP, 20/15min/account — threat-model §4.2). The
@@ -15,12 +17,16 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from civicsignals_api import events
 from civicsignals_api.config import Settings, get_settings
 from civicsignals_api.db import get_session
+from civicsignals_api.events import AUTH_PASSWORD_RESET_COMPLETED, AUTH_PASSWORD_RESET_REQUESTED
+from civicsignals_api.modules.accounts import services as accounts_services
 from civicsignals_api.modules.accounts.schemas import UserOut
 from civicsignals_api.modules.notifications import services as notifications_services
 from civicsignals_api.problems import ProblemException
@@ -31,11 +37,15 @@ from .schemas import (
     AuthResponse,
     LoginRequest,
     MessageResponse,
+    PasswordResetConfirmBody,
+    PasswordResetRequestBody,
     SignupRequest,
     SignupResponse,
     TokenPair,
     VerifyEmailRequest,
 )
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -172,3 +182,101 @@ async def verify_email(body: VerifyEmailRequest, session: SessionDep) -> Message
 @router.get("/me", response_model=UserOut)
 async def me(current_user: CurrentUser) -> UserOut:
     return UserOut.model_validate(current_user)
+
+
+# --- B3: Password reset -------------------------------------------------------
+
+
+def _send_password_reset_email(email: str, raw_token: str, settings: Settings) -> None:
+    link = f"{settings.web_base_url}/reset-password?token={raw_token}"
+    message = notifications_services.OutboundEmail(
+        to=email,
+        subject="Reset your CivicSignals password",
+        text_body=(
+            "You requested a password reset for your CivicSignals account.\n\n"
+            f"Reset your password by visiting:\n{link}\n\n"
+            "This link expires in 1 hour and can only be used once.\n\n"
+            "If you did not request a password reset, you can ignore this message."
+        ),
+        html_body=(
+            "<p>You requested a password reset for your CivicSignals account.</p>"
+            f'<p><a href="{link}">Reset my password</a></p>'
+            "<p>This link expires in 1 hour and can only be used once.</p>"
+            "<p>If you did not request a password reset, you can ignore this message.</p>"
+        ),
+    )
+    notifications_services.send_email(message)
+
+
+@router.post(
+    "/password-reset/request",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Request a password reset email",
+    response_description="Always 204 — no enumeration",
+)
+async def password_reset_request(
+    body: PasswordResetRequestBody, session: SessionDep, settings: SettingsDep
+) -> Response:
+    """Send a password-reset email if the address is registered.
+
+    ALWAYS returns 204 regardless of whether the address is known — this prevents
+    user enumeration (doc 08 §3.1, threat-model §4.2). The email is only sent
+    when the user actually exists.
+
+    Emits ``auth.password_reset.requested`` on the in-process event bus for audit
+    (B9 will persist it).
+    """
+    email = str(body.email)
+    user = await accounts_services.get_user_by_email(session, email)
+    if user is not None:
+        raw_token = await auth_services.create_password_reset_token(
+            session, user, settings=settings
+        )
+        await session.commit()
+        _send_password_reset_email(email, raw_token, settings)
+        # TODO B9: persist audit entry — currently emitted on the in-process bus only.
+        await events.publish(
+            AUTH_PASSWORD_RESET_REQUESTED,
+            {"user_id": str(user.id), "email": email},
+        )
+    else:
+        # No commit needed — nothing changed; rollback for cleanliness.
+        await session.rollback()
+        logger.info("password_reset_request_unknown_email", email=email)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/password-reset/confirm", response_model=MessageResponse)
+async def password_reset_confirm(
+    body: PasswordResetConfirmBody, session: SessionDep
+) -> MessageResponse:
+    """Validate a reset token, set a new password, and consume the token.
+
+    Returns ``400`` if the token is unknown, expired, or already used.
+    On success all other pending reset tokens for this user are also invalidated,
+    preventing replay of old links.
+
+    Emits ``auth.password_reset.completed`` on the in-process event bus for audit
+    (B9 will persist it).
+    """
+    try:
+        user = await auth_services.consume_password_reset_token(
+            session, body.token, new_password=body.new_password
+        )
+        await session.commit()
+    except auth_services.PasswordResetTokenError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="invalid_reset_token",
+            title="Invalid password-reset token",
+            detail="This reset link is invalid, expired, or already used.",
+        ) from exc
+
+    # TODO B9: persist audit entry — currently emitted on the in-process bus only.
+    await events.publish(
+        AUTH_PASSWORD_RESET_COMPLETED,
+        {"user_id": str(user.id), "email": user.email},
+    )
+    return MessageResponse(message="password reset")

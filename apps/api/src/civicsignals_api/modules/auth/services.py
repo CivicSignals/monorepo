@@ -12,6 +12,8 @@ RBAC), so the public surface is intentionally small and stable:
 - ``signup`` — create a user, mint + persist a verification token, and return
   the opaque token to mail.
 - ``consume_email_verification_token`` — single-use verification.
+- ``create_password_reset_token`` / ``consume_password_reset_token`` — B3 reset
+  flow. Token is single-use, hashed at rest, and expires after a configurable TTL.
 
 Cross-module rules: user identity is owned by ``accounts`` and reached only via
 ``accounts.services``; verification mail goes out via ``notifications.services``.
@@ -28,14 +30,14 @@ from uuid import UUID
 
 import jwt
 from passlib.context import CryptContext
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.config import Settings, get_settings
 from civicsignals_api.modules.accounts import services as accounts_services
 from civicsignals_api.modules.accounts.models import User
 
-from .models import EmailVerificationToken
+from .models import EmailVerificationToken, PasswordResetToken
 
 # bcrypt at cost 12 (NFR §4.2). passlib transparently truncates >72 bytes; we
 # additionally reject overly long passwords at the schema layer.
@@ -62,6 +64,10 @@ class InvalidTokenError(AuthError):
 
 class VerificationTokenError(AuthError):
     """An email-verification token was missing, expired, or already used."""
+
+
+class PasswordResetTokenError(AuthError):
+    """A password-reset token was missing, expired, or already consumed."""
 
 
 @dataclass(frozen=True)
@@ -218,6 +224,87 @@ async def consume_email_verification_token(session: AsyncSession, raw_token: str
 
     record.used_at = datetime.now(UTC)
     await accounts_services.mark_email_verified(session, user)
+    await session.flush()
+    return user
+
+
+# --- Password-reset tokens (B3; single-use, hashed at rest) -----------------
+
+
+async def create_password_reset_token(
+    session: AsyncSession, user: User, *, settings: Settings | None = None
+) -> str:
+    """Generate, persist (hashed), and return a single-use password-reset token.
+
+    The opaque token is returned to the caller so the route can embed it in the
+    reset link mailed to the user. Only the SHA-256 digest is stored in the DB
+    (threat-model §4.2).
+    """
+    settings = settings or get_settings()
+    raw = secrets.token_urlsafe(32)
+    record = PasswordResetToken(
+        user_id=user.id,
+        token_hash=_hash_token(raw),
+        expires_at=datetime.now(UTC) + timedelta(seconds=settings.password_reset_ttl_seconds),
+    )
+    session.add(record)
+    await session.flush()
+    return raw
+
+
+async def consume_password_reset_token(
+    session: AsyncSession,
+    raw_token: str,
+    *,
+    new_password: str,
+) -> User:
+    """Validate a reset token, update the password, and invalidate all other tokens.
+
+    Raises :class:`PasswordResetTokenError` if the token is unknown, expired, or
+    already consumed. On success:
+
+    - Sets the user's ``password_hash`` to the bcrypt hash of ``new_password``.
+    - Marks this token consumed (``consumed_at = now``).
+    - Marks all *other* pending reset tokens for the same user consumed so that
+      old reset links can no longer be replayed.
+    """
+    result = await session.execute(
+        select(PasswordResetToken).where(PasswordResetToken.token_hash == _hash_token(raw_token))
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        raise PasswordResetTokenError("unknown token")
+    if record.consumed_at is not None:
+        raise PasswordResetTokenError("token already used")
+    expires_at = record.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at < datetime.now(UTC):
+        raise PasswordResetTokenError("token expired")
+
+    user = await accounts_services.get_user_by_id(session, record.user_id)
+    if user is None:
+        raise PasswordResetTokenError("user no longer exists")
+
+    now = datetime.now(UTC)
+
+    # Invalidate all other pending reset tokens for this user so old reset links
+    # cannot be replayed after a successful password change.
+    await session.execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.user_id == record.user_id,
+            PasswordResetToken.id != record.id,
+            PasswordResetToken.consumed_at.is_(None),
+        )
+        .values(consumed_at=now)
+    )
+
+    # Consume this token.
+    record.consumed_at = now
+
+    # Update the password.
+    user.password_hash = hash_password(new_password)
     await session.flush()
     return user
 

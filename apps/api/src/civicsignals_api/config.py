@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     # dev/self-host first-run flow is frictionless; Cloud sets it true.
     require_email_verification: bool = False
     web_base_url: str = "http://localhost:3000"
+    # Password-reset token TTL (B3). Short window reduces the attack surface for
+    # a stolen reset link (threat-model §4.2).
+    password_reset_ttl_seconds: int = 60 * 60  # 1 hour
 
     # LLM gateway (doc 06 §7, doc 18 §6.6). Vendor SDKs are imported lazily by
     # the backends; only the keys/base URLs configured here are needed.

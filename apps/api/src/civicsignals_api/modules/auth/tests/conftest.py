@@ -35,6 +35,7 @@ from civicsignals_api.main import app
 from civicsignals_api.modules.accounts.models import User  # noqa: F401  registers the table
 from civicsignals_api.modules.auth.models import (  # noqa: F401  registers the table
     EmailVerificationToken,
+    PasswordResetToken,
 )
 from civicsignals_api.modules.notifications import services as notifications_services
 
