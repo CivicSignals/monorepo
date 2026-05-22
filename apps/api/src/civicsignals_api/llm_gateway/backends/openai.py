@@ -86,13 +86,13 @@ def _normalize_error(exc: Exception) -> Exception:
     """Map openai SDK errors to the gateway taxonomy (see anthropic backend)."""
     name = type(exc).__name__
     status = getattr(exc, "status_code", None)
+    # APIStatusError (4xx base) is intentionally excluded — see anthropic backend.
     transient_names = {
         "APITimeoutError",
         "APIConnectionError",
         "RateLimitError",
         "InternalServerError",
-        "APIStatusError",
     }
-    if name in transient_names or (isinstance(status, int) and status >= 500) or status == 429:
+    if name in transient_names or (isinstance(status, int) and (status == 429 or status >= 500)):
         return TransientLLMError(f"openai transient error: {name}: {exc}")
     return exc

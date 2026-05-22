@@ -49,7 +49,8 @@ class OllamaBackend:
             if status >= 500 or status == 429:
                 raise TransientLLMError(f"ollama transient error: HTTP {status}") from exc
             raise
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+        except httpx.TransportError as exc:
+            # TransportError covers timeouts, connection, and protocol errors.
             raise TransientLLMError(f"ollama transport error: {exc}") from exc
 
         data = response.json()

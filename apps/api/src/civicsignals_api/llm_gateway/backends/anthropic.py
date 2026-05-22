@@ -93,13 +93,15 @@ def _normalize_error(exc: Exception) -> Exception:
     """
     name = type(exc).__name__
     status = getattr(exc, "status_code", None)
+    # These error classes are always transient. APIStatusError is NOT here: it is
+    # the base for 4xx (e.g. 400/401/404) which must not be retried — those are
+    # decided by status code below (429 / 5xx only).
     transient_names = {
         "APITimeoutError",
         "APIConnectionError",
         "RateLimitError",
         "InternalServerError",
-        "APIStatusError",
     }
-    if name in transient_names or (isinstance(status, int) and status >= 500) or status == 429:
+    if name in transient_names or (isinstance(status, int) and (status == 429 or status >= 500)):
         return TransientLLMError(f"anthropic transient error: {name}: {exc}")
     return exc
