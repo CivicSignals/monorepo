@@ -83,3 +83,31 @@ describe("robots() — public signal pages (P2)", () => {
     expect(disallowArr).toContain("/feed");
   });
 });
+
+describe("robots() — Crawl-delay (P4)", () => {
+  it("sets a positive Crawl-delay on the general (*) rule", async () => {
+    const { default: robots } = await import("@/app/robots");
+    const result = robots();
+    const rule = Array.isArray(result.rules) ? result.rules[0] : result.rules;
+    // Next emits `Crawl-delay: <n>` from the per-rule `crawlDelay` field; assert
+    // it is present and positive so polite crawlers pace themselves (P4).
+    expect(rule?.userAgent).toBe("*");
+    expect(typeof rule?.crawlDelay).toBe("number");
+    expect(rule?.crawlDelay ?? 0).toBeGreaterThan(0);
+  });
+
+  it("keeps the public crawl paths allowed alongside the Crawl-delay", async () => {
+    const { default: robots } = await import("@/app/robots");
+    const result = robots();
+    const rule = Array.isArray(result.rules) ? result.rules[0] : result.rules;
+    const allow = rule?.allow;
+    const allowArr = Array.isArray(allow) ? allow : allow ? [allow] : [];
+    // /directory/* and /s/* stay crawlable; auth/api stay disallowed.
+    expect(allowArr).toContain("/directory/");
+    expect(allowArr).toContain("/s/");
+    const disallow = rule?.disallow;
+    const disallowArr = Array.isArray(disallow) ? disallow : disallow ? [disallow] : [];
+    expect(disallowArr).toContain("/api/");
+    expect(disallowArr).toContain("/feed");
+  });
+});

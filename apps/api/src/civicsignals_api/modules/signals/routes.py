@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import RequireAdmin, RequireViewer
+from civicsignals_api.ratelimit import public_signal_limiter
 
 from . import services
 from .schemas import PublicSignalRead, SignalPage, SignalRead, SignalSourcesRead
@@ -50,6 +51,11 @@ from .services import WorkspaceFeedPage
 router = APIRouter(prefix="/signals", tags=["signals"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+# P4: per-client (IP) rate limit applied ONLY to the public, unauthenticated
+# signal reads below — never to the authenticated /feed or admin fuzzy-review
+# routes. ``Depends`` re-resolves ``public_signal_limiter`` per request so the
+# configured limit/window is read from settings (and is overridable in tests).
+PublicRateLimit = Depends(public_signal_limiter)
 CursorQuery = Annotated[str | None, Query(description="Opaque pagination cursor.")]
 LimitQuery = Annotated[int, Query(ge=1, le=services.MAX_LIMIT)]
 
@@ -431,6 +437,7 @@ async def reject_fuzzy_review(
 async def get_public_signal(
     signal_id: uuid.UUID,
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
 ) -> PublicSignalRead | JSONResponse:
     """Public, unauthenticated, narrowed read of a signal (P2; doc 13 §4.1, §4.6).
 
@@ -455,6 +462,7 @@ async def get_public_signal(
 async def get_signal_sources(
     signal_id: uuid.UUID,
     session: SessionDep,
+    _rate_limit: Annotated[None, PublicRateLimit],
 ) -> SignalSourcesRead | JSONResponse:
     """Public, unauthenticated source citations for a signal (P2; doc 07 §3).
 
