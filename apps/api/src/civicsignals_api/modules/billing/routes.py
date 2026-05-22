@@ -6,6 +6,10 @@ N1 implements:
   - ``GET  /billing/customer``     — current workspace Stripe customer link.
   - ``POST /billing/customer``     — create a Stripe customer for the workspace.
 
+N2 implements:
+  - ``GET /billing/plan``       — effective plan + limits + feature flags for the workspace.
+  - ``GET /billing/plan/demo``  — demo of a feature-gated endpoint (requires SMART_SEARCH).
+
 The webhook endpoint is unauthenticated (verified by Stripe signature). All
 other endpoints use ``require_workspace`` (B5).
 
@@ -25,10 +29,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import CurrentWorkspace
 from civicsignals_api.modules.billing import services
+from civicsignals_api.modules.billing.dependencies import require_feature
 from civicsignals_api.modules.billing.models import BillingCustomer, BillingSubscription
+from civicsignals_api.modules.billing.plans import Feature, get_plan
 from civicsignals_api.modules.billing.schemas import (
     BillingCustomerOut,
     BillingSubscriptionOut,
+    PlanOut,
+    WorkspacePlanOut,
 )
 from civicsignals_api.problems import ProblemException
 
@@ -210,3 +218,56 @@ async def create_customer(
             name=ctx.user.name or ctx.workspace.name,
         )
     return customer
+
+
+# ---------------------------------------------------------------------------
+# N2: Plan + feature-flag endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/plan",
+    response_model=WorkspacePlanOut,
+    summary="Get effective plan, limits, and feature flags for the current workspace",
+    description=(
+        "Returns the workspace's effective billing plan (resolved from "
+        "``billing_subscription``; defaults to ``self_hosted`` when no active "
+        "subscription exists), its numeric limits per metering dimension, and the "
+        "set of features the plan enables. Clients use this to render upgrade CTAs "
+        "and enforce soft limits without a Stripe call on the hot path (N2)."
+    ),
+)
+async def get_workspace_plan(
+    ctx: CurrentWorkspace,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> WorkspacePlanOut:
+    """Return the effective plan + limits + feature flags for the current workspace."""
+    effective_plan = await services.get_workspace_plan(session, ctx.workspace_id)
+    defn = get_plan(effective_plan)
+    return WorkspacePlanOut(
+        workspace_id=ctx.workspace_id,
+        effective_plan=PlanOut.from_definition(defn),
+    )
+
+
+@router.get(
+    "/plan/demo-smart-search",
+    response_model=dict[str, str],
+    summary="[Demo] Feature-gated endpoint requiring SMART_SEARCH (N2)",
+    description=(
+        "Demonstration of the ``require_feature`` dependency pattern (N2). "
+        "Returns 402 when the workspace plan does not include ``smart_search``. "
+        "Production smart-search routes live in the ``smart_search`` module; "
+        "this endpoint exists only to validate the gate in the billing module's "
+        "test suite. "
+        "# TODO N4: actual quota enforcement (runs/month cap) goes here once metering lands."
+    ),
+)
+async def demo_smart_search_gate(
+    ctx: CurrentWorkspace,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    _gate: Annotated[None, Depends(require_feature(Feature.SMART_SEARCH))],
+) -> dict[str, str]:
+    """Return a stub response; the real value is the 402 gate on plans lacking SMART_SEARCH."""
+    # TODO N4: enforce smart-search monthly quota before reaching here.
+    return {"status": "ok", "plan": (await services.get_workspace_plan(session, ctx.workspace_id))}

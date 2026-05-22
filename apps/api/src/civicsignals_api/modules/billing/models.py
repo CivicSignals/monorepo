@@ -9,7 +9,7 @@ N1: Stripe customer + subscription wiring (this task).
   - billing_webhook_event: idempotency/event-log for processed Stripe webhook events.
 
 Future tasks:
-  # TODO N2: billing_plan / feature-flag table hangs here (plan definitions).
+  # N2: Plan definitions are code-defined in billing/plans.py (no DB table needed).
   # TODO N3: billing_usage for metered events (smart searches, exports) extends here.
   # TODO N4: billing_limit rows (per-plan caps) reference billing_subscription.
   # TODO N5: self-serve checkout + plan-change flow uses billing_customer.stripe_customer_id.
@@ -109,7 +109,7 @@ class BillingSubscription(Base):
     (N4 limits, N5 self-serve) read ``status`` + ``plan`` directly from this row
     via ``billing.services``.
 
-    # TODO N2: add ``feature_flags JSONB`` column once plan-definition table lands.
+    # N2: feature flags + limits are code-defined in billing/plans.py (no JSONB column needed).
     # TODO N4: billing limits (smart-search quota, export quota) read .plan + .status.
     # TODO N5: self-serve plan-change POSTs through billing.services.change_plan().
     # TODO LC-13: live Stripe subscription IDs populated after LC-13 (real account).
