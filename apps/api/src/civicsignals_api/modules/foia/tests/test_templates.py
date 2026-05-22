@@ -4,13 +4,20 @@ Coverage:
 - Template files load and pass schema validation (all 8 templates).
 - list_templates() returns all templates in jurisdiction-sorted order.
 - get_template() returns the correct template; raises on missing jurisdiction.
-- render_template() correctly substitutes all placeholders.
+- render_template() correctly substitutes all required + optional placeholders.
 - render_template() raises MissingPlaceholderError on missing required vars.
+- Optional placeholders (requester_phone, requester_organization, records_officer_name)
+  may be omitted; they default to empty string in rendered output.
+- fee_waiver_language (template-owned) is rendered against caller context so its
+  internal placeholders (e.g. {fee_waiver_basis}) are fully resolved.
+- No unresolved {placeholder} tokens remain in the rendered body.
 - Each template has deadline_days, statute, and placeholders fields.
 - HTTP routes: list / get / render endpoints return correct shapes and errors.
 """
 
 from __future__ import annotations
+
+import re
 
 import pytest
 from fastapi import FastAPI
@@ -46,6 +53,19 @@ FULL_CONTEXT = {
     "date": "2025-05-22",
     "fee_waiver_basis": "non-profit news organization",
 }
+
+# Minimal required-only context (optional placeholders omitted).
+REQUIRED_CONTEXT = {
+    k: v for k, v in FULL_CONTEXT.items() if k not in services.OPTIONAL_PLACEHOLDERS
+}
+
+_PLACEHOLDER_RE = re.compile(r"\{[a-z_]+\}")
+
+
+def _unresolved_placeholders(text: str) -> list[str]:
+    """Return any remaining {placeholder} tokens found in *text*."""
+    return _PLACEHOLDER_RE.findall(text)
+
 
 # ---------------------------------------------------------------------------
 # Service-layer tests
@@ -84,6 +104,11 @@ class TestTemplateRegistry:
                 f"{tmpl.jurisdiction}: placeholders must be a list"
             )
             assert len(tmpl.placeholders) > 0, f"{tmpl.jurisdiction}: placeholders list is empty"
+
+    def test_co_cora_jurisdiction_name_no_duplicate(self) -> None:
+        """Regression: CO-CORA should not have 'Colorado Colorado' typo."""
+        tmpl = services.get_template("CO-CORA")
+        assert "Colorado Colorado" not in tmpl.jurisdiction_name
 
 
 class TestGetTemplate:
@@ -142,12 +167,37 @@ class TestRenderTemplate:
         # Ensure no unresolved placeholders remain
         assert "{requester_name}" not in rendered
         assert "{entity_name}" not in rendered
+        assert _unresolved_placeholders(rendered) == [], (
+            f"Unresolved placeholders in US-FOIA render: {_unresolved_placeholders(rendered)}"
+        )
 
     def test_render_ca_pra_full_context(self) -> None:
         rendered = services.render_template("CA-PRA", FULL_CONTEXT)
         assert "Jane Doe" in rendered
-        # The body may or may not contain the law name verbatim; just verify substitution worked
-        assert "{requester_name}" not in rendered
+        assert _unresolved_placeholders(rendered) == [], (
+            f"Unresolved placeholders in CA-PRA render: {_unresolved_placeholders(rendered)}"
+        )
+
+    def test_render_fee_waiver_language_fully_substituted(self) -> None:
+        """fee_waiver_language is a template-owned field and must be fully rendered.
+
+        Some templates include {fee_waiver_basis} inside fee_waiver_language.
+        This verifies that the renderer resolves nested placeholders.
+        """
+        for tmpl in services.list_templates():
+            rendered = services.render_template(tmpl.jurisdiction, FULL_CONTEXT)
+            assert "{fee_waiver_basis}" not in rendered, (
+                f"Unresolved {{fee_waiver_basis}} in {tmpl.jurisdiction!r} render"
+            )
+            assert "{fee_waiver_language}" not in rendered, (
+                f"{{fee_waiver_language}} was not expanded in {tmpl.jurisdiction!r} render"
+            )
+
+    def test_render_optional_placeholders_can_be_omitted(self) -> None:
+        """Optional placeholders default to empty string without raising errors."""
+        rendered = services.render_template("US-FOIA", REQUIRED_CONTEXT)
+        assert isinstance(rendered, str)
+        assert len(rendered) > 100
 
     def test_render_missing_required_placeholder_raises(self) -> None:
         ctx = {k: v for k, v in FULL_CONTEXT.items() if k != "requester_name"}
@@ -261,8 +311,8 @@ class TestRenderTemplateRoute:
         )
         assert resp.status_code == 404
 
-    def test_render_all_templates_with_full_context(self) -> None:
-        """Smoke test: every template renders without error given a full context."""
+    def test_render_all_templates_with_full_context_no_unresolved(self) -> None:
+        """Smoke test: every template renders with no unresolved {placeholder} tokens."""
         for tmpl in services.list_templates():
             resp = _client.post(
                 f"/api/v1/foia/templates/{tmpl.jurisdiction}/render",
@@ -271,3 +321,16 @@ class TestRenderTemplateRoute:
             assert resp.status_code == 200, (
                 f"Template {tmpl.jurisdiction!r} failed to render: {resp.text}"
             )
+            rendered_body = resp.json()["rendered_body"]
+            leftover = _unresolved_placeholders(rendered_body)
+            assert leftover == [], (
+                f"Template {tmpl.jurisdiction!r} has unresolved placeholders: {leftover}"
+            )
+
+    def test_render_optional_placeholders_omitted_returns_200(self) -> None:
+        """Optional placeholders may be absent from context without triggering 422."""
+        resp = _client.post(
+            "/api/v1/foia/templates/US-FOIA/render",
+            json={"context": REQUIRED_CONTEXT},
+        )
+        assert resp.status_code == 200

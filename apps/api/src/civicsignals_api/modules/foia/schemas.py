@@ -1,11 +1,10 @@
 """Pydantic request/response shapes for the foia module (doc 06 §3).
 
 Template responses are **global reference data** — not workspace-scoped —
-so these shapes carry no workspace fields. List responses use the
-standard envelope shape (``items`` + ``next_cursor``), but the template
-list is small enough that we return all templates in one shot without
-cursor pagination for now (M1). M2 may add cursor pagination if the
-library grows large.
+so these shapes carry no workspace fields. The template list response uses
+``items`` + ``total`` (not cursor-paginated) because the library is small
+and static (M1). M2 may introduce cursor pagination if the library grows
+to the point where a single response is impractical.
 """
 
 from __future__ import annotations

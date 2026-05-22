@@ -9,7 +9,9 @@ Template library (M1)
 workspace-scoped — templates are shared across every workspace like recipes).
 :func:`get_template` — fetch one template by its ``jurisdiction`` code.
 :func:`render_template` — substitute placeholders; raises :exc:`MissingPlaceholderError`
-on missing required variables.
+on missing required variables. Optional placeholders (``requester_phone``,
+``requester_organization``, ``records_officer_name``) default to an empty string
+so callers may omit them.
 
 The module-level :data:`_REGISTRY` is populated at import time from the YAML
 files in the ``templates/`` sibling directory. Malformed files raise
@@ -30,7 +32,7 @@ from typing import Any
 import yaml
 
 # ---------------------------------------------------------------------------
-# Exceptions
+# Constants
 # ---------------------------------------------------------------------------
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -52,12 +54,25 @@ _REQUIRED_KEYS: frozenset[str] = frozenset(
     }
 )
 
-# Template-owned keys that may appear as ``{key}`` in the body and are
+# Template-owned keys that may appear as ``{key}`` in the body or in
+# template-owned field strings (e.g. ``fee_waiver_language``) and are
 # substituted automatically by :func:`render_template` from the template's own
 # fields, without requiring the caller to supply them in ``context``.
-# These keys are NOT listed in ``placeholders`` (which only contains
-# user-supplied context keys).
+# These keys MUST NOT appear in ``placeholders`` (which contains user-supplied
+# context keys only).
 _TEMPLATE_OWNED_KEYS: frozenset[str] = frozenset({"fee_waiver_language"})
+
+# Placeholders that are present in every template body but whose values are
+# optional: callers may omit them and they will be rendered as empty string.
+# MUST be a subset of the ``placeholders`` list in each YAML file.
+OPTIONAL_PLACEHOLDERS: frozenset[str] = frozenset(
+    {"requester_phone", "requester_organization", "records_officer_name"}
+)
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 
 class TemplateLoadError(Exception):
@@ -145,6 +160,30 @@ class FoiaTemplate:
 # ---------------------------------------------------------------------------
 
 
+def _extract_placeholders(text: str) -> set[str]:
+    """Return the set of named placeholder keys found in *text*.
+
+    Uses :mod:`string`'s ``Formatter`` to parse ``{name}`` tokens; ignores
+    positional ``{}`` and format specs so ``{date:%Y-%m-%d}`` would yield
+    ``"date"``.
+
+    Raises :exc:`TemplateLoadError` on malformed format strings (e.g., unmatched
+    ``{``) so errors are surfaced at import time with file context.
+    """
+    formatter = string.Formatter()
+    result: set[str] = set()
+    try:
+        for _, field_name, _, _ in formatter.parse(text):
+            if field_name is not None:
+                # strip attribute access / item access (e.g. "obj.attr" -> "obj")
+                base = re.split(r"[.\[]", field_name)[0]
+                if base:
+                    result.add(base)
+    except ValueError as exc:
+        raise TemplateLoadError(f"Malformed format string: {exc}") from exc
+    return result
+
+
 def _load_template_file(path: Path) -> FoiaTemplate:
     """Parse and validate a single template YAML file.
 
@@ -175,48 +214,50 @@ def _load_template_file(path: Path) -> FoiaTemplate:
 
     if not isinstance(raw.get("deadline_days"), int):
         raise TemplateLoadError(
-            f"{path.name}: 'deadline_days' must be an integer, got {type(raw.get('deadline_days')).__name__}"
+            f"{path.name}: 'deadline_days' must be an integer, "
+            f"got {type(raw.get('deadline_days')).__name__}"
         )
 
     if not isinstance(raw.get("placeholders"), list):
         raise TemplateLoadError(
-            f"{path.name}: 'placeholders' must be a list, got {type(raw.get('placeholders')).__name__}"
+            f"{path.name}: 'placeholders' must be a list, "
+            f"got {type(raw.get('placeholders')).__name__}"
         )
 
-    # Verify declared placeholders match the body using string.Formatter parsing.
-    # Template-owned fields (e.g. ``fee_waiver_language``) may also appear in the
-    # body — they are substituted automatically by render_template from the
-    # template object itself, so they do not need to appear in ``placeholders``.
     body: str = str(raw.get("body", ""))
+    fee_waiver_text: str = str(raw.get("fee_waiver_language", ""))
     declared: set[str] = {str(p) for p in raw.get("placeholders", [])}
-    body_placeholders = _extract_placeholders(body)
-    undeclared = body_placeholders - declared - _TEMPLATE_OWNED_KEYS
-    if undeclared:
+
+    # Placeholders allowed in template-owned fields: they must either be in
+    # ``placeholders`` (user-supplied) or be other template-owned keys.
+    # We do NOT allow new undeclared placeholders inside fee_waiver_language.
+    try:
+        fwl_placeholders = _extract_placeholders(fee_waiver_text)
+    except TemplateLoadError as exc:
+        raise TemplateLoadError(f"{path.name} fee_waiver_language: {exc}") from exc
+
+    undeclared_in_fwl = fwl_placeholders - declared - _TEMPLATE_OWNED_KEYS
+    if undeclared_in_fwl:
         raise TemplateLoadError(
-            f"{path.name}: body contains undeclared placeholders: {sorted(undeclared)}. "
+            f"{path.name}: fee_waiver_language contains undeclared placeholders: "
+            f"{sorted(undeclared_in_fwl)}. Add them to the 'placeholders' list."
+        )
+
+    # Verify body placeholders: user-supplied OR template-owned keys are allowed.
+    try:
+        body_placeholders = _extract_placeholders(body)
+    except TemplateLoadError as exc:
+        raise TemplateLoadError(f"{path.name} body: {exc}") from exc
+
+    undeclared_in_body = body_placeholders - declared - _TEMPLATE_OWNED_KEYS
+    if undeclared_in_body:
+        raise TemplateLoadError(
+            f"{path.name}: body contains undeclared placeholders: {sorted(undeclared_in_body)}. "
             "Add them to the 'placeholders' list or verify they are template-owned keys "
             f"(currently: {sorted(_TEMPLATE_OWNED_KEYS)})."
         )
 
     return FoiaTemplate(raw)
-
-
-def _extract_placeholders(text: str) -> set[str]:
-    """Return the set of named placeholder keys found in *text*.
-
-    Uses :mod:`string`'s ``Formatter`` to parse ``{name}`` tokens; ignores
-    positional ``{}`` and format specs so ``{date:%Y-%m-%d}`` would yield
-    ``"date"``.
-    """
-    formatter = string.Formatter()
-    result: set[str] = set()
-    for _, field_name, _, _ in formatter.parse(text):
-        if field_name is not None:
-            # strip attribute access / item access (e.g. "obj.attr" -> "obj")
-            base = re.split(r"[.\[]", field_name)[0]
-            if base:
-                result.add(base)
-    return result
 
 
 def _build_registry() -> dict[str, FoiaTemplate]:
@@ -276,38 +317,43 @@ def render_template(jurisdiction: str, context: dict[str, str]) -> str:
 
     Raises:
         TemplateNotFoundError: if *jurisdiction* is not in the registry.
-        MissingPlaceholderError: if any placeholder declared in the template's
-            ``placeholders`` list is absent from *context* (or empty string).
+        MissingPlaceholderError: if any *required* placeholder is absent from
+            *context* or has an empty string value. Optional placeholders
+            (``requester_phone``, ``requester_organization``,
+            ``records_officer_name``) may be omitted or empty — they default
+            to an empty string in the rendered output.
 
-    Optional placeholders (``requester_phone``, ``requester_organization``,
-    ``records_officer_name``) are omitted from the required set only if the
-    template body contains them — the ``placeholders`` list is the source of
-    truth. Callers may pass any extra keys in *context*; they are ignored.
+    Template-owned fields (``fee_waiver_language``) are substituted from the
+    template definition first, then the caller's context is applied. Placeholders
+    *within* ``fee_waiver_language`` (e.g. ``{fee_waiver_basis}``) are resolved
+    from the caller's context in the same pass.
 
     The substitution uses :meth:`str.format_map` for simplicity and safety
     (no ``eval``, no shell expansion).
     """
     tmpl = get_template(jurisdiction)
 
-    missing = [p for p in tmpl.placeholders if not context.get(p)]
+    required = [p for p in tmpl.placeholders if p not in OPTIONAL_PLACEHOLDERS]
+    missing = [p for p in required if not context.get(p)]
     if missing:
         raise MissingPlaceholderError(jurisdiction, missing)
 
-    # Build the full substitution map: user-supplied context merged with
-    # template-owned fields (e.g. ``fee_waiver_language``). Template-owned
-    # values take the template's value unless the caller overrides them —
-    # this allows render to work without the caller knowing which fields
-    # are pre-populated from the template definition.
-    full_context: dict[str, str] = {
-        "fee_waiver_language": tmpl.fee_waiver_language,
-    }
+    # Fill optional placeholders with empty string when not supplied.
+    full_context: dict[str, str] = dict.fromkeys(OPTIONAL_PLACEHOLDERS, "")
     full_context.update(context)
 
-    # Use format_map with a DefaultDict-like fallback so extra keys in context
-    # are silently ignored and only declared placeholders are required.
+    # Render template-owned fields (e.g. fee_waiver_language) against the
+    # full caller context so that placeholders within those fields
+    # (e.g. {fee_waiver_basis}, {entity_name}) are resolved in the same pass.
     class _SafeMap(dict[str, str]):
         def __missing__(self, key: str) -> str:
             return f"{{{key}}}"  # leave unknown placeholders intact
+
+    rendered_fwl = tmpl.fee_waiver_language.format_map(_SafeMap(full_context))
+
+    # Inject the rendered template-owned field so the body's {fee_waiver_language}
+    # token is replaced with the fully-substituted text.
+    full_context["fee_waiver_language"] = rendered_fwl
 
     rendered = tmpl.body.format_map(_SafeMap(full_context))
     return rendered

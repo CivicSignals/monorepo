@@ -43,9 +43,16 @@ Each `.yaml` file must contain the following top-level keys:
 | `{date}` | Date the request is submitted |
 | `{fee_waiver_basis}` | Basis for fee waiver (e.g. "news media", "educational institution") |
 
-All required placeholders are listed under the `placeholders` key in each template.
-`{requester_phone}`, `{requester_organization}`, and `{records_officer_name}` are
-optional and can be omitted from the rendered request if not supplied.
+All placeholders are listed under the `placeholders` key in each template.
+Three placeholders are **optional** — callers may omit them or pass an empty string
+and `render_template()` will substitute an empty string rather than raising an error:
+
+- `{requester_phone}`
+- `{requester_organization}`
+- `{records_officer_name}`
+
+All other placeholders are **required**. Passing a missing or empty required
+placeholder to `render_template()` raises `MissingPlaceholderError` (HTTP 422).
 
 ## Status
 

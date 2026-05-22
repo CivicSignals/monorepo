@@ -23,7 +23,6 @@ Errors follow RFC 7807 ``application/problem+json`` via
 from __future__ import annotations
 
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
 
 from civicsignals_api.problems import ProblemException
 
@@ -73,8 +72,8 @@ def list_templates() -> FoiaTemplateList:
         "``CA-PRA``, ``TX-PIA``). Returns 404 if the jurisdiction is not found."
     ),
 )
-def get_template(jurisdiction: str) -> FoiaTemplateRead | JSONResponse:
-    """Return one template by jurisdiction code, or a 404 problem."""
+def get_template(jurisdiction: str) -> FoiaTemplateRead:
+    """Return one template by jurisdiction code, or raise a 404 problem."""
     try:
         tmpl = services.get_template(jurisdiction)
     except services.TemplateNotFoundError:
@@ -95,7 +94,7 @@ def get_template(jurisdiction: str) -> FoiaTemplateRead | JSONResponse:
 def render_template(
     jurisdiction: str,
     body: FoiaTemplateRenderRequest,
-) -> FoiaTemplateRenderResponse | JSONResponse:
+) -> FoiaTemplateRenderResponse:
     """Render a template with caller-supplied context."""
     try:
         rendered = services.render_template(jurisdiction, body.context)
