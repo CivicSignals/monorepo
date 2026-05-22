@@ -108,13 +108,21 @@ Optional (add later for Slack notifications):
 |---|---|
 | `STAGING_SLACK_WEBHOOK` | Slack incoming-webhook URL |
 
-### 6. Push the compose file and .env to the VPS
+### 6. Place static files on the VPS (one-time, manual)
 
-Copy the files that CI will later keep in sync:
+The deploy workflow (`deploy.sh`) does **not** sync `docker-compose.yml` or
+`nginx/nginx.conf` — those are manually placed once and then left in place.
+
+> **Important — nginx.conf:** the provisioning script writes a TLS-enabled
+> `nginx.conf` at `/opt/civicsignals/infra/nginx/nginx.conf`. Do **not**
+> overwrite it with the repo's HTTP-only `infra/nginx/nginx.conf`, as doing so
+> would disable TLS redirects.
+
+Copy the compose file (CI keeps images updated, not the compose file itself):
 
 ```bash
 scp infra/docker-compose.yml civicsignals@<VPS-IP>:/opt/civicsignals/infra/docker-compose.yml
-scp infra/nginx/nginx.conf   civicsignals@<VPS-IP>:/opt/civicsignals/infra/nginx/nginx.conf
+# nginx.conf was already written by provision.sh — do not overwrite it.
 ```
 
 Create `/opt/civicsignals/infra/.env` from the template:

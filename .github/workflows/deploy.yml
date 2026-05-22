@@ -103,8 +103,16 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "${{ secrets.STAGING_SSH_KEY }}" > ~/.ssh/staging_deploy
           chmod 600 ~/.ssh/staging_deploy
-          # Add host key to known_hosts to avoid interactive prompt.
-          ssh-keyscan -H "${{ secrets.STAGING_SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Populate known_hosts from a pinned host-key secret if available,
+          # otherwise fall back to ssh-keyscan (acceptable for staging; add
+          # STAGING_SSH_KNOWN_HOST secret to pin the fingerprint in production).
+          # TODO A5: pin STAGING_SSH_KNOWN_HOST secret to prevent MITM on the
+          # production deploy. For staging this ssh-keyscan fallback is acceptable.
+          if [ -n "${{ secrets.STAGING_SSH_KNOWN_HOST }}" ]; then
+            printf '%s\n' "${{ secrets.STAGING_SSH_KNOWN_HOST }}" >> ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "${{ secrets.STAGING_SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          fi
 
       # ------------------------------------------------------------------ deploy
       - name: Deploy

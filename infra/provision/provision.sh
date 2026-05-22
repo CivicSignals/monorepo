@@ -17,11 +17,11 @@
 #   DOMAIN=staging.civicsignals.io DEPLOY_DIR=/opt/civicsignals ./provision.sh
 #
 # Variables:
-#   DOMAIN       — FQDN that will serve traffic (used for TLS cert)  [required for TLS]
-#   DEPLOY_DIR   — app directory on VPS                               [default: /opt/civicsignals]
-#   DEPLOY_USER  — non-root OS user that CI SSHes as                  [default: civicsignals]
-#   CERTBOT_EMAIL — email for Let's Encrypt registration              [required for TLS]
-#   SKIP_TLS     — set to "1" to skip certbot (plain HTTP only)       [default: 0]
+#   DOMAIN        — FQDN that will serve traffic (used for TLS cert)  [required for TLS]
+#   DEPLOY_DIR    — app directory on VPS                               [default: /opt/civicsignals]
+#   DEPLOY_USER   — non-root OS user that CI SSHes as                  [default: civicsignals]
+#   CERTBOT_EMAIL — email for Let's Encrypt registration               [required for TLS]
+#   SKIP_TLS      — set to "1" to skip certbot (plain HTTP only)       [default: 0]
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 set -euo pipefail
@@ -63,7 +63,26 @@ install_base() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Docker Engine + Compose plugin
+# 2. Deploy user + SSH authorised_keys placeholder
+# Must run BEFORE install_docker so the user exists when Docker group is added.
+# ---------------------------------------------------------------------------
+setup_deploy_user() {
+  if ! id "${DEPLOY_USER}" >/dev/null 2>&1; then
+    log "Creating deploy user: ${DEPLOY_USER} ..."
+    useradd -m -s /bin/bash "${DEPLOY_USER}"
+  fi
+  install -d -m 700 -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" "/home/${DEPLOY_USER}/.ssh"
+  touch "/home/${DEPLOY_USER}/.ssh/authorized_keys"
+  chmod 600 "/home/${DEPLOY_USER}/.ssh/authorized_keys"
+  chown "${DEPLOY_USER}:${DEPLOY_USER}" "/home/${DEPLOY_USER}/.ssh/authorized_keys"
+  log "Deploy user '${DEPLOY_USER}' ready."
+  log "ACTION REQUIRED: paste the CI deploy public key into:"
+  log "  /home/${DEPLOY_USER}/.ssh/authorized_keys"
+}
+
+# ---------------------------------------------------------------------------
+# 3. Docker Engine + Compose plugin
+# Must run AFTER setup_deploy_user so the user exists when added to the docker group.
 # ---------------------------------------------------------------------------
 install_docker() {
   if command -v docker >/dev/null 2>&1; then
@@ -75,14 +94,14 @@ install_docker() {
   fi
   systemctl enable --now docker
   # Add the deploy user to the docker group so CI can run compose without sudo.
-  if id "${DEPLOY_USER}" >/dev/null 2>&1; then
-    usermod -aG docker "${DEPLOY_USER}"
-    log "Added ${DEPLOY_USER} to docker group."
-  fi
+  # NOTE: the user must log out and back in (or 'newgrp docker') for this to take
+  # effect in interactive sessions. SSH sessions started after this point pick it up.
+  usermod -aG docker "${DEPLOY_USER}"
+  log "Added ${DEPLOY_USER} to docker group."
 }
 
 # ---------------------------------------------------------------------------
-# 3. Firewall
+# 4. Firewall
 # ---------------------------------------------------------------------------
 configure_firewall() {
   log "Configuring UFW firewall ..."
@@ -97,7 +116,7 @@ configure_firewall() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Swap (avoids OOM on small VPS during image pulls / LLM extraction)
+# 5. Swap (avoids OOM on small VPS during image pulls / LLM extraction)
 # ---------------------------------------------------------------------------
 configure_swap() {
   if swapon --show | grep -q '/swapfile'; then
@@ -114,23 +133,6 @@ configure_swap() {
   echo "vm.swappiness=10" > /etc/sysctl.d/99-civicsignals.conf
   sysctl -p /etc/sysctl.d/99-civicsignals.conf >/dev/null 2>&1
   log "Swapfile ready."
-}
-
-# ---------------------------------------------------------------------------
-# 5. Deploy user + SSH authorised_keys placeholder
-# ---------------------------------------------------------------------------
-setup_deploy_user() {
-  if ! id "${DEPLOY_USER}" >/dev/null 2>&1; then
-    log "Creating deploy user: ${DEPLOY_USER} ..."
-    useradd -m -s /bin/bash "${DEPLOY_USER}"
-  fi
-  install -d -m 700 -o "${DEPLOY_USER}" -g "${DEPLOY_USER}" "/home/${DEPLOY_USER}/.ssh"
-  touch "/home/${DEPLOY_USER}/.ssh/authorized_keys"
-  chmod 600 "/home/${DEPLOY_USER}/.ssh/authorized_keys"
-  chown "${DEPLOY_USER}:${DEPLOY_USER}" "/home/${DEPLOY_USER}/.ssh/authorized_keys"
-  log "Deploy user '${DEPLOY_USER}' ready."
-  log "ACTION REQUIRED: paste the CI deploy public key into:"
-  log "  /home/${DEPLOY_USER}/.ssh/authorized_keys"
 }
 
 # ---------------------------------------------------------------------------
@@ -174,14 +176,21 @@ install_certbot() {
     -d "${DOMAIN}" \
     || warn "certbot failed — check DNS points to this server and port 80 is reachable."
 
-  # Auto-renewal via cron (certbot ships a systemd timer too; belt-and-suspenders).
+  # Auto-renewal cron (certbot also ships a systemd timer — belt-and-suspenders).
+  local COMPOSE_FILE="${DEPLOY_DIR}/infra/docker-compose.yml"
+  local ENV_FILE="${DEPLOY_DIR}/infra/.env"
   ( crontab -l 2>/dev/null | grep -v certbot; \
-    echo "0 3 * * * certbot renew --quiet --deploy-hook 'docker compose -f ${DEPLOY_DIR}/${COMPOSE_FILE:-infra/docker-compose.yml} --env-file ${DEPLOY_DIR}/infra/.env restart nginx'" ) | crontab -
+    echo "0 3 * * * certbot renew --quiet --deploy-hook 'docker compose -f ${COMPOSE_FILE} --env-file ${ENV_FILE} restart nginx'" ) | crontab -
   log "certbot renewal cron installed."
 }
 
 # ---------------------------------------------------------------------------
 # 8. nginx TLS config (written to disk for compose volume-mount)
+#
+# The TLS server block:
+#   - Redirects port 80 → 443 for all traffic EXCEPT /healthz (so the deploy
+#     health probe works against http://localhost/healthz without following 301s).
+#   - Adds HSTS on port 443.
 # ---------------------------------------------------------------------------
 write_nginx_tls_conf() {
   if [ "${SKIP_TLS}" = "1" ] || [ -z "${DOMAIN}" ]; then
@@ -251,16 +260,28 @@ http {
     keepalive 16;
   }
 
-  # HTTP — redirect everything to HTTPS.
+  # HTTP — proxy /healthz directly (so deploy probes work without following 301s),
+  # redirect everything else to HTTPS.
   server {
     listen 80 default_server;
     server_name ${DOMAIN};
+
+    # Nginx / docker-compose health probe — must NOT redirect so deploy.sh can
+    # probe http://localhost/healthz without curl following the 301.
+    location = /healthz {
+      proxy_pass http://api_upstream;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Host               \$host;
+      proxy_set_header X-Forwarded-Proto  http;
+    }
 
     # Let certbot's ACME http-01 challenges through.
     location /.well-known/acme-challenge/ {
       root /var/www/certbot;
     }
 
+    # Redirect everything else to HTTPS.
     location / {
       return 301 https://\$host\$request_uri;
     }
@@ -351,7 +372,10 @@ Wants=network-online.target
 Type=simple
 User=${DEPLOY_USER}
 WorkingDirectory=${DEPLOY_DIR}
-ExecStart=/usr/bin/docker compose -f infra/docker-compose.yml --env-file infra/.env up --remove-orphans
+# --no-build: images must be pulled (via deploy.sh) before startup.
+# This prevents the service from attempting local builds on the VPS
+# where the build contexts (apps/api, apps/web) are not present.
+ExecStart=/usr/bin/docker compose -f infra/docker-compose.yml --env-file infra/.env up --remove-orphans --no-build
 ExecStop=/usr/bin/docker compose -f infra/docker-compose.yml --env-file infra/.env down
 Restart=on-failure
 RestartSec=10s
@@ -370,26 +394,32 @@ UNIT_FILE
 # ---------------------------------------------------------------------------
 setup_backup_cron() {
   log "Installing nightly pg_dump backup cron ..."
-  install -m 0755 /dev/stdin /usr/local/bin/civic-backup.sh << 'BACKUP'
+  install -m 0750 /dev/stdin /usr/local/bin/civic-backup.sh << 'BACKUP'
 #!/usr/bin/env bash
 # Nightly pg_dump → Backblaze B2 (doc 06 §10).
 # Requires: rclone configured with a remote named "b2" (run `rclone config`).
 set -euo pipefail
+# Restrict permissions: database dumps contain production data and must not
+# be world-readable.
+umask 077
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/civicsignals}"
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/civicsignals}"
 COMPOSE_FILE="${COMPOSE_FILE:-infra/docker-compose.yml}"
 ENV_FILE="${ENV_FILE:-infra/.env}"
+install -d -m 700 "${BACKUP_DIR}"
 cd "${DEPLOY_DIR}"
 TS=$(date +%Y%m%d-%H%M%S)
-DUMP="/tmp/civic-${TS}.sql.gz"
+DUMP="${BACKUP_DIR}/civic-${TS}.sql.gz"
 docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" \
   exec -T postgres pg_dump \
     -U "${POSTGRES_USER:-civic}" \
     "${POSTGRES_DB:-civicsignals}" \
   | gzip > "${DUMP}"
+chmod 600 "${DUMP}"
 rclone copy "${DUMP}" b2:civicsignals-backups/ \
-  || echo "[backup:WARN] rclone not configured yet; dump saved locally at ${DUMP}"
+  || echo "[backup:WARN] rclone not configured yet; dump saved at ${DUMP}"
 # Retain 7 days of local dumps (safety net if B2 push fails).
-find /tmp -name 'civic-*.sql.gz' -mtime +7 -delete
+find "${BACKUP_DIR}" -name 'civic-*.sql.gz' -mtime +7 -delete
 echo "[backup] Done: ${DUMP}"
 BACKUP
 
@@ -411,14 +441,16 @@ configure_auto_updates() {
 
 # ---------------------------------------------------------------------------
 # Main
+# NOTE: setup_deploy_user MUST run before install_docker so the user exists
+# when Docker adds it to the docker group.
 # ---------------------------------------------------------------------------
 main() {
   require_root
   install_base
-  install_docker
+  setup_deploy_user      # create user before Docker so group add works
+  install_docker         # adds DEPLOY_USER to docker group
   configure_firewall
   configure_swap
-  setup_deploy_user
   setup_deploy_dir
   install_certbot
   write_nginx_tls_conf
@@ -434,25 +466,28 @@ main() {
   log "     (generate with: ssh-keygen -t ed25519 -C 'civicsignals-staging-deploy')"
   log "     Put the private key in GitHub secret STAGING_SSH_KEY."
   log ""
-  log "  2. Copy infra/docker-compose.yml to ${DEPLOY_DIR}/infra/docker-compose.yml"
-  log "     Copy infra/nginx/nginx.conf  to ${DEPLOY_DIR}/infra/nginx/nginx.conf"
-  log "     (CI's deploy.sh does this on each deploy once secrets are configured.)"
+  log "  2. Create ${DEPLOY_DIR}/infra/.env from infra/.env.example — fill all secrets."
+  log "     Example: scp infra/.env.example ${DEPLOY_USER}@<VPS>:${DEPLOY_DIR}/infra/.env"
+  log "     then edit the file on the VPS."
   log ""
-  log "  3. Create ${DEPLOY_DIR}/infra/.env from infra/.env.example — fill all secrets."
+  log "  3. Place the compose + nginx files on the VPS (one-time; CI does not sync them):"
+  log "     scp infra/docker-compose.yml ${DEPLOY_USER}@<VPS>:${DEPLOY_DIR}/infra/"
+  log "     # nginx.conf: the provisioner wrote a TLS-enabled version at:"
+  log "     #   ${DEPLOY_DIR}/infra/nginx/nginx.conf"
+  log "     # Do NOT overwrite it with the repo's HTTP-only nginx.conf."
   log ""
-  log "  4. If TLS was skipped, see docs/self-host/staging-deploy.md §TLS for steps."
-  log ""
-  log "  5. Start the stack manually for the first time:"
-  log "     sudo -u ${DEPLOY_USER} docker compose -f ${DEPLOY_DIR}/infra/docker-compose.yml --env-file ${DEPLOY_DIR}/infra/.env up -d"
+  log "  4. Pull images and do the first-time startup:"
+  log "     sudo -u ${DEPLOY_USER} docker compose -f ${DEPLOY_DIR}/infra/docker-compose.yml --env-file ${DEPLOY_DIR}/infra/.env pull"
+  log "     sudo -u ${DEPLOY_USER} docker compose -f ${DEPLOY_DIR}/infra/docker-compose.yml --env-file ${DEPLOY_DIR}/infra/.env up -d --no-build"
   log "     sudo -u ${DEPLOY_USER} docker compose -f ${DEPLOY_DIR}/infra/docker-compose.yml --env-file ${DEPLOY_DIR}/infra/.env run --rm init"
   log ""
-  log "  6. Configure GitHub secrets:"
+  log "  5. Configure GitHub secrets:"
   log "     STAGING_SSH_HOST    = <VPS IP or hostname>"
   log "     STAGING_SSH_USER    = ${DEPLOY_USER}"
   log "     STAGING_SSH_KEY     = <private key content>"
   log "     STAGING_DEPLOY_DIR  = ${DEPLOY_DIR}"
   log ""
-  log "  7. Push to main — the deploy workflow triggers automatically."
+  log "  6. Push to main — the deploy workflow triggers automatically."
   log ""
   log "See docs/self-host/staging-deploy.md for the full playbook."
 }

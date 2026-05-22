@@ -109,25 +109,31 @@ jobs:
 
             const lineCount = '${{ steps.sql.outputs.line_count }}';
             const preview = `${{ steps.sql.outputs.preview }}`;
+            const artifactUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
 
-            const body = `${marker}
-            ## Alembic migration SQL preview
-
-            Pending DDL for this PR (generated from a clean DB — shows every migration from baseline):
-
-            **Lines:** ${lineCount}
-
-            <details>
-            <summary>Click to expand migration SQL</summary>
-
-            \`\`\`sql
-            ${preview}
-            \`\`\`
-            </details>
-
-            > Full SQL is also attached as a [build artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
-            > _Non-blocking — this comment is informational only._
-            `;
+            // Build body without leading indentation — 4+ leading spaces
+            // turn lines into a Markdown code block.
+            const lines = [
+              marker,
+              '## Alembic migration SQL preview',
+              '',
+              'Pending DDL for this PR (generated against a clean DB — shows all migrations from baseline):',
+              '',
+              `**Lines:** ${lineCount}`,
+              '',
+              '<details>',
+              '<summary>Click to expand migration SQL</summary>',
+              '',
+              '```sql',
+              preview,
+              '```',
+              '',
+              '</details>',
+              '',
+              `> Full SQL attached as a [build artifact](${artifactUrl}).`,
+              '> _Non-blocking — this comment is informational only._',
+            ];
+            const body = lines.join('\n');
 
             if (existing) {
               await github.rest.issues.updateComment({
