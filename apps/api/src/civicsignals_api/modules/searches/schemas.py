@@ -20,27 +20,35 @@ envelope mirroring the icp module's ``IcpPage`` (doc 06 §5, doc 08 §1.5).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Any
 from uuid import UUID
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    field_validator,
+    ValidationError,
     model_validator,
 )
 
 from civicsignals_api.modules.signals import services as signals_services
 
+from .validation import (
+    FilterValidationError,
+    FilterViolation,
+    assert_valid_filters,
+    validate_filters,
+)
+
 # The closed signal-type taxonomy and the valid feed status set, sourced from the
 # signals module's public service surface so a saved filter can only reference
 # values the feed accepts (doc 06 §3 — searches reaches signals only via services).
 SignalType = signals_services.SignalType
-_VALID_STATUSES: frozenset[str] = frozenset(signals_services.SCORE_STATUSES)
 
-# Score is on the 0..100 scale (doc 14 §5.3 ``WorkspaceScore.score``).
-MinScore = Annotated[float, Field(ge=0.0, le=100.0)]
+# Score is on the 0..100 scale (doc 14 §5.3 ``WorkspaceScore.score``); the actual
+# range / type checks live in the centralized rule engine (``validation.py``) so
+# the message is explicit, not Pydantic's generic constraint text.
+MinScore = float
 
 _NAME = Field(min_length=1, max_length=200)
 
@@ -58,14 +66,22 @@ class SearchFilters(BaseModel):
     - ``published_at_gte`` / ``published_at_lt`` — bound the signal's
       ``occurred_at`` (doc 08 §1.6 date-range conventions).
 
-    ``extra="forbid"`` means a stray/unknown filter key is rejected at the edge
-    rather than silently persisted and ignored by the feed.
+    Validation (H2) is delegated to the centralized rule engine in
+    ``validation.py`` via the ``mode="before"`` validator below: unknown keys,
+    unknown enum values, out-of-range scores, empty status selections and
+    inverted date ranges each fail with an explicit, human-readable message
+    (one per violated rule) — not Pydantic's generic constraint text.
 
-    # TODO H2: richer filter validation (keyword facets, entity / deal-band
-    #   filters) extends this model as the feed query grows.
+    # TODO H3: a digest schedule reads this stored blob; richer filter facets
+    #   (keyword / entity / deal-band) extend the rule set as the feed grows.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # Permissive at the Pydantic layer (``extra="allow"`` so unknown keys reach
+    # the rule engine and are rejected with an explicit "not a filter" message
+    # rather than Pydantic's generic "extra inputs not permitted"). The single
+    # ``mode="before"`` validator runs the centralized H2 rule set, so every
+    # invalid combination surfaces with a human-readable message.
+    model_config = ConfigDict(extra="allow")
 
     signal_type: SignalType | None = None
     statuses: list[str] | None = None
@@ -73,33 +89,34 @@ class SearchFilters(BaseModel):
     published_at_gte: datetime | None = None
     published_at_lt: datetime | None = None
 
-    @field_validator("statuses")
+    @model_validator(mode="before")
     @classmethod
-    def _v_statuses(cls, value: list[str] | None) -> list[str] | None:
-        """Reject unknown statuses and de-duplicate while preserving order."""
-        if value is None:
-            return None
-        seen: set[str] = set()
-        cleaned: list[str] = []
-        for status in value:
-            if status not in _VALID_STATUSES:
-                raise ValueError(
-                    f"unknown status {status!r}; valid: {', '.join(sorted(_VALID_STATUSES))}"
-                )
-            if status not in seen:
-                seen.add(status)
-                cleaned.append(status)
-        return cleaned
+    def _v_rules(cls, data: Any) -> Any:
+        """Run the centralized H2 rule engine before field coercion.
 
-    @model_validator(mode="after")
-    def _v_date_range(self) -> SearchFilters:
-        if (
-            self.published_at_gte is not None
-            and self.published_at_lt is not None
-            and self.published_at_gte >= self.published_at_lt
-        ):
-            raise ValueError("published_at_gte must be before published_at_lt")
-        return self
+        Validating the *raw* mapping up front (rather than per-field afterward)
+        means the explicit per-rule messages always win over Pydantic's generic
+        coercion errors, and the rules stay in one place (``validation.py``)
+        shared with the routes. Statuses are de-duplicated (order-preserving)
+        once the values are known good.
+        """
+        if not isinstance(data, dict):
+            return data
+        violations = validate_filters(data)
+        if violations:
+            # Surface every violation; the route maps this to a 422 with one
+            # ``errors[]`` entry per rule (RFC 7807, doc 08 §1.7).
+            raise FilterValidationError(violations)
+        statuses = data.get("statuses")
+        if isinstance(statuses, list):
+            seen: set[Any] = set()
+            deduped: list[Any] = []
+            for status in statuses:
+                if status not in seen:
+                    seen.add(status)
+                    deduped.append(status)
+            data = {**data, "statuses": deduped}
+        return data
 
     def to_storage(self) -> dict[str, Any]:
         """Serialize to the JSONB blob persisted on the row.
@@ -112,13 +129,29 @@ class SearchFilters(BaseModel):
 
 
 class SavedSearchCreate(BaseModel):
-    """Request body for ``POST /searches`` (H1)."""
+    """Request body for ``POST /searches`` (H1).
+
+    ``filters`` is accepted as the raw filter mapping (not the parsed
+    :class:`SearchFilters`) so the route can validate it through the centralized
+    H2 rule engine and emit **one RFC 7807 ``errors[]`` entry per violated rule**
+    — Pydantic would otherwise collapse a nested-model failure into a single,
+    generic message. :meth:`validated_filters` does the parse/normalize once the
+    route has reported any rule violations.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = _NAME
-    filters: SearchFilters = Field(default_factory=SearchFilters)
+    filters: dict[str, Any] = Field(default_factory=dict)
     is_shared: bool = False
+
+    def validated_filters(self) -> SearchFilters:
+        """Parse the raw filter blob into the storage contract (after rule checks).
+
+        Raises :class:`FilterValidationError` for any violated rule so the route
+        renders the full set of explicit messages.
+        """
+        return _parse_filters(self.filters)
 
 
 class SavedSearchUpdate(BaseModel):
@@ -127,13 +160,46 @@ class SavedSearchUpdate(BaseModel):
     Every field is optional; ``None`` (or absent) means "leave unchanged". A
     caller renames by sending ``name``, re-filters by sending ``filters`` (the
     whole filter set is replaced), and toggles sharing via ``is_shared``.
+
+    As with create, ``filters`` is the raw mapping; the route validates it via
+    the H2 rule engine before persisting (see :meth:`validated_filters`).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(default=None, min_length=1, max_length=200)
-    filters: SearchFilters | None = None
+    filters: dict[str, Any] | None = None
     is_shared: bool | None = None
+
+    def validated_filters(self) -> SearchFilters | None:
+        """Parse the raw filter blob, or ``None`` when ``filters`` was omitted."""
+        if self.filters is None:
+            return None
+        return _parse_filters(self.filters)
+
+
+def _parse_filters(raw: dict[str, Any]) -> SearchFilters:
+    """Validate + normalize a raw filter mapping into :class:`SearchFilters`.
+
+    Runs the centralized rule engine first (so the explicit per-rule messages are
+    what a caller sees) and only then constructs the typed model. A clean blob
+    that nonetheless trips a Pydantic coercion edge (e.g. a date string the rule
+    engine parsed but the model cannot) is reported as a single ``filters``
+    violation rather than leaking a raw Pydantic error.
+    """
+    assert_valid_filters(raw)
+    try:
+        return SearchFilters.model_validate(raw)
+    except ValidationError as exc:  # pragma: no cover - rule engine covers the real cases
+        raise FilterValidationError(
+            [
+                FilterViolation(
+                    field="filters",
+                    code="invalid_filters",
+                    message=str(exc.errors()[0].get("msg", "Invalid filters.")),
+                )
+            ]
+        ) from exc
 
 
 class SavedSearchOut(BaseModel):

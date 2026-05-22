@@ -16,4 +16,3 @@ def dispatch_digests() -> None:
     #   anchor this scheduler hangs off — deleting a search must cancel its digest
     #   (see the ``delete_saved_search`` seam).
     """
-

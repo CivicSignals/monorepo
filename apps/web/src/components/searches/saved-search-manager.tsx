@@ -39,7 +39,20 @@ function formToFilters(values: SavedSearchFormValues): SearchFilters {
   if (values.signal_type) filters.signal_type = values.signal_type;
   if (values.statuses.length > 0) filters.statuses = values.statuses;
   if (values.min_score !== null) filters.min_score = values.min_score;
+  if (values.published_at_gte)
+    filters.published_at_gte = new Date(values.published_at_gte).toISOString();
+  if (values.published_at_lt)
+    filters.published_at_lt = new Date(values.published_at_lt).toISOString();
   return filters;
+}
+
+// An ISO timestamp from the API back into the `datetime-local` input value
+// (which has no timezone / seconds): trim to "YYYY-MM-DDTHH:mm".
+function toLocalInput(iso: string | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return iso.slice(0, 16);
 }
 
 function filtersToForm(
@@ -52,8 +65,53 @@ function filtersToForm(
     signal_type: filters.signal_type ?? "",
     statuses: filters.statuses ?? [],
     min_score: filters.min_score ?? null,
+    published_at_gte: toLocalInput(filters.published_at_gte),
+    published_at_lt: toLocalInput(filters.published_at_lt),
     is_shared: isShared,
   };
+}
+
+const EMPTY_FORM: SavedSearchFormValues = {
+  name: "",
+  signal_type: "",
+  statuses: [],
+  min_score: null,
+  published_at_gte: "",
+  published_at_lt: "",
+  is_shared: false,
+};
+
+// Map an RFC 7807 problem's per-field errors[] onto RHF field errors so the
+// server's explicit messages render inline next to the offending input (H2).
+// The backend's `published_at_gte` carries the cross-field date-range message;
+// an unknown field (or a problem without errors[]) is ignored here and shown
+// via the form-level alert instead.
+const SERVER_FIELDS = new Set<keyof SavedSearchFormValues>([
+  "name",
+  "signal_type",
+  "statuses",
+  "min_score",
+  "published_at_gte",
+  "published_at_lt",
+]);
+
+function applyServerErrors(
+  error: unknown,
+  setError: ReturnType<
+    typeof useForm<SavedSearchFormValues>
+  >["setError"],
+): boolean {
+  if (!(error instanceof ProblemError)) return false;
+  const errors = error.problem.errors ?? [];
+  let applied = false;
+  for (const e of errors) {
+    const field = e.field as keyof SavedSearchFormValues;
+    if (SERVER_FIELDS.has(field)) {
+      setError(field, { type: "server", message: e.message });
+      applied = true;
+    }
+  }
+  return applied;
 }
 
 export function SavedSearchManager() {
@@ -62,28 +120,22 @@ export function SavedSearchManager() {
 
   const create = useForm<SavedSearchFormValues>({
     resolver: zodResolver(savedSearchFormSchema),
-    defaultValues: {
-      name: "",
-      signal_type: "",
-      statuses: [],
-      min_score: null,
-      is_shared: false,
-    },
+    defaultValues: EMPTY_FORM,
   });
 
   const onCreate = create.handleSubmit(async (values) => {
-    await createMutation.mutateAsync({
-      name: values.name.trim(),
-      filters: formToFilters(values),
-      is_shared: values.is_shared,
-    });
-    create.reset({
-      name: "",
-      signal_type: "",
-      statuses: [],
-      min_score: null,
-      is_shared: false,
-    });
+    try {
+      await createMutation.mutateAsync({
+        name: values.name.trim(),
+        filters: formToFilters(values),
+        is_shared: values.is_shared,
+      });
+      create.reset(EMPTY_FORM);
+    } catch (err) {
+      // Surface the server's explicit per-field messages inline (H2). The
+      // mutation already rejected, so re-throwing is unnecessary.
+      applyServerErrors(err, create.setError);
+    }
   });
 
   const createError =
@@ -164,15 +216,20 @@ function SavedSearchRow({ search }: { search: SavedSearchOut }) {
   });
 
   const onSave = edit.handleSubmit(async (values) => {
-    await updateMutation.mutateAsync({
-      id: search.id,
-      update: {
-        name: values.name.trim(),
-        filters: formToFilters(values),
-        is_shared: values.is_shared,
-      },
-    });
-    setEditing(false);
+    try {
+      await updateMutation.mutateAsync({
+        id: search.id,
+        update: {
+          name: values.name.trim(),
+          filters: formToFilters(values),
+          is_shared: values.is_shared,
+        },
+      });
+      setEditing(false);
+    } catch (err) {
+      // Keep the editor open and surface the server's per-field messages (H2).
+      applyServerErrors(err, edit.setError);
+    }
   });
 
   const rowError =
@@ -272,6 +329,15 @@ function summarizeFilters(filters: SearchFilters): string {
     );
   if (filters.min_score !== undefined)
     parts.push(`score ≥ ${filters.min_score}`);
+  if (filters.published_at_gte || filters.published_at_lt) {
+    const from = filters.published_at_gte
+      ? filters.published_at_gte.slice(0, 10)
+      : "…";
+    const to = filters.published_at_lt
+      ? filters.published_at_lt.slice(0, 10)
+      : "…";
+    parts.push(`${from} → ${to}`);
+  }
   return parts.length > 0 ? parts.join(" · ") : "All signals";
 }
 
@@ -340,6 +406,11 @@ function SavedSearchFields({
             </label>
           ))}
         </div>
+        {errors.statuses ? (
+          <p role="alert" className="text-sm text-destructive">
+            {errors.statuses.message}
+          </p>
+        ) : null}
       </fieldset>
 
       <div className="space-y-1">
@@ -369,6 +440,55 @@ function SavedSearchFields({
           </p>
         ) : null}
       </div>
+
+      <fieldset className="space-y-2">
+        <legend className="text-sm font-medium">
+          Published date range{" "}
+          <span className="text-muted-foreground">(optional)</span>
+        </legend>
+        <div className="flex flex-wrap gap-4">
+          <div className="space-y-1">
+            <label
+              htmlFor={`${idPrefix}-published-gte`}
+              className="block text-xs text-muted-foreground"
+            >
+              From
+            </label>
+            <input
+              id={`${idPrefix}-published-gte`}
+              type="datetime-local"
+              aria-invalid={errors.published_at_gte ? "true" : undefined}
+              className="rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+              {...register("published_at_gte")}
+            />
+          </div>
+          <div className="space-y-1">
+            <label
+              htmlFor={`${idPrefix}-published-lt`}
+              className="block text-xs text-muted-foreground"
+            >
+              To
+            </label>
+            <input
+              id={`${idPrefix}-published-lt`}
+              type="datetime-local"
+              aria-invalid={errors.published_at_lt ? "true" : undefined}
+              className="rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+              {...register("published_at_lt")}
+            />
+          </div>
+        </div>
+        {errors.published_at_gte ? (
+          <p role="alert" className="text-sm text-destructive">
+            {errors.published_at_gte.message}
+          </p>
+        ) : null}
+        {errors.published_at_lt ? (
+          <p role="alert" className="text-sm text-destructive">
+            {errors.published_at_lt.message}
+          </p>
+        ) : null}
+      </fieldset>
 
       <label className="flex items-center gap-2 text-sm">
         <input type="checkbox" {...register("is_shared")} />

@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -129,26 +131,100 @@ def test_create_requires_auth(client: TestClient) -> None:
     assert resp.headers["content-type"].startswith("application/problem+json")
 
 
+def _post_filters(client: TestClient, token: str, ws: str, filters: dict[str, Any]) -> Response:
+    return client.post(
+        SEARCHES,
+        json={"name": "x", "filters": filters},
+        headers=_scoped(token, ws),
+    )
+
+
+def _problem(resp: Response) -> dict[str, Any]:
+    """Assert a 422 RFC 7807 problem and return its parsed body (H2)."""
+    assert resp.status_code == 422, resp.text
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    body: dict[str, Any] = resp.json()
+    return body
+
+
 def test_create_rejects_unknown_signal_type(client: TestClient) -> None:
     token, _ = _signup(client, "badtype@example.com")
     ws = _make_workspace(client, token)
-    resp = client.post(
-        SEARCHES,
-        json=_body(filters={"signal_type": "not_a_signal"}),
-        headers=_scoped(token, ws),
-    )
-    assert resp.status_code == 422
+    body = _problem(_post_filters(client, token, ws, {"signal_type": "not_a_signal"}))
+    # H2: explicit, per-field message — not a generic "invalid".
+    assert str(body["type"]).endswith("/validation")
+    err = body["errors"][0]
+    assert err["field"] == "signal_type"
+    assert err["code"] == "unknown_signal_type"
+    assert "not a known signal type" in err["message"]
 
 
 def test_create_rejects_unknown_status(client: TestClient) -> None:
     token, _ = _signup(client, "badstatus@example.com")
     ws = _make_workspace(client, token)
-    resp = client.post(
-        SEARCHES,
-        json=_body(filters={"statuses": ["nope"]}),
+    body = _problem(_post_filters(client, token, ws, {"statuses": ["nope"]}))
+    err = body["errors"][0]
+    assert err["field"] == "statuses"
+    assert "nope" in err["message"]
+
+
+def test_create_rejects_empty_statuses(client: TestClient) -> None:
+    token, _ = _signup(client, "emptystatus@example.com")
+    ws = _make_workspace(client, token)
+    body = _problem(_post_filters(client, token, ws, {"statuses": []}))
+    assert body["errors"][0]["code"] == "statuses_empty"
+
+
+def test_create_rejects_out_of_range_score(client: TestClient) -> None:
+    token, _ = _signup(client, "badscore@example.com")
+    ws = _make_workspace(client, token)
+    body = _problem(_post_filters(client, token, ws, {"min_score": 150}))
+    assert body["errors"][0]["code"] == "min_score_out_of_range"
+
+
+def test_create_rejects_inverted_date_range(client: TestClient) -> None:
+    token, _ = _signup(client, "baddates@example.com")
+    ws = _make_workspace(client, token)
+    body = _problem(
+        _post_filters(
+            client,
+            token,
+            ws,
+            {
+                "published_at_gte": "2026-02-01T00:00:00+00:00",
+                "published_at_lt": "2026-01-01T00:00:00+00:00",
+            },
+        )
+    )
+    assert body["errors"][0]["code"] == "date_range_inverted"
+
+
+def test_create_reports_every_violated_rule_at_once(client: TestClient) -> None:
+    token, _ = _signup(client, "multibad@example.com")
+    ws = _make_workspace(client, token)
+    body = _problem(
+        _post_filters(
+            client,
+            token,
+            ws,
+            {"signal_type": "nope", "min_score": 999, "statuses": []},
+        )
+    )
+    codes = {e["code"] for e in body["errors"]}
+    assert codes == {"unknown_signal_type", "min_score_out_of_range", "statuses_empty"}
+
+
+def test_update_rejects_invalid_filters(client: TestClient) -> None:
+    token, _ = _signup(client, "patchbad@example.com")
+    ws = _make_workspace(client, token)
+    created = client.post(SEARCHES, json=_body(), headers=_scoped(token, ws)).json()
+    resp = client.patch(
+        f"{SEARCHES}/{created['id']}",
+        json={"filters": {"signal_type": "not_a_signal"}},
         headers=_scoped(token, ws),
     )
-    assert resp.status_code == 422
+    body = _problem(resp)
+    assert body["errors"][0]["code"] == "unknown_signal_type"
 
 
 def test_get_saved_search(client: TestClient) -> None:
@@ -204,9 +280,7 @@ def test_private_search_invisible_to_other_member(client: TestClient) -> None:
     ws = _make_workspace(client, owner)
     _add_member_at_role(other_id, ws, Role.MEMBER)
 
-    created = client.post(
-        SEARCHES, json=_body(is_shared=False), headers=_scoped(owner, ws)
-    ).json()
+    created = client.post(SEARCHES, json=_body(is_shared=False), headers=_scoped(owner, ws)).json()
 
     # The other member cannot see the owner's *private* search.
     assert client.get(f"{SEARCHES}/{created['id']}", headers=_scoped(other, ws)).status_code == 404
@@ -219,9 +293,7 @@ def test_shared_search_visible_to_other_member(client: TestClient) -> None:
     ws = _make_workspace(client, owner)
     _add_member_at_role(other_id, ws, Role.MEMBER)
 
-    created = client.post(
-        SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)
-    ).json()
+    created = client.post(SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)).json()
 
     # A shared search is visible (read) to another member of the workspace.
     got = client.get(f"{SEARCHES}/{created['id']}", headers=_scoped(other, ws))
@@ -260,9 +332,7 @@ def test_non_owner_cannot_update_shared_search(client: TestClient) -> None:
     other, other_id = _signup(client, "edit-other@example.com")
     ws = _make_workspace(client, owner)
     _add_member_at_role(other_id, ws, Role.MEMBER)
-    created = client.post(
-        SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)
-    ).json()
+    created = client.post(SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)).json()
 
     resp = client.patch(
         f"{SEARCHES}/{created['id']}", json={"name": "Hijack"}, headers=_scoped(other, ws)
@@ -276,9 +346,7 @@ def test_non_owner_cannot_delete_shared_search(client: TestClient) -> None:
     other, other_id = _signup(client, "del-other@example.com")
     ws = _make_workspace(client, owner)
     _add_member_at_role(other_id, ws, Role.MEMBER)
-    created = client.post(
-        SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)
-    ).json()
+    created = client.post(SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)).json()
 
     resp = client.delete(f"{SEARCHES}/{created['id']}", headers=_scoped(other, ws))
     assert resp.status_code == 403
@@ -289,9 +357,7 @@ def test_non_owner_cannot_see_private_to_update_is_404(client: TestClient) -> No
     other, other_id = _signup(client, "priv-other@example.com")
     ws = _make_workspace(client, owner)
     _add_member_at_role(other_id, ws, Role.MEMBER)
-    created = client.post(
-        SEARCHES, json=_body(is_shared=False), headers=_scoped(owner, ws)
-    ).json()
+    created = client.post(SEARCHES, json=_body(is_shared=False), headers=_scoped(owner, ws)).json()
     # A search the caller cannot even *see* is 404 (not 403) — existence not leaked.
     resp = client.patch(
         f"{SEARCHES}/{created['id']}", json={"name": "x"}, headers=_scoped(other, ws)
@@ -316,9 +382,7 @@ def test_viewer_can_list_shared(client: TestClient) -> None:
     viewer, viewer_id = _signup(client, "rbacv-viewer@example.com")
     ws = _make_workspace(client, owner)
     _add_member_at_role(viewer_id, ws, Role.VIEWER)
-    created = client.post(
-        SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)
-    ).json()
+    created = client.post(SEARCHES, json=_body(is_shared=True), headers=_scoped(owner, ws)).json()
     listed = client.get(SEARCHES, headers=_scoped(viewer, ws)).json()
     assert [s["id"] for s in listed["items"]] == [created["id"]]
 
@@ -344,9 +408,7 @@ def test_rename_and_refilter(client: TestClient) -> None:
 def test_toggle_share(client: TestClient) -> None:
     token, _ = _signup(client, "togglesharept@example.com")
     ws = _make_workspace(client, token)
-    created = client.post(
-        SEARCHES, json=_body(is_shared=False), headers=_scoped(token, ws)
-    ).json()
+    created = client.post(SEARCHES, json=_body(is_shared=False), headers=_scoped(token, ws)).json()
     resp = client.patch(
         f"{SEARCHES}/{created['id']}", json={"is_shared": True}, headers=_scoped(token, ws)
     )

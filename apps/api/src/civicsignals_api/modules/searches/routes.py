@@ -43,6 +43,7 @@ from .schemas import (
     SavedSearchPage,
     SavedSearchUpdate,
 )
+from .validation import FilterValidationError
 
 router = APIRouter(prefix="/searches", tags=["searches"])
 
@@ -82,6 +83,22 @@ def _bad_cursor() -> ProblemException:
     )
 
 
+def _invalid_filters(exc: FilterValidationError) -> ProblemException:
+    """Map a filter-validation failure to a 422 RFC 7807 problem (H2, doc 08 §1.7).
+
+    Each violated rule becomes one ``errors[]`` entry (``field`` / ``code`` /
+    explicit ``message``) so the form can show a clear, per-field message rather
+    than a single generic "invalid" — the H2 acceptance criterion.
+    """
+    return ProblemException(
+        status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        code="validation",
+        title="Invalid filter combination",
+        detail="One or more saved-search filters are invalid; see errors for details.",
+        errors=[v.as_error() for v in exc.violations],
+    )
+
+
 @router.post(
     "",
     response_model=SavedSearchOut,
@@ -94,13 +111,21 @@ async def create_saved_search(
     session: SessionDep,
     response: Response,
 ) -> SavedSearchOut:
-    """Create a saved search owned by the caller in the active workspace (H1)."""
+    """Create a saved search owned by the caller in the active workspace (H1).
+
+    Filters are validated through the centralized H2 rule engine before persist;
+    an invalid combination is a ``422`` with one explicit message per broken rule.
+    """
+    try:
+        filters = body.validated_filters()
+    except FilterValidationError as exc:
+        raise _invalid_filters(exc) from exc
     search = await services.create_saved_search(
         session,
         workspace_id=ctx.workspace_id,
         created_by=ctx.user.id,
         name=body.name,
-        filters=body.filters.to_storage(),
+        filters=filters.to_storage(),
         is_shared=body.is_shared,
     )
     await session.commit()
@@ -155,7 +180,15 @@ async def update_saved_search(
     ctx: RequireMember,
     session: SessionDep,
 ) -> SavedSearchOut:
-    """Rename / re-filter / toggle sharing on a search the caller owns (H1)."""
+    """Rename / re-filter / toggle sharing on a search the caller owns (H1).
+
+    A re-filter is validated through the same centralized H2 rule engine as
+    create; an invalid combination is a ``422`` with one message per broken rule.
+    """
+    try:
+        filters = body.validated_filters()
+    except FilterValidationError as exc:
+        raise _invalid_filters(exc) from exc
     try:
         search = await services.update_saved_search(
             session,
@@ -163,7 +196,7 @@ async def update_saved_search(
             user_id=ctx.user.id,
             search_id=search_id,
             name=body.name,
-            filters=body.filters.to_storage() if body.filters is not None else None,
+            filters=filters.to_storage() if filters is not None else None,
             is_shared=body.is_shared,
         )
         await session.commit()

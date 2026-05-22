@@ -81,14 +81,18 @@ def test_equal_date_range_is_rejected() -> None:
 
 
 def test_unknown_filter_key_is_forbidden() -> None:
+    # The H2 rule engine rejects a stray filter key with an explicit message;
+    # constructed directly, that surfaces as a Pydantic ValidationError.
     with pytest.raises(ValidationError):
-        SearchFilters(entity_id="abc")  # type: ignore[call-arg]
+        SearchFilters.model_validate({"entity_id": "abc"})
 
 
 def test_create_defaults_to_empty_private_search() -> None:
     body = SavedSearchCreate(name="My feed")
     assert body.is_shared is False
-    assert body.filters.to_storage() == {}
+    # ``filters`` is now the raw mapping; ``validated_filters`` parses it (H2).
+    assert body.filters == {}
+    assert body.validated_filters().to_storage() == {}
 
 
 def test_create_requires_non_empty_name() -> None:

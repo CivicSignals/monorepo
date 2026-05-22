@@ -225,4 +225,77 @@ describe("SavedSearchManager", () => {
 
     expect(await screen.findByText(/give your search a name/i)).toBeDefined();
   });
+
+  it("shows an explicit message for an inverted date range before submit (H2)", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () =>
+        jsonResponse({ items: [], next_cursor: null }),
+      );
+
+    const user = userEvent.setup();
+    render(<SavedSearchManager />, { wrapper });
+
+    await screen.findByTestId("saved-search-manager");
+    await user.type(screen.getByLabelText(/^name$/i), "Bad range");
+    // Start after end → contradictory date range.
+    await user.type(
+      screen.getByLabelText(/^from$/i),
+      "2026-02-01T00:00",
+    );
+    await user.type(screen.getByLabelText(/^to$/i), "2026-01-01T00:00");
+    await user.click(screen.getByRole("button", { name: /save search/i }));
+
+    // The client catches the invalid combo: explicit message, no POST sent.
+    expect(
+      await screen.findByText(/start date must be before the end date/i),
+    ).toBeDefined();
+    const post = fetchSpy.mock.calls.find(
+      (c) => pathOf(c[0]) === "/api/v1/searches" && c[1]?.method === "POST",
+    );
+    expect(post).toBeUndefined();
+  });
+
+  it("renders the server's explicit per-field message on a 422 (H2)", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = pathOf(input);
+      if (path === "/api/v1/searches" && init?.method === "POST") {
+        // RFC 7807 problem+json with a per-field errors[] entry.
+        return new Response(
+          JSON.stringify({
+            type: "https://docs.civicsignals.io/errors/validation",
+            title: "Invalid filter combination",
+            status: 422,
+            detail: "One or more saved-search filters are invalid.",
+            errors: [
+              {
+                field: "min_score",
+                code: "min_score_out_of_range",
+                message: "Minimum score must be between 0 and 100 (got 150).",
+              },
+            ],
+          }),
+          {
+            status: 422,
+            headers: { "Content-Type": "application/problem+json" },
+          },
+        );
+      }
+      return jsonResponse({ items: [], next_cursor: null });
+    });
+
+    const user = userEvent.setup();
+    render(<SavedSearchManager />, { wrapper });
+
+    await screen.findByTestId("saved-search-manager");
+    await user.type(screen.getByLabelText(/^name$/i), "Server-rejected");
+    // A valid client value that the (mocked) server still rejects, so the POST
+    // fires and the server's explicit message is surfaced inline.
+    await user.type(screen.getByLabelText(/minimum score/i), "80");
+    await user.click(screen.getByRole("button", { name: /save search/i }));
+
+    expect(
+      await screen.findByText(/minimum score must be between 0 and 100/i),
+    ).toBeDefined();
+  });
 });
