@@ -38,6 +38,8 @@ const VERIFIED_CONTACT: ContactRead = {
   observed_at: NOW_ISO,
   verified: true,
   last_verified_at: NOW_ISO,
+  reported_invalid_at: null,
+  bounce_count: 0,
   created_at: NOW_ISO,
   updated_at: NOW_ISO,
 };
@@ -58,6 +60,8 @@ const STALE_CONTACT_UNVERIFIED: ContactRead = {
   observed_at: NOW_ISO,
   verified: false,
   last_verified_at: null,
+  reported_invalid_at: null,
+  bounce_count: 0,
   created_at: NOW_ISO,
   updated_at: NOW_ISO,
 };
@@ -79,6 +83,8 @@ const STALE_CONTACT_OLD: ContactRead = {
   // verified=true but last_verified_at is 200 days ago → Stale
   verified: true,
   last_verified_at: OLD_ISO,
+  reported_invalid_at: null,
+  bounce_count: 0,
   created_at: OLD_ISO,
   updated_at: OLD_ISO,
 };

@@ -1,10 +1,10 @@
-"""contacts SQLAlchemy models (doc 07 §2 "contacts", doc 16 §11, C2).
+"""contacts SQLAlchemy models (doc 07 §2 "contacts", doc 16 §11, C2, C6).
 
 Per-record source provenance on every contact row answers WHERE the data came
 from (doc 16 §18 "store provenance per record") and supports the verified/stale
 lifecycle described in doc 07 §4 ("Contact email" state machine).
 
-Four tables, all prefixed ``contacts_`` and migrated only by this module
+Five tables, all prefixed ``contacts_`` and migrated only by this module
 (doc 06 §3, §4):
 
 - ``contacts_contact`` — a person at an entity (name, role/title, FK to
@@ -16,10 +16,16 @@ Four tables, all prefixed ``contacts_`` and migrated only by this module
 - ``contacts_phone`` — phone number(s) with provenance.
 - ``contacts_title`` — title/position history for a contact, recording when a
   role was first/last observed and from which source.
+- ``contacts_correction`` — workspace-scoped correction reports (C6): records
+  who reported a contact as invalid/bounced/wrong and why. The contact row is
+  updated in-place (status, verified, confidence); this table is the audit trail.
 
 Contacts are **global**, not workspace-scoped (doc 07 §3: "Contacts are global
 per Entity. We never store workspace-private contact records — privacy + cost
 tradeoff intentional.").
+Correction reports are workspace-scoped (C6): a workspace member can report
+contact data as bad without mutating another workspace's view — but the
+underlying contact row IS updated globally since we store one contact per entity.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     func,
@@ -45,8 +52,11 @@ from civicsignals_api.db import Base
 
 from .ids import uuid7
 
-# Valid contact statuses.
-CONTACT_STATUSES: tuple[str, ...] = ("active", "inactive", "stale")
+# Valid contact statuses (C6 adds "bounced" and "invalid" to the lifecycle).
+CONTACT_STATUSES: tuple[str, ...] = ("active", "inactive", "stale", "bounced", "invalid")
+
+# Valid correction/bounce reason categories (C6, seam for K5 automatic push-failure).
+CORRECTION_KINDS: tuple[str, ...] = ("bounced", "wrong_email", "wrong_phone", "wrong_person", "other")
 
 # Email validation states (doc 07 §4 "Contact email" lifecycle).
 EMAIL_STATUSES: tuple[str, ...] = ("unverified", "valid", "risky", "invalid", "stale")
@@ -117,6 +127,18 @@ class Contact(Base):
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
 
+    # --- C6: correction / bounce tracking -----------------------------------
+    # Timestamp of the most-recent workspace report that this contact is invalid.
+    # NULL means never reported. Set by ``services.report_contact_invalid``.
+    reported_invalid_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Cumulative number of times this contact has been marked bounced/invalid
+    # across all workspaces. Incremented (never decremented) by the correction
+    # service; K5 uses this to decide whether to auto-suppress the contact.
+    bounce_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # -------------------------------------------------------------------------
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -132,6 +154,9 @@ class Contact(Base):
         back_populates="contact", cascade="all, delete-orphan"
     )
     titles: Mapped[list[ContactTitle]] = relationship(
+        back_populates="contact", cascade="all, delete-orphan"
+    )
+    corrections: Mapped[list[ContactCorrection]] = relationship(
         back_populates="contact", cascade="all, delete-orphan"
     )
 
@@ -322,4 +347,70 @@ class ContactTitle(Base):
             "title",
             unique=True,
         ),
+    )
+
+
+class ContactCorrection(Base):
+    """Workspace-scoped correction report for a contact (C6).
+
+    Records that a workspace member reported a contact as invalid/bounced/wrong.
+    This table is the audit trail; the parent ``contacts_contact`` row is updated
+    in-place (status → "bounced"/"invalid", verified → False, confidence lowered,
+    reported_invalid_at / bounce_count bumped).
+
+    ``workspace_id`` FK to ``workspaces_workspace`` — bare UUID column, no ORM
+    relationship (module isolation per doc 06 §3). ``reporter_id`` similarly is
+    a bare FK to ``auth_user``.
+
+    ``kind`` is one of :data:`CORRECTION_KINDS` (bounced, wrong_email, wrong_phone,
+    wrong_person, other). ``reason`` is optional free-text supplied by the reporter.
+    ``correction`` is an optional free-text suggested replacement (e.g. the correct
+    email address), providing the seam K5 uses to auto-update the contact after a
+    CRM push failure.
+    """
+
+    __tablename__ = "contacts_correction"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+
+    # FK to the parent contact.
+    contact_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("contacts_contact.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Workspace that submitted the report (bare UUID, no ORM relationship).
+    workspace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+    # User who submitted the report (bare UUID FK, no ORM relationship).
+    reporter_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+
+    # Category of the problem (see CORRECTION_KINDS).
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'other'"))
+
+    # Optional human-readable reason / description of the problem.
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Optional suggested replacement value (e.g. the correct email).
+    # K5 reads this to attempt auto-correction after a CRM push failure.
+    correction: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    contact: Mapped[Contact] = relationship(back_populates="corrections")
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN (" + ", ".join(f"'{k}'" for k in CORRECTION_KINDS) + ")",
+            name="contacts_correction_kind_check",
+        ),
+        Index("contacts_correction_contact_idx", "contact_id"),
+        Index("contacts_correction_workspace_idx", "workspace_id"),
+        # One report per (contact, workspace) at a given point in time is
+        # fine — reports accumulate as rows, not as upserts. No uniqueness
+        # constraint intentionally; multiple reports from different workspaces
+        # (or the same workspace on different occasions) are all kept.
     )

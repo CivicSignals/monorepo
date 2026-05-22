@@ -77,6 +77,8 @@ const VERIFIED_CONTACT: ContactRead = {
   observed_at: NOW_ISO,
   verified: true,
   last_verified_at: NOW_ISO,
+  reported_invalid_at: null,
+  bounce_count: 0,
   created_at: NOW_ISO,
   updated_at: NOW_ISO,
 };

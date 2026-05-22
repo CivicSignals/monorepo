@@ -1,4 +1,4 @@
-"""Public service interface for the contacts module (doc 06 §3, C2).
+"""Public service interface for the contacts module (doc 06 §3, C2, C6).
 
 Other modules call contacts only through the functions defined here — never by
 importing contacts's models or routes directly (doc 06 §3). The contact
@@ -16,6 +16,14 @@ Writes:
   stable key ``(entity_id, canonical_email)`` (doc 07 §2 UNIQUE constraint).
   Provenance fields are stored per-record (doc 16 §18).
 
+Correction (C6):
+- :func:`report_contact_invalid` — workspace-scoped report that a contact is
+  bounced / invalid / wrong. Inserts a ``ContactCorrection`` audit row and
+  updates the parent contact (status, verified, confidence, timestamps). This is
+  the seam K5 (automatic CRM-push-failure recovery) calls.
+- :func:`mark_bounced` — convenience alias that always uses kind="bounced";
+  callable by the ingestion/notification layer without importing schemas.
+
 Entity refs: access entities only via ``entities/services.py``; never import
 entities models here (doc 06 §3 module isolation).
 """
@@ -26,13 +34,20 @@ import base64
 import binascii
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import Contact, ContactEmail, ContactPhone, ContactTitle
+from .models import (
+    CORRECTION_KINDS,
+    Contact,
+    ContactCorrection,
+    ContactEmail,
+    ContactPhone,
+    ContactTitle,
+)
 
 # Cursor pagination defaults (doc 06 §5). Hard cap keeps an unbounded ``limit``
 # from scanning the full contacts table.
@@ -348,3 +363,148 @@ async def upsert_contact(session: AsyncSession, inp: ContactInput) -> Contact:
 
 # Convenience alias — ``create_contact`` routes to the same upsert logic.
 create_contact = upsert_contact
+
+
+# ---------------------------------------------------------------------------
+# Correction / bounce reporting (C6)
+# ---------------------------------------------------------------------------
+
+# Confidence penalty applied to a contact's confidence score on each correction
+# report. After enough reports the confidence drops to zero.
+_CONFIDENCE_PENALTY = 0.2
+
+# Confidence floor: we never set confidence below this value so the contact
+# remains discoverable (a workspace can still manually re-verify).
+_CONFIDENCE_FLOOR = 0.0
+
+
+@dataclass(slots=True)
+class CorrectionInput:
+    """Input data for a contact-correction report (C6).
+
+    ``kind`` must be one of :data:`~contacts.models.CORRECTION_KINDS`.
+    ``reason`` is optional free-text from the reporter.
+    ``correction`` is an optional suggested replacement value that K5 reads for
+    automatic re-try after a CRM push failure.
+    """
+
+    contact_id: uuid.UUID
+    workspace_id: uuid.UUID
+    reporter_id: uuid.UUID
+    kind: str = "other"
+    reason: str | None = None
+    correction: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in CORRECTION_KINDS:
+            raise ValueError(f"kind must be one of {CORRECTION_KINDS!r}, got {self.kind!r}")
+
+
+@dataclass(slots=True)
+class CorrectionResult:
+    """Result of a correction report — the updated contact + the new report row."""
+
+    contact: Contact
+    correction: ContactCorrection
+
+
+async def report_contact_invalid(
+    session: AsyncSession,
+    inp: CorrectionInput,
+) -> CorrectionResult:
+    """Record a workspace correction report and update the contact's status (C6).
+
+    Behaviour:
+    - Inserts a new :class:`~contacts.models.ContactCorrection` row (audit trail).
+    - Sets the contact ``status`` to the appropriate value:
+      - ``kind="bounced"``       → ``status="bounced"``
+      - ``kind="wrong_*"``       → ``status="invalid"``
+      - ``kind="other"``         → ``status="invalid"``
+    - Clears ``verified`` and ``last_verified_at`` to reflect that the contact is
+      no longer confirmed as accurate.
+    - Lowers ``confidence`` by :data:`_CONFIDENCE_PENALTY` (floored at
+      :data:`_CONFIDENCE_FLOOR`) to de-rank it in scored lists.
+    - Sets ``reported_invalid_at`` to *now* and increments ``bounce_count``.
+    - Updates ``updated_at`` to *now*.
+
+    Idempotent-friendly: calling this multiple times for the same contact is safe —
+    each call appends a new audit row and further lowers confidence / updates the
+    timestamp. Downstream callers that want set-once behaviour should check whether
+    the contact is already ``bounced``/``invalid`` before calling.
+
+    This function does **not** commit the session; callers own the transaction.
+    """
+    contact = await get_contact(session, inp.contact_id)
+    if contact is None:
+        raise ValueError(f"Contact {inp.contact_id!s} not found")
+
+    # Determine the new status.
+    new_status = "bounced" if inp.kind == "bounced" else "invalid"
+
+    # Lower confidence.
+    current_confidence = contact.confidence if contact.confidence is not None else 0.5
+    new_confidence = max(_CONFIDENCE_FLOOR, current_confidence - _CONFIDENCE_PENALTY)
+
+    now = datetime.now(UTC)
+
+    # Update the contact row in-place.
+    await session.execute(
+        update(Contact)
+        .where(Contact.id == inp.contact_id)
+        .values(
+            status=new_status,
+            verified=False,
+            last_verified_at=None,
+            confidence=new_confidence,
+            reported_invalid_at=now,
+            bounce_count=contact.bounce_count + 1,
+            updated_at=now,
+        )
+    )
+
+    # Insert the correction audit row.
+    correction = ContactCorrection(
+        contact_id=inp.contact_id,
+        workspace_id=inp.workspace_id,
+        reporter_id=inp.reporter_id,
+        kind=inp.kind,
+        reason=inp.reason,
+        correction=inp.correction,
+    )
+    session.add(correction)
+    await session.flush()
+
+    # Refresh the contact object from the identity map so the returned object
+    # reflects the new values without a second round-trip.
+    updated_contact = await session.get(Contact, inp.contact_id, populate_existing=True)
+    assert updated_contact is not None  # just inserted above
+    return CorrectionResult(contact=updated_contact, correction=correction)
+
+
+async def mark_bounced(
+    session: AsyncSession,
+    *,
+    contact_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    reporter_id: uuid.UUID,
+    reason: str | None = None,
+    correction: str | None = None,
+) -> CorrectionResult:
+    """Mark a contact as bounced (convenience wrapper around :func:`report_contact_invalid`).
+
+    ``kind`` is always ``"bounced"``. K5 (push-failure recovery) and the
+    notification worker call this instead of constructing a :class:`CorrectionInput`
+    directly.  This is the seam referenced by ``# TODO K`` comments in the push and
+    notification modules.
+    """
+    return await report_contact_invalid(
+        session,
+        CorrectionInput(
+            contact_id=contact_id,
+            workspace_id=workspace_id,
+            reporter_id=reporter_id,
+            kind="bounced",
+            reason=reason,
+            correction=correction,
+        ),
+    )

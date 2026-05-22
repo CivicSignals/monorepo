@@ -1,15 +1,17 @@
-"""HTTP endpoints for the contacts module, mounted under ``/api/v1/contacts`` (C2 req 3).
+"""HTTP endpoints for the contacts module, mounted under ``/api/v1/contacts`` (C2 req 3, C6).
 
 Contacts are **global** (doc 07 §3 — "Contacts are global per Entity. We never
-store workspace-private contact records."), so these endpoints intentionally do
+store workspace-private contact records."), so read endpoints intentionally do
 **not** require the ``X-Workspace-Id`` header (same reasoning as entities module).
 
-Exposed read endpoints:
-- ``GET /contacts``             — list/search contacts (optionally filtered by entity_id).
-- ``GET /contacts/{contact_id}``— get one contact by id.
-
-Writes happen only via ``contacts/services.py`` (called by ingestion/C4/C6); there
-is no public HTTP write surface in this task scope.
+Exposed endpoints:
+- ``GET  /contacts``                             — list/search contacts (optionally by entity_id).
+- ``GET  /contacts/{contact_id}``                — get one contact by id.
+- ``POST /contacts/{contact_id}/report-invalid`` — workspace-scoped correction report (C6).
+  Requires ``X-Workspace-Id`` + bearer auth. Records who reported the contact as
+  invalid/bounced/wrong and why; updates the contact's status/verified/confidence.
+  This is the manual-report seam; K5 (push-failure recovery) calls the underlying
+  service function directly.
 
 Cursor pagination: ``?cursor=…&limit=25`` (never offset), per doc 06 §5.
 RFC 7807 ``application/problem+json`` errors (doc 06 §5).
@@ -22,13 +24,21 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
+from civicsignals_api.modules.auth.dependencies import RequireMember
 
 from . import services
 from .models import Contact
-from .schemas import ContactPage, ContactRead
+from .schemas import (
+    ContactCorrectionRead,
+    ContactCorrectionRequest,
+    ContactCorrectionResponse,
+    ContactPage,
+    ContactRead,
+)
 
 router = APIRouter(prefix="/contacts", tags=["contacts"])
 
@@ -103,3 +113,62 @@ async def get_contact(
     if contact is None:
         return _problem(404, "Contact not found", f"No contact with id {contact_id}.")
     return ContactRead.model_validate(contact)
+
+
+@router.post(
+    "/{contact_id}/report-invalid",
+    response_model=ContactCorrectionResponse,
+    status_code=201,
+    summary="Report a contact as invalid / bounced (C6)",
+)
+async def report_contact_invalid(
+    contact_id: uuid.UUID,
+    body: ContactCorrectionRequest,
+    session: SessionDep,
+    ctx: RequireMember,
+) -> ContactCorrectionResponse | JSONResponse:
+    """Record a workspace-scoped correction report for a contact.
+
+    This endpoint is behind ``require_workspace`` (via :data:`RequireMember`):
+    - The ``X-Workspace-Id`` header (or ``last_active_workspace_id`` fallback) must
+      identify the caller's workspace.
+    - The caller must be at least a ``member`` in that workspace.
+
+    On success:
+    - A new :class:`~contacts.models.ContactCorrection` audit row is inserted.
+    - The contact's ``status`` is set to ``"bounced"`` or ``"invalid"``.
+    - ``verified`` is cleared; ``confidence`` is lowered; ``reported_invalid_at``
+      and ``bounce_count`` are updated.
+    - The updated contact + new correction row are returned with HTTP 201.
+
+    Calling this endpoint multiple times is safe (idempotent-friendly): each call
+    appends an audit row and further lowers confidence. The contact status does not
+    change again if it is already ``"bounced"``/``"invalid"``.
+    """
+    try:
+        result = await services.report_contact_invalid(
+            session,
+            services.CorrectionInput(
+                contact_id=contact_id,
+                workspace_id=ctx.workspace_id,
+                reporter_id=ctx.user.id,
+                kind=body.kind,
+                reason=body.reason,
+                correction=body.correction,
+            ),
+        )
+        await session.commit()
+    except ValueError as exc:
+        await session.rollback()
+        msg = str(exc)
+        if "not found" in msg.lower():
+            return _problem(404, "Contact not found", f"No contact with id {contact_id}.")
+        return _problem(400, "Invalid request", msg)
+    except IntegrityError:
+        await session.rollback()
+        return _problem(409, "Conflict", "Could not save the correction report; please retry.")
+
+    return ContactCorrectionResponse(
+        contact=ContactRead.model_validate(result.contact),
+        correction=ContactCorrectionRead.model_validate(result.correction),
+    )
