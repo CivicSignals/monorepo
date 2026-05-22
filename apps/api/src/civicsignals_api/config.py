@@ -60,6 +60,22 @@ class Settings(BaseSettings):
     # Invitation token TTL (B6). 7 days per doc 04 J7.
     invitation_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
 
+    # --- MFA / TOTP (B4) -----------------------------------------------------
+    # Fernet key used to encrypt TOTP secrets at rest. Falls back to
+    # ``secret_key`` in dev/self-host so no extra setup is needed. Production
+    # MUST set a dedicated key (rotating ``secret_key`` would invalidate stored
+    # TOTP secrets — users would need to re-enroll).
+    mfa_totp_encryption_key: str | None = None
+    # Number of backup/recovery codes to generate at MFA activation.
+    mfa_backup_code_count: int = 10
+    # TTL of the short-lived MFA challenge token (seconds). After the first
+    # factor (email+password) succeeds and MFA is required, the server issues
+    # a short-lived "mfa_challenge" JWT; the client presents it with the TOTP
+    # code at /auth/mfa/verify to obtain the full access+refresh pair.
+    mfa_challenge_ttl_seconds: int = 300  # 5 minutes
+    # TOTP issuer name shown in authenticator apps.
+    mfa_totp_issuer: str = "CivicSignals"
+
     # --- Google OAuth2 (B2) ---------------------------------------------------
     # Standard authorization-code flow (signed-state HMAC nonce; no PKCE).
     # Set GOOGLE_OAUTH_CLIENT_ID + SECRET to enable; leave unset (default) to

@@ -61,6 +61,7 @@ dependencies = [
     "opentelemetry-instrumentation-celery>=0.48b0",
     "prometheus-client>=0.21",
     "starlette-prometheus>=0.10",
+    "pyotp>=2.9.0",
 ]
 
 [project.optional-dependencies]

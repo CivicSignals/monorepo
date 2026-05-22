@@ -49,6 +49,15 @@ from .schemas import (
     AuthResponse,
     LoginRequest,
     MessageResponse,
+    MfaActivateResponse,
+    MfaDisableBody,
+    MfaEnrollBeginResponse,
+    MfaLoginVerifyBody,
+    MfaRegenerateCodesBody,
+    MfaRegenerateCodesResponse,
+    MfaRequiredResponse,
+    MfaStatusResponse,
+    MfaVerifyBody,
     PasswordResetConfirmBody,
     PasswordResetRequestBody,
     SignupRequest,
@@ -128,16 +137,30 @@ async def signup(body: SignupRequest, session: SessionDep, settings: SettingsDep
     )
 
 
-@router.post("/login", response_model=AuthResponse)
-async def login(body: LoginRequest, session: SessionDep, settings: SettingsDep) -> AuthResponse:
+@router.post("/login", response_model=AuthResponse | MfaRequiredResponse)
+async def login(
+    body: LoginRequest, session: SessionDep, settings: SettingsDep
+) -> AuthResponse | MfaRequiredResponse:
+    """Email+password login. When MFA is active returns an ``mfa_required`` challenge.
+
+    If the account has MFA enabled, the response is a :class:`MfaRequiredResponse`
+    (HTTP 200 with ``mfa_required: true``). The client must present the
+    ``challenge_token`` to ``POST /auth/mfa/verify`` with a TOTP/backup code.
+    A full :class:`AuthResponse` is only returned when MFA is not active.
+    """
     try:
-        user = await auth_services.authenticate(
+        user = await auth_services.authenticate_with_mfa_check(
             session,
             email=str(body.email),
             password=body.password,
             settings=settings,
         )
         await session.commit()
+    except auth_services.MfaRequiredError as exc:
+        # First factor succeeded; MFA is active — return the challenge token.
+        # Commit the touch_last_seen from authenticate() before returning.
+        await session.commit()
+        return MfaRequiredResponse(challenge_token=exc.challenge_token)
     except auth_services.InvalidCredentialsError as exc:
         await session.rollback()
         raise ProblemException(
@@ -436,6 +459,277 @@ async def revoke_personal_token(
 
 
 router.include_router(tokens_router)
+
+
+# ---------------------------------------------------------------------------
+# B4: MFA / TOTP endpoints
+# ---------------------------------------------------------------------------
+# All MFA endpoints are mounted under the existing ``/auth`` prefix:
+#   POST /api/v1/auth/mfa/enroll            — begin enrollment
+#   POST /api/v1/auth/mfa/enroll/verify     — activate (confirm live code)
+#   POST /api/v1/auth/mfa/verify            — second-factor login (challenge → tokens)
+#   GET  /api/v1/auth/mfa/status            — MFA status for current user
+#   POST /api/v1/auth/mfa/disable           — disable MFA (requires re-auth)
+#   POST /api/v1/auth/mfa/backup-codes/regenerate  — replace backup codes (re-auth)
+
+_mfa_router = APIRouter(prefix="/mfa", tags=["auth", "mfa"])
+
+
+def _mfa_problem(code: str, title: str, detail: str) -> ProblemException:
+    return ProblemException(
+        status=status.HTTP_400_BAD_REQUEST,
+        code=code,
+        title=title,
+        detail=detail,
+    )
+
+
+def _mfa_401(detail: str) -> ProblemException:
+    return ProblemException(
+        status=status.HTTP_401_UNAUTHORIZED,
+        code="mfa_invalid_code",
+        title="Invalid MFA code",
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@_mfa_router.post(
+    "/enroll",
+    response_model=MfaEnrollBeginResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Begin TOTP MFA enrollment — returns provisioning URI",
+)
+async def mfa_enroll_begin(
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> MfaEnrollBeginResponse:
+    """Start TOTP enrollment for the current user.
+
+    Generates a new TOTP secret, stores it encrypted (not yet activated), and
+    returns the ``otpauth://`` provisioning URI and base32 secret. The secret is
+    shown **once**; submit it to an authenticator app, then call
+    ``POST /auth/mfa/enroll/verify`` with a live code to activate.
+
+    Returns ``400`` if MFA is already activated.
+    """
+    try:
+        result = await auth_services.begin_mfa_enrollment(session, current_user, settings=settings)
+        await session.commit()
+    except auth_services.MfaAlreadyActiveError as exc:
+        await session.rollback()
+        raise _mfa_problem(
+            "mfa_already_active",
+            "MFA already active",
+            "MFA is already activated for this account. Disable it first to re-enroll.",
+        ) from exc
+    return MfaEnrollBeginResponse(totp_uri=result.totp_uri, secret=result.secret)
+
+
+@_mfa_router.post(
+    "/enroll/verify",
+    response_model=MfaActivateResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Activate MFA — confirm a live TOTP code, receive backup codes",
+)
+async def mfa_enroll_verify(
+    body: MfaVerifyBody,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> MfaActivateResponse:
+    """Confirm a live TOTP code and activate MFA for the current user.
+
+    On success: activates MFA and returns ``backup_codes`` — the one-time
+    plaintext recovery codes. These are shown **once**; the server stores only
+    their SHA-256 hashes.
+
+    Returns ``400`` on bad/expired code or if enrollment was not started.
+    """
+    try:
+        result = await auth_services.activate_mfa(
+            session, current_user, totp_code=body.code, settings=settings
+        )
+        await session.commit()
+    except auth_services.MfaNotActiveError as exc:
+        await session.rollback()
+        raise _mfa_problem(
+            "mfa_not_enrolled",
+            "MFA enrollment not started",
+            "Call POST /auth/mfa/enroll first.",
+        ) from exc
+    except auth_services.MfaAlreadyActiveError as exc:
+        await session.rollback()
+        raise _mfa_problem(
+            "mfa_already_active",
+            "MFA already active",
+            "MFA is already activated.",
+        ) from exc
+    except auth_services.MfaInvalidCodeError as exc:
+        await session.rollback()
+        raise _mfa_401("Invalid or expired TOTP code. Check your authenticator app.") from exc
+    return MfaActivateResponse(backup_codes=result.backup_codes)
+
+
+@_mfa_router.post(
+    "/verify",
+    response_model=AuthResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Complete MFA login — exchange challenge token + TOTP/backup code for tokens",
+)
+async def mfa_login_verify(
+    body: MfaLoginVerifyBody,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> AuthResponse:
+    """Complete the second factor of MFA login.
+
+    Accepts the short-lived ``challenge_token`` from the ``mfa_required`` login
+    response plus a TOTP code or backup code. On success issues a full
+    access+refresh token pair. Returns ``401`` on invalid/expired codes.
+    """
+    try:
+        user_id = auth_services.verify_mfa_challenge_token(body.challenge_token, settings=settings)
+    except auth_services.MfaChallengeTokenError as exc:
+        raise ProblemException(
+            status=status.HTTP_401_UNAUTHORIZED,
+            code="invalid_mfa_challenge",
+            title="Invalid or expired MFA challenge",
+            detail="The MFA challenge token is invalid or expired. Please log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    from civicsignals_api.modules.accounts import services as accounts_services
+
+    user = await accounts_services.get_user_by_id(session, user_id)
+    if user is None:
+        raise ProblemException(
+            status=status.HTTP_401_UNAUTHORIZED,
+            code="user_not_found",
+            title="User not found",
+            detail="The user associated with this challenge no longer exists.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        await auth_services.verify_mfa_code(session, user, code=body.code, settings=settings)
+        await session.commit()
+    except auth_services.MfaNotActiveError as exc:
+        await session.rollback()
+        raise ProblemException(
+            status=status.HTTP_400_BAD_REQUEST,
+            code="mfa_not_active",
+            title="MFA not active",
+            detail="MFA is not active for this account.",
+        ) from exc
+    except auth_services.MfaInvalidCodeError as exc:
+        await session.rollback()
+        raise _mfa_401("Invalid or expired MFA code.") from exc
+
+    # B9: emit login audit event (best-effort).
+    try:
+        await events.publish(AUTH_LOGIN, {"user_id": str(user.id), "email": user.email})
+    except Exception:
+        logger.warning("mfa_login_event_failed", user_id=str(user.id))
+
+    return AuthResponse(
+        user=UserOut.model_validate(user),
+        tokens=_token_pair(user.id, settings),
+    )
+
+
+@_mfa_router.get(
+    "/status",
+    response_model=MfaStatusResponse,
+    summary="MFA status for the current user",
+)
+async def mfa_status(
+    current_user: CurrentUser,
+    session: SessionDep,
+) -> MfaStatusResponse:
+    """Return whether MFA is active for the current user."""
+    credential = await auth_services.get_active_mfa_credential(session, current_user.id)
+    if credential is None:
+        return MfaStatusResponse(mfa_enabled=False)
+    return MfaStatusResponse(mfa_enabled=True, activated_at=credential.activated_at)
+
+
+@_mfa_router.post(
+    "/disable",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Disable MFA (requires a fresh TOTP or backup code)",
+)
+async def mfa_disable(
+    body: MfaDisableBody,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> MessageResponse:
+    """Disable MFA for the current user.
+
+    Requires a fresh TOTP or backup code as re-authentication. Clears the TOTP
+    secret and all backup codes. Returns ``400`` if MFA is not active, ``401``
+    on invalid code.
+    """
+    try:
+        await auth_services.disable_mfa(session, current_user, code=body.code, settings=settings)
+        await session.commit()
+    except auth_services.MfaNotActiveError as exc:
+        await session.rollback()
+        raise _mfa_problem(
+            "mfa_not_active",
+            "MFA not active",
+            "MFA is not currently active for this account.",
+        ) from exc
+    except auth_services.MfaInvalidCodeError as exc:
+        await session.rollback()
+        raise _mfa_401(
+            "Invalid or already-used code. Provide a fresh TOTP or backup code."
+        ) from exc
+    return MessageResponse(message="MFA disabled")
+
+
+@_mfa_router.post(
+    "/backup-codes/regenerate",
+    response_model=MfaRegenerateCodesResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Regenerate backup codes (requires re-auth; old codes are invalidated)",
+)
+async def mfa_regenerate_backup_codes(
+    body: MfaRegenerateCodesBody,
+    current_user: CurrentUser,
+    session: SessionDep,
+    settings: SettingsDep,
+) -> MfaRegenerateCodesResponse:
+    """Regenerate backup codes for the current user.
+
+    All existing backup codes are deleted; the new ones are returned once.
+    Requires a fresh TOTP or backup code as re-authentication. Returns ``400``
+    if MFA is not active, ``401`` on invalid code.
+    """
+    try:
+        codes = await auth_services.regenerate_backup_codes(
+            session, current_user, code=body.code, settings=settings
+        )
+        await session.commit()
+    except auth_services.MfaNotActiveError as exc:
+        await session.rollback()
+        raise _mfa_problem(
+            "mfa_not_active",
+            "MFA not active",
+            "MFA is not currently active for this account.",
+        ) from exc
+    except auth_services.MfaInvalidCodeError as exc:
+        await session.rollback()
+        raise _mfa_401(
+            "Invalid or already-used code. Provide a fresh TOTP or backup code."
+        ) from exc
+    return MfaRegenerateCodesResponse(backup_codes=codes)
+
+
+router.include_router(_mfa_router)
 
 
 # ---------------------------------------------------------------------------

@@ -6,13 +6,15 @@ Tables are prefixed ``auth_`` and are migrated only by this module
 hangs off it. For B1 that is the single-use email-verification token. B2 adds
 ``auth_oauth_identity`` to store provider/subject pairs for Google OAuth (and
 future providers). B3 (password reset) adds ``auth_password_reset_token`` here.
-B4 (MFA) adds its own ``auth_*`` table. B8 (API tokens) adds ``auth_api_token``
-— long-lived bearer credentials (workspace + personal access tokens, doc 08
-§1.3).
+B4 (MFA) adds ``auth_mfa_credential`` (Fernet-encrypted TOTP secret + flags) and
+``auth_mfa_backup_code`` (hashed single-use recovery codes). B8 (API tokens)
+adds ``auth_api_token`` — long-lived bearer credentials (workspace + personal
+access tokens, doc 08 §1.3).
 
 Tokens are never stored in cleartext: only a SHA-256 hash of the random token is
 persisted, so a database leak does not expose usable verification links or API
-keys (threat-model §4.2).
+keys (threat-model §4.2). The TOTP secret is Fernet-encrypted at rest (B4);
+backup-code hashes are SHA-256 digests (never reversible).
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import ARRAY, DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import ARRAY, Boolean, DateTime, Enum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -123,6 +125,79 @@ class PasswordResetToken(Base):
     token_hash: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MfaCredential(Base):
+    """TOTP MFA credential for a user (B4).
+
+    One row per user (at most). ``totp_secret_encrypted`` is a Fernet-encrypted
+    base32 TOTP secret — it must be decryptable to verify codes, so it is
+    symmetrically encrypted (unlike API tokens which are hashed). ``activated``
+    is False until the user confirms a live code; until then, MFA is not enforced
+    at login.
+
+    ``activated_at`` is set on the first successful verify-and-activate call.
+    The secret is **never returned** to the client after enrollment.
+    """
+
+    __tablename__ = "auth_mfa_credential"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_auth_mfa_credential_user"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Fernet-encrypted base32 TOTP secret (threat-model §4.2: encrypted at rest;
+    # the plaintext is shown once at enrollment and never again).
+    totp_secret_encrypted: Mapped[str] = mapped_column(String, nullable=False)
+    # True only after the user has verified a live TOTP code (enroll-verify step).
+    activated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class MfaBackupCode(Base):
+    """A single-use backup/recovery code for MFA (B4).
+
+    On activation, ~10 codes are generated. Only their SHA-256 hashes are stored.
+    ``used_at`` (non-null) marks a code consumed — it can never be used again.
+    When all codes are used the user should regenerate (POST /mfa/backup-codes/regenerate).
+
+    The ``mfa_credential_id`` FK links codes to the active MFA credential; all
+    codes are deleted when MFA is disabled (or when ``regenerate`` replaces the
+    set).
+    """
+
+    __tablename__ = "auth_mfa_backup_code"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+    mfa_credential_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("auth_mfa_credential.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # SHA-256 hex digest of the plaintext code (threat-model §4.2).
+    code_hash: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
