@@ -92,10 +92,11 @@ class OcrBackend(ABC):
 class FakeOcrBackend(OcrBackend):
     """Deterministic OCR backend for tests.
 
-    Returns ``page_text`` repeated once per page (or ``default_text`` when
-    ``pages`` is 0, meaning the page count isn't known until runtime — the
-    backend receives bytes it doesn't inspect).  Always succeeds; never
-    imports ``pytesseract`` or ``boto3``.
+    Returns ``page_text.format(n=page_num)`` for each page in the simulated
+    document.  ``simulated_page_count`` controls the total page count so
+    truncation logic (the 100-page cap + first-50 + last-25 strategy) can be
+    exercised without real PDFs.  The raw ``pdf_bytes`` argument is ignored.
+    Always succeeds; never imports ``pytesseract`` or ``boto3``.
     """
 
     page_text: str = "OCR extracted text for page {n}."
@@ -141,7 +142,7 @@ class TesseractBackend(OcrBackend):
 
     def run(self, pdf_bytes: bytes) -> OcrResult:
         try:
-            from pdf2image import convert_from_bytes
+            from pdf2image import convert_from_bytes, pdfinfo_from_bytes
         except ImportError:
             log.warning("extraction.ocr.pdf2image_unavailable")
             return OcrResult(text="", ocr_used=True, backend="tesseract", pages_processed=0)
@@ -152,22 +153,30 @@ class TesseractBackend(OcrBackend):
             log.warning("extraction.ocr.pytesseract_unavailable")
             return OcrResult(text="", ocr_used=True, backend="tesseract", pages_processed=0)
 
-        # Convert all pages to PIL images first to get the total page count.
+        # Use pdfinfo_from_bytes to get the page count cheaply, *before* rasterising
+        # any pages. For long PDFs the 100-page cap means we only convert the
+        # first-50 + last-25 pages; rasterising the full doc first would defeat that
+        # cap and potentially OOM the worker (doc 19 §2.2).
         try:
-            all_images = convert_from_bytes(pdf_bytes, dpi=self.dpi)
+            info = pdfinfo_from_bytes(pdf_bytes)
+            total = int(info.get("Pages", 0))
         except Exception as exc:
-            log.warning("extraction.ocr.pdf2image_failed", error=str(exc))
+            log.warning("extraction.ocr.pdfinfo_failed", error=str(exc))
             return OcrResult(text="", ocr_used=True, backend="tesseract", pages_processed=0)
 
-        total = len(all_images)
         pages_to_ocr = _select_pages(total)
         truncated = len(pages_to_ocr) < total
 
         parts: list[str] = []
         for page_num in pages_to_ocr:
-            img = all_images[page_num - 1]  # pages_to_ocr is 1-indexed
+            # Convert a single page at a time; pdf2image is 1-indexed via first_page/last_page.
             try:
-                page_text: str = pytesseract.image_to_string(img, lang=self.lang)
+                images = convert_from_bytes(
+                    pdf_bytes, dpi=self.dpi, first_page=page_num, last_page=page_num
+                )
+                if not images:
+                    continue
+                page_text: str = pytesseract.image_to_string(images[0], lang=self.lang)
                 if page_text.strip():
                     parts.append(page_text)
             except Exception as exc:
@@ -209,31 +218,40 @@ class TextractBackend(OcrBackend):
 
     def run(self, pdf_bytes: bytes) -> OcrResult:
         try:
-            from pdf2image import convert_from_bytes
+            from pdf2image import convert_from_bytes, pdfinfo_from_bytes
         except ImportError:
             log.warning("extraction.ocr.pdf2image_unavailable")
             return OcrResult(text="", ocr_used=True, backend="textract", pages_processed=0)
 
+        # Use pdfinfo_from_bytes to get the page count cheaply, *before* rasterising
+        # any pages. For long PDFs the 100-page cap means we only convert the
+        # first-50 + last-25 pages; rasterising the full doc first would defeat that
+        # cap and waste both CPU (rasterisation) and Textract API calls (doc 19 §2.2).
         try:
-            all_images = convert_from_bytes(pdf_bytes, dpi=self.dpi)
+            info = pdfinfo_from_bytes(pdf_bytes)
+            total = int(info.get("Pages", 0))
         except Exception as exc:
-            log.warning("extraction.ocr.pdf2image_failed", error=str(exc))
+            log.warning("extraction.ocr.pdfinfo_failed", error=str(exc))
             return OcrResult(text="", ocr_used=True, backend="textract", pages_processed=0)
 
         import boto3  # already a core dep (boto3>=1.35 in pyproject.toml)
 
         client = boto3.client("textract", region_name=self.region)
-        total = len(all_images)
         pages_to_ocr = _select_pages(total)
         truncated = len(pages_to_ocr) < total
 
         parts: list[str] = []
         for page_num in pages_to_ocr:
-            img = all_images[page_num - 1]
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG")
-            jpeg_bytes = buf.getvalue()
+            # Convert one page at a time; pdf2image first_page/last_page are 1-indexed.
             try:
+                images = convert_from_bytes(
+                    pdf_bytes, dpi=self.dpi, first_page=page_num, last_page=page_num
+                )
+                if not images:
+                    continue
+                buf = io.BytesIO()
+                images[0].save(buf, format="JPEG")
+                jpeg_bytes = buf.getvalue()
                 response: dict[str, object] = client.detect_document_text(
                     Document={"Bytes": jpeg_bytes}
                 )

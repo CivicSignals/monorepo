@@ -80,10 +80,15 @@ def test_select_pages_over_cap_structure() -> None:
     assert pages[50:] == list(range(176, 201))
 
 
-def test_select_pages_over_cap_no_duplicates() -> None:
-    """Dedup when last-25 block would overlap with first-50."""
-    # With 70 pages: first 50 = 1-50; last 25 starts at max(51, 70-25+1=46) = 51.
+def test_select_pages_no_duplicates_within_cap() -> None:
+    """Returned page list is always deduplicated, even when total ≤ 100.
+
+    With 70 pages the result is simply all 70 pages (no truncation), but the
+    dedup logic must still produce a list with no repeated entries regardless.
+    """
+    # 70 ≤ 100 → all pages returned; the set comparison confirms no duplicates.
     pages = _select_pages(70)
+    assert pages == list(range(1, 71))
     assert sorted(pages) == list(set(pages))  # no duplicates
 
 
@@ -265,14 +270,16 @@ def test_parse_document_ocr_not_truncated_at_cap(
 def test_parse_document_ocr_failure_is_non_fatal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OCR backend raising an exception → parse returns whatever text exists + ocr_used."""
+    """OCR backend raising an exception → parse returns the pdfplumber text + ocr_used=True."""
 
     class BrokenBackend(FakeOcrBackend):
         def run(self, pdf_bytes: bytes) -> OcrResult:
             raise RuntimeError("Tesseract not installed")
 
+    # pdfplumber returned some partial text (< 200 chars) — it should be preserved
+    # on OCR failure rather than silently discarded (doc 19 §2.2 best-effort).
     monkeypatch.setattr(
-        pipeline, "_parse_pdf", _make_parse_pdf_stub(text="", page_count=10)
+        pipeline, "_parse_pdf", _make_parse_pdf_stub(text="partial extract", page_count=10)
     )
     doc = _stored_doc()
     # Should not raise — the parse stage is non-fatal.
@@ -280,8 +287,8 @@ def test_parse_document_ocr_failure_is_non_fatal(
 
     assert parsed.ocr_used is True  # OCR was attempted
     assert parsed.ocr_truncated is False
-    # Whatever text pdfplumber returned (empty here) is kept.
-    assert parsed.text == ""
+    # The pdfplumber fallback text is preserved even when OCR fails.
+    assert parsed.text == "partial extract"
 
 
 def test_parse_document_non_pdf_no_ocr() -> None:

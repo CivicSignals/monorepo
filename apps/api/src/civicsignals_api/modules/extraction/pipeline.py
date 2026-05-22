@@ -195,7 +195,10 @@ def parse_document(
                 pages=page_count,
             )
             text, ocr_used, ocr_truncated = _run_ocr(
-                content, ocr_backend=ocr_backend, doc_id=str(doc.id)
+                content,
+                ocr_backend=ocr_backend,
+                doc_id=str(doc.id),
+                fallback_text=text,
             )
         elif len(text) < OCR_MIN_PDF_CHARS:
             # Short PDF but ≤ 5 pages — too small to bother with OCR; flag degraded
@@ -236,11 +239,14 @@ def _run_ocr(
     *,
     ocr_backend: OcrBackend | None,
     doc_id: str,
+    fallback_text: str = "",
 ) -> tuple[str, bool, bool]:
     """Invoke the OCR backend and return ``(text, ocr_used, ocr_truncated)``.
 
-    Non-fatal: a backend failure logs a warning and returns empty text with
-    ``ocr_used=True`` (the attempt was made) and ``ocr_truncated=False``.
+    Non-fatal: a backend failure (or a backend that returns empty text) falls back
+    to ``fallback_text`` (the pdfplumber extract, which was < 200 chars but possibly
+    non-empty) with ``ocr_used=True`` (the attempt was made) and ``ocr_truncated=False``.
+    This ensures pdfplumber text is never silently discarded.
     """
     backend = ocr_backend if ocr_backend is not None else get_ocr_backend()
     try:
@@ -253,11 +259,17 @@ def _run_ocr(
             ocr_truncated=result.ocr_truncated,
             chars=len(result.text),
         )
-        return result.text, result.ocr_used, result.ocr_truncated
+        # If the backend returned no text, preserve the original pdfplumber extract
+        # rather than silently discarding whatever it found (doc 19 §2.2 best-effort).
+        ocr_text = result.text if result.text.strip() else fallback_text
+        return ocr_text, result.ocr_used, result.ocr_truncated
     except Exception as exc:
         # Best-effort: OCR failure must not lose the document (doc 19 §2.2 §12.1).
-        log.warning("extraction.parse.ocr_failed", doc_id=doc_id, error=str(exc))
-        return "", True, False
+        # Include the stack trace so operators can diagnose backend issues.
+        log.warning(
+            "extraction.parse.ocr_failed", doc_id=doc_id, error=str(exc), exc_info=True
+        )
+        return fallback_text, True, False
 
 
 def _is_texty(content_type: str) -> bool:
