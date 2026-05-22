@@ -49,7 +49,7 @@ from civicsignals_api.llm_gateway import LLMGateway, get_gateway
 
 from .dedupe import merge_signal, window_for
 from .embedding import build_embedding_text
-from .models import EMBEDDING_DIM, Signal
+from .models import EMBEDDING_DIM, SIGNAL_STATUS_MERGED, Signal
 from .models_fuzzy_review import (
     REVIEW_STATUS_APPROVED,
     REVIEW_STATUS_PENDING,
@@ -301,6 +301,11 @@ async def apply_fuzzy_review(
             new_confidence=candidate.confidence,
             now=now,
         )
+        # Soft-delete the candidate: mark it ``merged`` so it no longer surfaces in
+        # list_signals / feed queries. The row is kept for the audit trail (its
+        # raw_document_ids have been folded into the surviving signal above).
+        candidate.status = SIGNAL_STATUS_MERGED
+        candidate.merged_into = matched.id
         await session.flush()
         review.status = REVIEW_STATUS_APPROVED
         log.info(

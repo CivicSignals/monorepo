@@ -70,6 +70,7 @@ from .fuzzy_dedupe import (
     run_fuzzy_dedupe,
 )
 from .models import (
+    SIGNAL_STATUS_MERGED,
     SIGNAL_STATUS_NEW,
     SIGNAL_STATUS_PENDING_REVIEW,
     Signal,
@@ -292,9 +293,13 @@ async def store_signal(
             now=now,
         )
         if fuzzy_result.auto_merged and fuzzy_result.matched_signal_id is not None:
-            # Auto-merge folded the new evidence into the surviving signal; return
-            # the matched (surviving) signal instead of the candidate row so callers
-            # always receive the authoritative deduped signal.
+            # Auto-merge folded the new evidence into the surviving signal; soft-delete
+            # the candidate row so it no longer surfaces in list_signals / feed queries.
+            # The row is kept for the audit trail (its raw_document_ids were merged into
+            # the surviving signal by run_fuzzy_dedupe → merge_signal above).
+            row.status = SIGNAL_STATUS_MERGED
+            row.merged_into = fuzzy_result.matched_signal_id
+            await session.flush()
             surviving = await session.get(Signal, fuzzy_result.matched_signal_id)
             if surviving is not None:
                 return surviving
@@ -466,7 +471,7 @@ async def list_signals(
     """
     limit = max(1, min(limit, MAX_LIMIT))
 
-    stmt = select(Signal)
+    stmt = select(Signal).where(Signal.status != SIGNAL_STATUS_MERGED)
     if entity_id is not None:
         stmt = stmt.where(Signal.entity_id == entity_id)
     if signal_type is not None:
@@ -508,6 +513,7 @@ __all__ = [
     "GRADUATION_COUNT",
     "HIGH_STAKES_TYPES",
     "MAX_LIMIT",
+    "SIGNAL_STATUS_MERGED",
     "PAYLOAD_BY_TYPE",
     "REVIEW_STATUS_APPROVED",
     "REVIEW_STATUS_PENDING",

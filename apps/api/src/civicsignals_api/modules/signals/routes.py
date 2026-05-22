@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.db import get_session
+from civicsignals_api.modules.auth.dependencies import RequireAdmin
 
 from . import services
 from .schemas import SignalPage, SignalRead
@@ -140,9 +141,6 @@ class FuzzyReviewDecisionIn(BaseModel):
 # Fuzzy-review endpoints (admin-gated; E10, doc 19 §7.4)
 # ---------------------------------------------------------------------------
 
-# TODO B7: add ``require_admin`` dependency once RBAC lands. The review endpoints
-# are internal tooling (validating the 0.92 threshold) and should be admin-only.
-
 
 @router.get(
     "/fuzzy-reviews",
@@ -150,6 +148,7 @@ class FuzzyReviewDecisionIn(BaseModel):
     summary="List fuzzy-dedupe review rows (admin)",
 )
 async def list_fuzzy_reviews(
+    ctx: RequireAdmin,
     session: SessionDep,
     signal_type: Annotated[str | None, Query(description="Filter by signal type.")] = None,
     status: Annotated[
@@ -187,6 +186,7 @@ async def list_fuzzy_reviews(
 )
 async def get_fuzzy_review(
     review_id: uuid.UUID,
+    ctx: RequireAdmin,
     session: SessionDep,
 ) -> FuzzyReviewRead | JSONResponse:
     """Fetch one fuzzy-review row by id (E10; doc 19 §7.4)."""
@@ -203,6 +203,7 @@ async def get_fuzzy_review(
 )
 async def approve_fuzzy_review(
     review_id: uuid.UUID,
+    ctx: RequireAdmin,
     session: SessionDep,
     body: Annotated[FuzzyReviewDecisionIn, Body(default_factory=FuzzyReviewDecisionIn)],
 ) -> FuzzyReviewRead | JSONResponse:
@@ -244,6 +245,7 @@ async def approve_fuzzy_review(
 )
 async def reject_fuzzy_review(
     review_id: uuid.UUID,
+    ctx: RequireAdmin,
     session: SessionDep,
     body: Annotated[FuzzyReviewDecisionIn, Body(default_factory=FuzzyReviewDecisionIn)],
 ) -> FuzzyReviewRead | JSONResponse:

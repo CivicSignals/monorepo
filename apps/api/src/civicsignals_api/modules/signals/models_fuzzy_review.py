@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, Index, String, Text, func
+from sqlalchemy import DateTime, Float, Index, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -69,7 +69,7 @@ class SignalFuzzyReview(Base):
 
     # Review lifecycle: pending → approved | rejected.
     status: Mapped[str] = mapped_column(
-        String(32), nullable=False, server_default=f"'{REVIEW_STATUS_PENDING}'"
+        String(32), nullable=False, server_default=text(f"'{REVIEW_STATUS_PENDING}'")
     )
 
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
