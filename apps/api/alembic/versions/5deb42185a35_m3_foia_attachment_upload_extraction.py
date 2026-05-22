@@ -1,7 +1,7 @@
 """M3 foia_attachment — uploaded FOIA response docs + extraction pipeline linkage.
 
 Revision ID: 5deb42185a35
-Revises: 479ad775f192
+Revises: b282915c8b8f
 Create Date: 2026-05-22 14:00:00.000000
 
 Adds the ``foia_attachment`` table (prefixed ``foia_``, owned by the foia module
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "5deb42185a35"
-down_revision: str | None = "479ad775f192"
+down_revision: str | None = "b282915c8b8f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
