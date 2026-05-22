@@ -84,6 +84,9 @@ async function renderProfile(
   vi.doMock("@/lib/public-entities-api", () => ({
     fetchPublicEntity: vi.fn().mockResolvedValue(entityOverride),
     fetchPublicEntityChildren: vi.fn().mockResolvedValue(childrenOverride),
+    // P1 additions — provide stubs so the updated page.tsx doesn't error
+    fetchPublicEntityContacts: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+    fetchPublicEntitySignals: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
     fetchPublicEntities: vi.fn(),
     fetchAllEntityIdsForSitemap: vi.fn().mockResolvedValue([]),
     DIRECTORY_REVALIDATE_SECONDS: 300,
@@ -217,6 +220,9 @@ describe("PublicEntityProfilePage", () => {
     vi.doMock("@/lib/public-entities-api", () => ({
       fetchPublicEntity: vi.fn().mockResolvedValue(null),
       fetchPublicEntityChildren: vi.fn().mockResolvedValue(EMPTY_CHILDREN),
+      // P1 additions
+      fetchPublicEntityContacts: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+      fetchPublicEntitySignals: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
       fetchPublicEntities: vi.fn(),
       fetchAllEntityIdsForSitemap: vi.fn().mockResolvedValue([]),
       DIRECTORY_REVALIDATE_SECONDS: 300,
