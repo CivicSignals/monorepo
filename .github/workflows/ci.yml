@@ -154,38 +154,53 @@ jobs:
         run: pnpm --filter @civicsignals/web test
 
   # ---------------------------------------------------------------------------
-  # E2E smoke (Playwright — QA-1). Runs @smoke-tagged specs on every PR.
+  # E2E smoke (Playwright — QA-1 + QA-5 browser matrix). Runs @smoke-tagged
+  # specs on every PR across Chromium, Firefox, and WebKit (Safari engine).
   # Covers the static marketing surface that exists today (landing page, /pricing,
   # nav, 404). CUF-1..9 fixme scaffolds auto-skip until feature tasks merge.
   #
-  # Blocking: the smoke subset targets reliable, stable pages. If it becomes
-  # flaky, investigate the root cause rather than setting continue-on-error.
+  # Browser matrix strategy (QA-5): strategy.matrix over [chromium, firefox,
+  # webkit] — each matrix leg runs as a separate job in parallel, builds the
+  # Next.js app independently, installs its own browser binary with OS deps,
+  # and uploads a per-browser Playwright report artifact. The three legs run
+  # concurrently so total wall-clock time is roughly one browser's worth.
+  #
+  # NON-BLOCKING: continue-on-error: true is intentional — this is a slow CI
+  # job (web build + browser install per leg) and concurrency cancel-in-progress
+  # frequently cancels it on rebases/force-pushes. WebKit system deps may also
+  # be absent on minimal runners. Real coverage lives in the nightly full suite
+  # (e2e-nightly.yml). Do NOT remove continue-on-error until the browser cache
+  # is stable and all legs complete consistently.
+  #
+  # Mobile-viewport sanity: manual only (QA-5 scope decision). To test locally,
+  # add a mobile project to playwright.config.ts (e.g. `devices['Pixel 5']`)
+  # and run `playwright test --project=<mobile-project-name>` before any
+  # responsive-layout change.
   # ---------------------------------------------------------------------------
   e2e-smoke:
     name: E2E smoke
     runs-on: ubuntu-latest
-    # NON-BLOCKING during the rapid build-out: the @smoke specs themselves pass,
-    # but this is the slowest CI job (web build + chromium install) so the
-    # concurrency cancel-in-progress frequently cancels it on rebases/force-pushes,
-    # making it look red on PRs. Keep it running for visibility but don't let it
-    # gate merges. Real coverage lives in the nightly full suite (e2e-nightly.yml).
-    # TODO QA-5: restore as a required gate once the web UI + browser caching stabilize.
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Node + pnpm
         uses: ./.github/actions/setup-node-pnpm
 
-      # Cache the Playwright browser binaries so the chromium install (the slow
-      # step) is a no-op on cache hit — keeps this job fast enough to finish
-      # before a superseding push cancels it.
+      # Cache the Playwright browser binaries keyed per browser so each matrix
+      # leg is a cache hit after the first successful run. Cache key includes
+      # the pnpm-lock.yaml hash so a Playwright version bump invalidates it.
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          key: playwright-${{ matrix.browser }}-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: |
+            playwright-${{ matrix.browser }}-${{ runner.os }}-
             playwright-chromium-${{ runner.os }}-
 
       # Build the Next.js app so `next start` serves the production bundle.
@@ -194,30 +209,32 @@ jobs:
       - name: Build web app
         run: pnpm --filter @civicsignals/web build
 
-      # Install only Chromium (the smoke project target). Firefox + Safari are
-      # added by QA-5 (browser matrix). --with-deps installs OS-level libs.
-      - name: Install Playwright Chromium
+      # Install the browser for this matrix leg plus OS-level deps.
+      # WebKit deps (libwoff2, libflite, libhyphen, etc.) may be absent on
+      # minimal runners — the job is non-blocking (continue-on-error: true)
+      # so a webkit dep failure does not gate merges.
+      - name: Install Playwright ${{ matrix.browser }}
         working-directory: apps/web
-        run: pnpm exec playwright install --with-deps chromium
+        run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
 
-      # Run the smoke project (grep: @smoke). The Playwright config starts the
-      # web server automatically via the webServer block; PLAYWRIGHT_START_CMD
-      # overrides the default `pnpm dev` to use the pre-built standalone output
-      # (Next.js 15 with output: standalone produces .next/standalone/apps/web/server.js).
-      - name: Run Playwright smoke specs
+      # Run the smoke project for this browser engine (grep: @smoke).
+      # The Playwright config starts the web server automatically via the
+      # webServer block; PLAYWRIGHT_START_CMD overrides the default `pnpm dev`
+      # to use the pre-built standalone output (Next.js 15 standalone mode).
+      - name: Run Playwright smoke specs (${{ matrix.browser }})
         working-directory: apps/web
         env:
           CI: "true"
           PLAYWRIGHT_START_CMD: "node .next/standalone/apps/web/server.js"
-        run: pnpm e2e:smoke
+        run: pnpm exec playwright test --project=${{ matrix.browser }}-smoke
 
       # Always upload traces/screenshots on failure so they're downloadable
       # from the GH Actions run page even if the job fails.
-      - name: Upload Playwright report
+      - name: Upload Playwright report (${{ matrix.browser }})
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-smoke-report
+          name: playwright-smoke-report-${{ matrix.browser }}
           path: apps/web/playwright-report/
           retention-days: 7
 
