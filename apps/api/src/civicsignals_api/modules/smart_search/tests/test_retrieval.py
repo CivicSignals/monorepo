@@ -47,6 +47,7 @@ from civicsignals_api.modules.smart_search.services import (
     HybridRetriever,
     _decode_offset_cursor,
     _encode_offset_cursor,
+    _has_enforceable_filter,
     _merge_filters,
     fuse_rankings,
 )
@@ -206,6 +207,18 @@ def test_merge_filters_unions_lists_and_overrides_scalars() -> None:
 def test_merge_filters_none_extra_returns_base() -> None:
     base = SearchFilters(signal_type=["rfp_posted"])
     assert _merge_filters(base, None) is base
+
+
+def test_enforceable_filter_only_for_sql_backed_fields() -> None:
+    # Enforced today: signal_type / status / date.
+    assert _has_enforceable_filter(SearchFilters(signal_type=["rfp_posted"]))
+    assert _has_enforceable_filter(SearchFilters(status=["new"]))
+    assert _has_enforceable_filter(SearchFilters(published_at_gte=dt.date(2026, 1, 1)))
+    # Not yet enforceable (entity join / F3) -> not a real intersection gate.
+    assert not _has_enforceable_filter(SearchFilters(state=["WA"]))
+    assert not _has_enforceable_filter(SearchFilters(entity_kind=["k12_district"]))
+    assert not _has_enforceable_filter(SearchFilters(min_score=0.5))
+    assert not _has_enforceable_filter(SearchFilters())
 
 
 # =========================================================================

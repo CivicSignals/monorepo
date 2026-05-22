@@ -576,8 +576,14 @@ class HybridRetriever:
         retrieval is the entity-resolution join that lands with F3/E10. The state
         codes are still echoed back in the response's structured query.
         # TODO E10/F3: join entities_entity for the state/geo filter.
+
+        The gate keys off whether a *currently-enforceable* filter is set
+        (signal_type / status / date), **not** ``is_empty()``: a query whose only
+        filter is one we cannot yet enforce (state / entity_kind / min_score) must
+        return ``None`` (do not intersect) — intersecting with an unordered, capped
+        "all rows" set would wrongly drop valid vector/BM25 hits outside the cap.
         """
-        if filters.is_empty():
+        if not _has_enforceable_filter(filters):
             return None
         stmt = _apply_filters(select(Signal.id), filters).limit(limit)
         rows = (await session.execute(stmt)).scalars().all()
@@ -647,6 +653,23 @@ def _merge_filters(base: SearchFilters, extra: SearchFilters | None) -> SearchFi
     except ValidationError:
         log.info("smart_search.merge_filters.incoherent", exc_info=True)
         return extra
+
+
+def _has_enforceable_filter(filters: SearchFilters) -> bool:
+    """Whether ``filters`` constrains a column ``_apply_filters`` actually enforces.
+
+    Only ``signal_type`` / ``status`` / the date range map to ``signals_signal``
+    columns today (``_apply_filters``). ``state`` / ``entity_kind`` need the entity
+    join and ``min_score`` needs F3, so a filter-set containing *only* those is not
+    yet a real intersection — the structured-filter retriever returns ``None`` for it
+    (see :meth:`HybridRetriever._filter_ids`).
+    """
+    return bool(
+        filters.signal_type
+        or filters.status
+        or filters.published_at_gte is not None
+        or filters.published_at_lt is not None
+    )
 
 
 def _apply_filters(stmt: Any, filters: SearchFilters) -> Any:
