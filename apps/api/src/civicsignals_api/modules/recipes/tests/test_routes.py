@@ -95,6 +95,24 @@ def test_preview_bad_input_combo_400(client: TestClient) -> None:
     assert resp.headers["content-type"].startswith("application/problem+json")
 
 
+def test_preview_fetch_failure_maps_to_502(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A FetchFailedError from the service maps to a 502 by exception *type*
+    # (no message-prefix matching).
+    from civicsignals_api.modules.recipes import services
+    from civicsignals_api.modules.recipes.runner import FetchFailedError
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise FetchFailedError("https://example.gov/x", "connection refused")
+
+    monkeypatch.setattr(services, "preview_recipe", _boom)
+    resp = client.post(PREVIEW_PATH, json={"recipe_yaml": INLINE_RECIPE, "url": "https://x"})
+    assert resp.status_code == 502
+    assert resp.headers["content-type"].startswith("application/problem+json")
+    assert resp.json()["title"] == "Upstream fetch failed"
+
+
 def test_preview_staff_gate_token_required(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.setenv("RECIPE_PREVIEW_STAFF_TOKEN", "s3cr3t")

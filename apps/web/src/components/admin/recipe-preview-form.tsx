@@ -4,7 +4,7 @@
 // Server state (the preview call) is owned by TanStack Query (useMutation), per
 // doc 06 §2 — never Zustand. Client-only form state is local component state.
 import { useMutation } from "@tanstack/react-query";
-import { useState } from "react";
+import { type FormEvent, useState } from "react";
 import {
   type PreviewFormState,
   type PreviewResult,
@@ -72,7 +72,7 @@ export function RecipePreviewForm({
     setState((prev) => ({ ...prev, [key]: val }));
   }
 
-  function onSubmit(event: React.FormEvent) {
+  function onSubmit(event: FormEvent) {
     event.preventDefault();
     mutation.mutate(state);
   }

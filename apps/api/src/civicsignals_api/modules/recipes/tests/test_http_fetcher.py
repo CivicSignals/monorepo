@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from civicsignals_api.modules.recipes.http_fetcher import HttpxFetcher
-from civicsignals_api.modules.recipes.runner import RecipeError
+from civicsignals_api.modules.recipes.runner import FetchFailedError
 
 UA = "CivicSignalsBot/1.0"
 
@@ -60,9 +60,9 @@ def test_robots_txt_transport_error_is_none() -> None:
         assert fetcher.robots_txt("https://example.gov/x", user_agent=UA) is None
 
 
-def test_fetch_transport_error_raises_recipe_error() -> None:
+def test_fetch_transport_error_raises_fetch_failed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("boom")
 
-    with HttpxFetcher(client=_client(handler)) as fetcher, pytest.raises(RecipeError):
+    with HttpxFetcher(client=_client(handler)) as fetcher, pytest.raises(FetchFailedError):
         fetcher.fetch("https://example.gov/x", user_agent=UA, max_redirects=5)

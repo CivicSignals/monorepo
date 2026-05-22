@@ -18,7 +18,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .runner import RecipeError
+from .runner import FetchFailedError
 
 DEFAULT_TIMEOUT_SECONDS = 20.0
 
@@ -66,7 +66,7 @@ class HttpxFetcher:
                 follow_redirects=True,
             )
         except httpx.HTTPError as exc:
-            raise RecipeError(f"failed to fetch {url!r}: {exc}") from exc
+            raise FetchFailedError(url, str(exc)) from exc
         return response.status_code, response.text, dict(response.headers)
 
     def robots_txt(self, url: str, *, user_agent: str) -> str | None:

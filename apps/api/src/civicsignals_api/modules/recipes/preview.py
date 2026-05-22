@@ -30,8 +30,6 @@ from .runner import (
     RecipeError,
     RecipeRunner,
     RequiredFieldMissingError,
-    _extract_field,
-    _parse_html,
 )
 from .schemas import (
     CanonicalRecord,
@@ -63,20 +61,19 @@ class _PreviewNoopFetcher:
         return None
 
 
-def _field_previews(recipe: Recipe, html: str) -> list[FieldPreview]:
-    """Compute a per-field diagnostic view over ``html``.
+def _field_previews(recipe: Recipe, values: dict[str, str | None]) -> list[FieldPreview]:
+    """Build the per-field diagnostic view from extracted ``values``.
 
-    We re-evaluate each field's *primary* selector (index 0) the same way the
-    runner does — via the runner's own ``_extract_field`` over a shared soup —
-    so the preview can attribute a missing value to the selector that produced
-    it without duplicating extraction logic. Fallback-selector attribution is
-    D11's concern; until then we surface the full ordered selector list so an
-    author can see what *would* be tried.
+    ``values`` comes from the runner's public :meth:`RecipeRunner.field_values`
+    (one value per declared field), so the preview stays on a supported runner
+    surface rather than the extraction internals (D11's domain). We pair each
+    value with its :class:`FieldSpec` (which the recipe exposes publicly) to
+    surface required-ness, the read attribute, and the ordered selector list an
+    author would debug against.
     """
-    soup = _parse_html(html)
     previews: list[FieldPreview] = []
     for name, spec in recipe.fields.items():
-        value = _extract_field(soup, spec)
+        value = values.get(name)
         previews.append(
             FieldPreview(
                 name=name,
@@ -99,8 +96,8 @@ def preview_html(recipe: Recipe, html: str, *, source_url: str = HTML_SOURCE_URL
     see, so we capture the :class:`RequiredFieldMissingError` into the result's
     ``error`` rather than raising. ``ok`` is ``False`` in that case.
     """
-    fields = _field_previews(recipe, html)
     runner = RecipeRunner(recipe, _PreviewNoopFetcher())
+    fields = _field_previews(recipe, runner.field_values(html))
 
     error: str | None = None
     records: list[CanonicalRecord] = []

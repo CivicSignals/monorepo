@@ -15,7 +15,12 @@ from civicsignals_api.modules.recipes import preview as preview_mod
 from civicsignals_api.modules.recipes import scaffold as scaffold_mod
 from civicsignals_api.modules.recipes import services
 from civicsignals_api.modules.recipes.cli import main as cli_main
-from civicsignals_api.modules.recipes.runner import RecipeError, RobotsDisallowedError
+from civicsignals_api.modules.recipes.runner import (
+    FetchFailedError,
+    RecipeError,
+    RecipeNotFoundError,
+    RobotsDisallowedError,
+)
 
 VALID_RECIPE_YAML = """\
 recipe_id: temp-recipe
@@ -131,6 +136,35 @@ def test_preview_url_honors_robots() -> None:
     fetcher = _StaticFetcher(LISTING_HTML, robots="User-agent: *\nDisallow: /private/\n")
     with pytest.raises(RobotsDisallowedError):
         preview_mod.preview_url(recipe, "https://example.gov/private/rfp", fetcher)
+
+
+def test_preview_url_propagates_fetch_failure() -> None:
+    class _FailingFetcher:
+        def fetch(
+            self, url: str, *, user_agent: str, max_redirects: int
+        ) -> tuple[int, str, dict[str, str]]:
+            raise FetchFailedError(url, "boom")
+
+        def robots_txt(self, url: str, *, user_agent: str) -> str | None:
+            return None
+
+    recipe = services.parse_recipe_yaml(VALID_RECIPE_YAML)
+    with pytest.raises(FetchFailedError):
+        preview_mod.preview_url(recipe, "https://example.gov/x", _FailingFetcher())
+
+
+def test_runner_field_values_is_public_and_non_raising() -> None:
+    # The public per-field surface the preview consumes — returns a value per
+    # declared field (None for a miss), never raising on a missing required.
+    recipe = services.parse_recipe_yaml(VALID_RECIPE_YAML)
+    runner = services.make_runner(recipe, _StaticFetcher(LISTING_HTML))
+    values = runner.field_values("<html><body><p>nothing</p></body></html>")
+    assert values == {"title": None, "due_date": None}
+
+
+def test_load_unknown_recipe_raises_not_found() -> None:
+    with pytest.raises(RecipeNotFoundError):
+        services.load_recipe("definitely-not-a-recipe")
 
 
 # ---------------------------------------------------------------------------
