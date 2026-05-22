@@ -1,0 +1,57 @@
+# Grafana data source provisioning (A6).
+#
+# Auto-loaded by Grafana at startup from GF_PATHS_PROVISIONING. URLs use the
+# Compose service DNS names + container ports from infra/docker-compose.yml.
+# Prometheus is the default data source. Tempo is linked to Loki so a span's
+# trace can pivot to the matching logs.
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    # prometheus service listens on its default :9090.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    # loki serves its HTTP API on :3100 (the grafana/loki default config).
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      # Turn a log line's `traceId` field into a clickable link to Tempo.
+      derivedFields:
+        - name: traceID
+          matcherRegex: '"trace_id":"(\w+)"'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    # tempo query_frontend HTTP listens on :3200 (see the inline tempo config
+    # in docker-compose.yml).
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      # Pivot from a trace to the related Loki logs by trace_id.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: '-1h'
+        spanEndTimeShift: '1h'
+        filterByTraceID: true
+        tags:
+          - key: service.name
+            value: service
+      nodeGraph:
+        enabled: true

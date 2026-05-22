@@ -1,0 +1,21 @@
+# Grafana dashboard provider (A6).
+#
+# A file-based provider that loads every dashboard JSON found under the mounted
+# path. The container path matches the bind mount in infra/docker-compose.yml.
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+apiVersion: 1
+
+providers:
+  - name: civicsignals
+    orgId: 1
+    folder: CivicSignals
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      # Grafana loads *.json from this directory (mounted read-only).
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false
