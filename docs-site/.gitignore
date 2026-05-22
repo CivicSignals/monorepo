@@ -1,0 +1,4 @@
+# Docusaurus generated files
+.docusaurus/
+build/
+node_modules/
