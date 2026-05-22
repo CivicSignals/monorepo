@@ -26,6 +26,7 @@ from .policy import DEFAULT_TASK_MODELS, KNOWN_PROVIDERS, ModelChoice, TaskModel
 from .types import (
     TASK_CLASSIFY,
     TASK_EXTRACTION,
+    TASK_SMART_SEARCH_REWRITE,
     TASK_SUMMARY,
     TASK_TRANSLATE,
     BackendNotAvailableError,
@@ -41,6 +42,7 @@ __all__ = [
     "KNOWN_PROVIDERS",
     "TASK_CLASSIFY",
     "TASK_EXTRACTION",
+    "TASK_SMART_SEARCH_REWRITE",
     "TASK_SUMMARY",
     "TASK_TRANSLATE",
     "AnthropicBackend",

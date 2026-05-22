@@ -17,6 +17,10 @@ TASK_CLASSIFY = "classify"
 TASK_EXTRACTION = "extraction"
 TASK_SUMMARY = "summary"
 TASK_TRANSLATE = "translate"
+# Smart-search NL->structured query rewrite (doc 08 §3.2/§3.3, TODO I2). A small,
+# cheap, low-latency call on the user's search box, so it routes to a Haiku-class
+# model just like classification.
+TASK_SMART_SEARCH_REWRITE = "smart_search_rewrite"
 
 
 @dataclass(frozen=True)

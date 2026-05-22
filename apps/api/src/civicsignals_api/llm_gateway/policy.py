@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from .types import (
     TASK_CLASSIFY,
     TASK_EXTRACTION,
+    TASK_SMART_SEARCH_REWRITE,
     TASK_SUMMARY,
     TASK_TRANSLATE,
 )
@@ -38,6 +39,7 @@ DEFAULT_TASK_MODELS: dict[str, ModelChoice] = {
     TASK_EXTRACTION: ModelChoice("anthropic", "claude-3-5-sonnet-latest"),
     TASK_SUMMARY: ModelChoice("anthropic", "claude-3-5-sonnet-latest"),
     TASK_TRANSLATE: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
+    TASK_SMART_SEARCH_REWRITE: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
 }
 
 
