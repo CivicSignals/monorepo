@@ -216,6 +216,29 @@ class Settings(BaseSettings):
     recipe_schema_dir: str | None = None
     recipes_dir: str | None = None
 
+    # --- Recipe drift detection (E7; doc 18 §3.2) ---------------------------
+    # Rolling per-recipe metrics auto-pause a recipe whose extraction success rate
+    # drops below ``drift_extraction_success_threshold`` (24h window) and the LLM
+    # fallback rate over ``drift_llm_fallback_threshold`` (7d) is surfaced as a
+    # degradation alert. Auto-pause stops new runs (D4's scheduler skips paused
+    # recipes); past signals stay visible (doc 18 §3.2). Thresholds are guesses we
+    # tune from real baselines (doc 18 §8) — hence configurable, not hard-coded.
+    drift_extraction_success_threshold: float = 0.5
+    drift_llm_fallback_threshold: float = 0.2
+    # A recipe needs at least this many recorded runs in the window before
+    # auto-pause can fire — a recipe with one bad run shouldn't trip on noise
+    # (doc 18 §8: low-volume recipes false-alarm).
+    drift_min_runs_for_pause: int = 3
+
+    # GitHub auto-issue on auto-pause (doc 18 §3.2). When ``github_token`` is unset
+    # the issue-opener is a no-op (dev / self-host without a token): drift still
+    # pauses the recipe, it just doesn't file an issue. ``github_repo`` is
+    # ``owner/name`` (defaults to the recipes repo). The token needs ``issues:write``
+    # on that repo. Injectable/mockable via ``recipes.services.override_github_client``.
+    github_token: str | None = None
+    github_repo: str = "CivicSignals/monorepo"
+    github_api_base_url: str = "https://api.github.com"
+
     # --- Headless browser fetcher (D2; doc 18 §1 cat. D, §4 "Headless browser") -
     # The Playwright-backed fetcher (``http_browser`` connector) renders JS-heavy
     # pages the static fetcher can't. It runs only on ``worker_ingest`` (the lean

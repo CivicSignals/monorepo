@@ -23,10 +23,31 @@ from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from civicsignals_api.config import get_settings as _get_settings
+
+from .drift import (
+    WINDOW_7D_HOURS,
+    WINDOW_24H_HOURS,
+    build_run_outcome,
+    clear_drift_state,
+    compute_rolling_metrics,
+    evaluate_recipe_drift,
+    evaluation_subjects,
+    get_drift_state,
+    list_recipe_ids_with_runs,
+    record_drift_pause,
+    record_run_outcome,
+    rollup_metrics,
+)
 from .fixtures import (
     list_recipe_ids,
     replay_fixture,
     replay_recipe,
+)
+from .github_client import (
+    GitHubClient,
+    HttpxGitHubClient,
+    NoopGitHubClient,
 )
 from .http_fetcher import HttpxFetcher
 from .models import DeadLetter
@@ -56,6 +77,8 @@ from .schemas import (
     CanonicalRecord,
     DeadLetterEntry,
     DriftCounters,
+    DriftEvaluation,
+    DriftStateRecord,
     ExtractedDocument,
     FieldExtraction,
     FieldPreview,
@@ -63,6 +86,8 @@ from .schemas import (
     PreviewRequest,
     PreviewResult,
     Recipe,
+    RollingMetrics,
+    RunOutcome,
     SourcePointer,
 )
 
@@ -115,6 +140,35 @@ def run_pointers(
     """
     runner = RecipeRunner(recipe, fetcher, clock=clock, llm_extractor=llm_extractor)
     return runner.run_pointers(pointers)
+
+
+def run_pointers_with_outcome(
+    recipe: Recipe,
+    fetcher: Fetcher,
+    pointers: Sequence[SourcePointer],
+    *,
+    clock: Clock | None = None,
+    llm_extractor: LLMFieldExtractor | None = None,
+    wall_clock_seconds: float | None = None,
+) -> tuple[list[CanonicalRecord], RunOutcome]:
+    """Run pointers and also build the E7 :class:`RunOutcome` from the result.
+
+    The drift-recording seam (doc 18 §3.2): runs the same lifecycle as
+    :func:`run_pointers` but threads out each per-document extraction and folds the
+    D11 drift counters into a per-run outcome — *without* re-running the chain or
+    editing the pipeline stages. The ingest worker (D4) records the returned outcome
+    via :func:`record_run_outcome` so the rolling-window drift detection has data.
+    """
+    runner = RecipeRunner(recipe, fetcher, clock=clock, llm_extractor=llm_extractor)
+    records, extractions = runner.run_pointers_collecting_extractions(pointers)
+    outcome = build_run_outcome(
+        recipe.recipe_id,
+        extractions,
+        recipe_version=recipe.version,
+        signals_produced=len(records),
+        wall_clock_seconds=wall_clock_seconds,
+    )
+    return records, outcome
 
 
 def run_recipe_file(
@@ -237,12 +291,53 @@ def preview_recipe(
         return preview_url(recipe, request.url, live_fetcher)
 
 
+# ----------------------------------------------------------------------------
+# Recipe drift: GitHub auto-issue client seam (doc 18 §3.2, TODO E7)
+# ----------------------------------------------------------------------------
+
+# Mirrors billing's Stripe-client seam: a process-level client, config-gated to a
+# no-op when ``GITHUB_TOKEN`` is unset, overridable in tests. The drift beat task
+# resolves the client through :func:`get_github_client` and injects it into
+# :func:`evaluate_recipe_drift`, so the LLM/network boundary stays injectable.
+_github_client_override: GitHubClient | None = None
+
+
+def get_github_client() -> GitHubClient:
+    """Return the GitHub issue-opener (real when configured, else a no-op).
+
+    No-op when ``GITHUB_TOKEN`` is unset (dev / self-host) — auto-pause still
+    happens, no issue is filed (doc 18 §3.2). Tests inject a recording fake via
+    :func:`override_github_client`. Not cached across calls so a settings change
+    (token added) takes effect; the default client is cheap to construct.
+    """
+    if _github_client_override is not None:
+        return _github_client_override
+    settings = _get_settings()
+    if not settings.github_token:
+        return NoopGitHubClient()
+    return HttpxGitHubClient(
+        settings.github_token,
+        settings.github_repo,
+        api_base_url=settings.github_api_base_url,
+    )
+
+
+def override_github_client(client: GitHubClient | None) -> None:
+    """Inject a GitHub client (recording fake in tests), or reset with ``None``."""
+    global _github_client_override
+    _github_client_override = client
+
+
 __all__ = [
+    "WINDOW_7D_HOURS",
+    "WINDOW_24H_HOURS",
     "CanonicalRecord",
     "Clock",
     "DeadLetter",
     "DeadLetterEntry",
     "DriftCounters",
+    "DriftEvaluation",
+    "DriftStateRecord",
     "ExtractedDocument",
     "FetchFailedError",
     "Fetcher",
@@ -250,8 +345,11 @@ __all__ = [
     "FieldPreview",
     "FixtureReplayResult",
     "GatewayFieldExtractor",
+    "GitHubClient",
     "HttpxFetcher",
+    "HttpxGitHubClient",
     "LLMFieldExtractor",
+    "NoopGitHubClient",
     "PreviewRequest",
     "PreviewResult",
     "RealClock",
@@ -262,11 +360,22 @@ __all__ = [
     "RecipeValidationError",
     "RequiredFieldMissingError",
     "RobotsDisallowedError",
+    "RollingMetrics",
+    "RunOutcome",
     "SourcePointer",
+    "build_run_outcome",
+    "clear_drift_state",
+    "compute_rolling_metrics",
+    "evaluate_recipe_drift",
+    "evaluation_subjects",
+    "get_drift_state",
+    "get_github_client",
     "list_recipe_ids",
+    "list_recipe_ids_with_runs",
     "load_recipe",
     "load_recipe_file",
     "make_runner",
+    "override_github_client",
     "parse_recipe",
     "parse_recipe_yaml",
     "persist_dead_letters",
@@ -274,10 +383,14 @@ __all__ = [
     "preview_recipe",
     "preview_url",
     "recipes_dir",
+    "record_drift_pause",
+    "record_run_outcome",
     "render_recipe",
     "replay_fixture",
     "replay_recipe",
+    "rollup_metrics",
     "run_pointers",
+    "run_pointers_with_outcome",
     "run_recipe",
     "run_recipe_file",
     "scaffold_recipe",

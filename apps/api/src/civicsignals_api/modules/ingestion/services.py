@@ -19,6 +19,7 @@ extraction chain reads stored documents back through).
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Sequence
 from datetime import datetime
@@ -33,6 +34,7 @@ from civicsignals_api.modules.recipes.services import (
     Clock,
     Fetcher,
     LLMFieldExtractor,
+    RunOutcome,
     load_recipe,
 )
 
@@ -78,6 +80,10 @@ def crawl_recipe_with_connector(
     the ordered extract fallback chain (doc 18 §2.2, §3.4). This is the entry point
     the scheduler/ingest worker uses (TODO D4 wires the raw-doc persistence loop +
     crawl-run bookkeeping on top).
+
+    Records-only: the normal crawl path uses the runner's ``run_pointers`` (no
+    per-document :class:`ExtractedDocument`s retained). The E7 drift-recording path
+    that needs the per-run outcome is :func:`crawl_recipe_recording_drift`.
     """
     recipe = load_recipe(recipe_id)
     connector = connector_for(recipe, clock=clock)
@@ -91,6 +97,45 @@ def crawl_recipe_with_connector(
         close = getattr(fetcher, "close", None)
         if callable(close):
             close()
+
+
+async def crawl_recipe_recording_drift(
+    session: AsyncSession,
+    recipe_id: str,
+    seed_urls: Sequence[str],
+    *,
+    clock: Clock | None = None,
+    llm_extractor: LLMFieldExtractor | None = None,
+) -> list[CanonicalRecord]:
+    """Crawl a recipe and record its per-run outcome for drift detection (E7).
+
+    The completion hook (doc 18 §3.2): runs the connector lifecycle through the
+    runner's *outcome-collecting* path (``run_pointers_with_outcome`` →
+    ``RecipeRunner.run_pointers_collecting_extractions``), then records the resulting
+    :class:`RunOutcome` — built from the run's per-document extractions + D11 drift
+    counters, not by editing the pipeline stages — so the rolling-window drift
+    detector has data per run. Only this drift-aware path pays for retaining the
+    extractions; the normal :func:`crawl_recipe_with_connector` stays records-only.
+    Times the wall clock around the run for the per-recipe wall-clock metric. The
+    caller owns the transaction (this flushes, not commits). The D4 ingest worker
+    calls this instead of :func:`crawl_recipe_with_connector` once it is wired.
+    """
+    recipe = load_recipe(recipe_id)
+    connector = connector_for(recipe, clock=clock)
+    fetcher = connector.build_fetcher()
+    started = time.monotonic()
+    try:
+        pointers = connector.discover(seed_urls)
+        records, outcome = recipes_services.run_pointers_with_outcome(
+            recipe, fetcher, pointers, clock=clock, llm_extractor=llm_extractor
+        )
+    finally:
+        close = getattr(fetcher, "close", None)
+        if callable(close):
+            close()
+    outcome = outcome.model_copy(update={"wall_clock_seconds": time.monotonic() - started})
+    await recipes_services.record_run_outcome(session, outcome)
+    return records
 
 
 async def store_raw_document(
@@ -390,8 +435,10 @@ __all__ = [
     "RawDocumentRef",
     "RawDocumentStorage",
     "RecipeScheduleState",
+    "RunOutcome",
     "StoredRawDocument",
     "crawl_recipe",
+    "crawl_recipe_recording_drift",
     "crawl_recipe_with_connector",
     "get_or_create_recipe_schedule",
     "get_raw_document",
