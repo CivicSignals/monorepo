@@ -55,3 +55,18 @@ test: ## Run all tests via Turborepo
 .PHONY: typecheck
 typecheck: ## Type-check everything via Turborepo
 	pnpm typecheck
+
+.PHONY: notice
+notice: ## Regenerate NOTICE.md from the API runtime dependency tree (TODO A3)
+	./scripts/gen-notice.sh
+
+.PHONY: check-notice
+check-notice: ## Fail if NOTICE.md is stale or a disallowed license appears (TODO A3)
+	./scripts/gen-notice.sh --check
+
+.PHONY: check-recipes
+check-recipes: ## Validate recipes against the JSON Schema + replay golden fixtures (TODO A3)
+	uvx --from check-jsonschema check-jsonschema \
+		--schemafile packages/recipe-schema/schema/recipe.schema.json \
+		recipes/*/recipe.yml
+	python scripts/replay_fixtures.py recipes
