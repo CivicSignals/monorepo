@@ -81,6 +81,9 @@ dev = [
     "types-pyyaml>=6.0",
     # Typing stubs for passlib (auth password hashing, B1).
     "types-passlib>=1.7",
+    # In-memory S3 mock for the raw-document storage tests (D3) so no real
+    # network/MinIO is needed; pinned to the s3 extra to keep the install slim.
+    "moto[s3]>=5.0",
 ]
 
 [build-system]
@@ -139,6 +142,11 @@ module = [
     "anthropic.*",
     "openai.*",
     "spacy.*",
+    # boto3/botocore ship no inline types (the s3 client is dynamically built),
+    # and moto is a test-only dependency without bundled stubs (D3 raw storage).
+    "boto3.*",
+    "botocore.*",
+    "moto.*",
 ]
 ignore_missing_imports = true
 
