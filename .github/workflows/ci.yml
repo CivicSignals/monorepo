@@ -280,13 +280,34 @@ jobs:
         run: ./scripts/gen-notice.sh --check
 
   # ---------------------------------------------------------------------------
-  # Recipe fixtures: validate every recipe against the JSON Schema and replay
-  # golden fixtures (doc 18 §3.3). Replay is guarded — it passes until the D1
-  # runner exists (see scripts/replay_fixtures.py).
+  # Recipe fixtures (QA-4): validate every recipe against the JSON Schema and
+  # replay golden fixtures (doc 18 §3.3).
+  #
+  # Triggered on every PR + push to main. Path-filtered so the job always runs
+  # when recipe files, the shared JSON Schema, the recipe runner, or the
+  # regression harness itself changes — contributors never have to remember to
+  # trigger it manually (doc 11 §3 CUF-7).
+  #
+  # Two complementary gates:
+  #   1. check-jsonschema — validates raw YAML against the canonical draft-07
+  #      schema independently of the Python runner (catches schema drift early).
+  #   2. pytest test_recipe_regression — parametrized golden-fixture replay
+  #      (one test node per recipe/fixture pair) so a failing recipe is named
+  #      explicitly in the CI log.  The CLI replay (cli.py) is kept as the
+  #      human-facing `make check-recipes` affordance; pytest is the CI gate.
   # ---------------------------------------------------------------------------
   recipe-fixtures:
     name: Recipe fixtures
     runs-on: ubuntu-latest
+    # Run when any recipe file, the JSON Schema, the runner, or the harness
+    # itself changes.  Also runs on changes to the harness test file so a
+    # regression-harness bug surfaces before it hits production.
+    # On push to main this job always runs (no path filter on push) so the
+    # golden-fixture suite is always green on the main branch.
+    if: >-
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'recipe') ||
+      true
     steps:
       - uses: actions/checkout@v4
 
@@ -317,9 +338,19 @@ jobs:
         working-directory: apps/api
         run: uv sync --frozen
 
-      # Replay every recipe's golden fixtures through the D1 lifecycle runner and
-      # diff against the committed *.expected.json (doc 18 §3.3). Exit is non-zero
-      # on any extraction divergence (recipe/connector/prompt drift).
-      - name: Replay golden fixtures
+      # Parametrized regression harness (QA-4): one pytest node per
+      # recipe/<id>/fixtures/<case>.html pair.  Each node replays the fixture
+      # through the live runner and asserts the projected extraction matches
+      # the committed *.expected.json.  Clear per-recipe failure messages in CI.
+      - name: Run recipe regression harness (pytest)
+        working-directory: apps/api
+        run: |
+          uv run pytest \
+            src/civicsignals_api/modules/recipes/tests/test_recipe_regression.py \
+            -v --tb=short
+
+      # CLI replay (human-facing gate; also a redundant CI check to keep the
+      # CLI and pytest harness in sync).  Exit is non-zero on any drift.
+      - name: Replay golden fixtures via CLI (redundant gate)
         working-directory: apps/api
         run: uv run python -m civicsignals_api.modules.recipes.cli
