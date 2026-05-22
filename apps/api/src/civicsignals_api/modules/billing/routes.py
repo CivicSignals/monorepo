@@ -10,6 +10,9 @@ N2 implements:
   - ``GET /billing/plan``       — effective plan + limits + feature flags for the workspace.
   - ``GET /billing/plan/demo``  — demo of a feature-gated endpoint (requires SMART_SEARCH).
 
+N3 implements:
+  - ``GET /billing/usage``      — current-period usage vs plan limits for the workspace.
+
 The webhook endpoint is unauthenticated (verified by Stripe signature). All
 other endpoints use ``require_workspace`` (B5).
 
@@ -31,12 +34,14 @@ from civicsignals_api.modules.auth.dependencies import CurrentWorkspace
 from civicsignals_api.modules.billing import services
 from civicsignals_api.modules.billing.dependencies import require_feature
 from civicsignals_api.modules.billing.models import BillingCustomer, BillingSubscription
-from civicsignals_api.modules.billing.plans import Feature, get_plan
+from civicsignals_api.modules.billing.plans import Dimension, Feature, get_plan
 from civicsignals_api.modules.billing.schemas import (
     BillingCustomerOut,
     BillingSubscriptionOut,
+    DimensionUsageOut,
     PlanOut,
     WorkspacePlanOut,
+    WorkspaceUsageOut,
 )
 from civicsignals_api.problems import ProblemException
 
@@ -271,3 +276,70 @@ async def demo_smart_search_gate(
     """Return a stub response; the real value is the 402 gate on plans lacking SMART_SEARCH."""
     # TODO N4: enforce smart-search monthly quota before reaching here.
     return {"status": "ok", "plan": (await services.get_workspace_plan(session, ctx.workspace_id))}
+
+
+# ---------------------------------------------------------------------------
+# N3: Usage metering endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/usage",
+    response_model=WorkspaceUsageOut,
+    summary="Get current-period usage vs plan limits for the workspace",
+    description=(
+        "Returns the workspace's metered usage for the current billing month "
+        "(calendar month, UTC), broken down by dimension, alongside the plan "
+        "cap for each dimension (``null`` = unlimited). The ``seats`` dimension "
+        "is refreshed on every call (live count from ``accounts_member``). All "
+        "other dimensions reflect the accumulated counters in ``billing_usage``.\n\n"
+        "Clients use this to render usage meters and upgrade CTAs. N4 will add "
+        "enforcement (soft 80 % banner + hard 429 at 100 %) on top of these numbers."
+        "# TODO N4: enforcement layer reads the same numbers returned here."
+    ),
+)
+async def get_workspace_usage(
+    ctx: CurrentWorkspace,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> WorkspaceUsageOut:
+    """Return current-period usage vs plan limits for the requesting workspace (N3).
+
+    Steps:
+    1. Refresh the seats snapshot (live count from accounts_member).
+    2. Load per-dimension usage counters from billing_usage.
+    3. Resolve plan limits from N2's plan registry.
+    4. Combine into a WorkspaceUsageOut with pct_used for each dimension.
+    """
+    period = services.current_period()
+
+    # Refresh seats (snapshot, not accumulated).
+    async with session.begin_nested():
+        await services.refresh_seats_usage(session, ctx.workspace_id, period=period)
+
+    # Read all usage counters for this workspace + period.
+    usage_map = await services.get_usage(session, ctx.workspace_id, period=period)
+
+    # Resolve the workspace plan limits (N2).
+    effective_plan = await services.get_workspace_plan(session, ctx.workspace_id)
+
+    # Build per-dimension usage-vs-limit objects.  We iterate over all known
+    # Dimensions so every dimension appears in the response even with zero usage.
+    dimensions: dict[str, DimensionUsageOut] = {}
+    for dim in Dimension:
+        used = usage_map.get(dim.value, 0)
+        limit = services.plan_limit(effective_plan, dim)
+        pct: float | None = None
+        if limit is not None and limit > 0:
+            pct = round(used / limit * 100, 1)
+        dimensions[dim.value] = DimensionUsageOut(
+            dimension=dim.value,
+            used=used,
+            limit=limit,
+            pct_used=pct,
+        )
+
+    return WorkspaceUsageOut(
+        workspace_id=ctx.workspace_id,
+        period=period,
+        dimensions=dimensions,
+    )

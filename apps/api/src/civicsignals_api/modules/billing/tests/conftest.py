@@ -35,6 +35,7 @@ from civicsignals_api.modules.billing import services as billing_services
 from civicsignals_api.modules.billing.models import (  # noqa: F401
     BillingCustomer,
     BillingSubscription,
+    BillingUsage,
     BillingWebhookEvent,
 )
 
@@ -73,6 +74,7 @@ def _get_billing_meta() -> MetaData:
         "billing_customer",
         "billing_subscription",
         "billing_webhook_event",
+        "billing_usage",
     }
     meta = MetaData()
 

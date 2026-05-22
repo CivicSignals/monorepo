@@ -97,6 +97,7 @@ class Dimension(StrEnum):
       - CONTACT_EXPORTS_PER_MONTH — contact CSV exports per calendar month
       - SAVED_SEARCHES            — max saved searches in the workspace (F7.6)
       - API_REQUESTS_PER_MONTH    — REST API calls per calendar month
+      - AI_RUNS_PER_MONTH         — LLM gateway calls (across all tasks) per month (N3)
     """
 
     SEATS = "seats"
@@ -105,6 +106,7 @@ class Dimension(StrEnum):
     CONTACT_EXPORTS_PER_MONTH = "contact_exports_per_month"
     SAVED_SEARCHES = "saved_searches"
     API_REQUESTS_PER_MONTH = "api_requests_per_month"
+    AI_RUNS_PER_MONTH = "ai_runs_per_month"
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,7 @@ PLANS: dict[SubscriptionPlan, PlanDefinition] = {
             Dimension.CONTACT_EXPORTS_PER_MONTH: _UNLIMITED,
             Dimension.SAVED_SEARCHES: _UNLIMITED,
             Dimension.API_REQUESTS_PER_MONTH: _UNLIMITED,
+            Dimension.AI_RUNS_PER_MONTH: _UNLIMITED,
         },
         features=frozenset(
             {
@@ -174,6 +177,7 @@ PLANS: dict[SubscriptionPlan, PlanDefinition] = {
             Dimension.CONTACT_EXPORTS_PER_MONTH: 50,
             Dimension.SAVED_SEARCHES: 20,
             Dimension.API_REQUESTS_PER_MONTH: 5_000,
+            Dimension.AI_RUNS_PER_MONTH: 500,
         },
         features=frozenset(
             {
@@ -199,6 +203,7 @@ PLANS: dict[SubscriptionPlan, PlanDefinition] = {
             Dimension.CONTACT_EXPORTS_PER_MONTH: 500,
             Dimension.SAVED_SEARCHES: 50,
             Dimension.API_REQUESTS_PER_MONTH: 50_000,
+            Dimension.AI_RUNS_PER_MONTH: 5_000,
         },
         features=frozenset(
             {
@@ -227,6 +232,7 @@ PLANS: dict[SubscriptionPlan, PlanDefinition] = {
             Dimension.CONTACT_EXPORTS_PER_MONTH: _UNLIMITED,
             Dimension.SAVED_SEARCHES: 200,
             Dimension.API_REQUESTS_PER_MONTH: 500_000,
+            Dimension.AI_RUNS_PER_MONTH: _UNLIMITED,
         },
         features=frozenset(
             {
@@ -258,6 +264,7 @@ PLANS: dict[SubscriptionPlan, PlanDefinition] = {
             Dimension.CONTACT_EXPORTS_PER_MONTH: _UNLIMITED,
             Dimension.SAVED_SEARCHES: _UNLIMITED,
             Dimension.API_REQUESTS_PER_MONTH: _UNLIMITED,
+            Dimension.AI_RUNS_PER_MONTH: _UNLIMITED,
         },
         features=frozenset(Feature),  # all features enabled
     ),

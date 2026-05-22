@@ -8,10 +8,15 @@ N1: Stripe customer + subscription wiring (this task).
   - billing_subscription: per-workspace subscription state (driven by Stripe events).
   - billing_webhook_event: idempotency/event-log for processed Stripe webhook events.
 
+N3: Usage metering (this task).
+  - billing_usage: per-workspace, per-period (month), per-dimension usage counter.
+    Keyed on (workspace_id, period, dimension); incremented atomically via
+    ON CONFLICT DO UPDATE (upsert). Designed for cheap increments and cheap
+    current-period reads (index on workspace_id + period).
+
 Future tasks:
-  # N2: Plan definitions are code-defined in billing/plans.py (no DB table needed).
-  # TODO N3: billing_usage for metered events (smart searches, exports) extends here.
-  # TODO N4: billing_limit rows (per-plan caps) reference billing_subscription.
+  # TODO N4: billing_limit enforcement (hard 429 at 100%, soft 80% banner) reads
+  #   billing_usage + plans.plan_limit via billing.services.check_limit.
   # TODO N5: self-serve checkout + plan-change flow uses billing_customer.stripe_customer_id.
 """
 
@@ -21,7 +26,19 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -201,4 +218,68 @@ class BillingWebhookEvent(Base):
 
     processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class BillingUsage(Base):
+    """Per-workspace, per-period, per-dimension usage counter (N3).
+
+    Each row tracks a single metering dimension (e.g. ``ai_runs``,
+    ``api_requests``) for a workspace over a calendar month.  The ``period``
+    column stores the first day of that month (``YYYY-MM-01``) so that a
+    period-rollover is simply a new row rather than a reset on an existing one
+    — old history is always preserved for audit/analytics.
+
+    **Design goals:**
+
+    - *Cheap increments*: callers do an ``INSERT … ON CONFLICT DO UPDATE SET
+      count = count + delta`` — a single round-trip, no read-before-write.
+    - *Cheap current-period reads*: the ``(workspace_id, period)`` compound
+      index makes fetching all dimensions for one workspace-month a single
+      index scan.
+    - *Workspace isolation*: the unique constraint
+      ``(workspace_id, period, dimension)`` prevents double-counting if two
+      workers race on the same row.
+
+    Dimension values match :class:`civicsignals_api.modules.billing.plans.Dimension`
+    string values (e.g. ``"ai_runs_per_month"``, ``"api_requests_per_month"``).
+    The ``seats`` dimension is a snapshot (overwritten, not incremented) since
+    it is derivable from ``accounts_member`` and updated lazily by the
+    metering scheduler.
+
+    # TODO N4: ``check_limit(workspace_id, dimension)`` reads this table plus
+    #   ``plan_limit(plan, dimension)`` to enforce soft (80%) and hard (100%)
+    #   caps.  N3 provides the numbers; N4 adds the enforcement layer.
+    """
+
+    __tablename__ = "billing_usage"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "period",
+            "dimension",
+            name="uq_billing_usage_ws_period_dim",
+        ),
+        # Efficient lookup of all dimensions for a workspace+month.
+        Index("ix_billing_usage_ws_period", "workspace_id", "period"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid7)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts_workspace.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # First day of the calendar month, UTC (e.g. 2025-05-01).
+    period: Mapped[datetime] = mapped_column(Date(), nullable=False)
+    # Matches Dimension.value — stored as a plain string for forward-compat.
+    dimension: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Cumulative count for this (workspace, period, dimension) cell.
+    count: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
