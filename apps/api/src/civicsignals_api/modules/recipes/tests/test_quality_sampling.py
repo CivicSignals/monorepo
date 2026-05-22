@@ -168,12 +168,30 @@ async def engine() -> AsyncIterator[AsyncEngine]:
 
 @pytest_asyncio.fixture
 async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    from sqlalchemy import text
+
     maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with maker() as s:
-        yield s
+        # Each test starts from a clean slate: remove any quality samples and the
+        # QA-7-seeded signals left behind by a previous test in this session.
+        # signals_signal persists across tests (the engine fixture only manages
+        # recipes_quality_sample), so leftover QA-7 signals would otherwise pollute
+        # window-based assertions (e.g. the no-candidates test).
+        await s.execute(text("DELETE FROM recipes_quality_sample"))
+        await s.execute(text("DELETE FROM signals_signal WHERE recipe_id LIKE 'qa7-%'"))
+        await s.commit()
+        try:
+            yield s
+        finally:
+            await s.rollback()
+            await s.execute(text("DELETE FROM recipes_quality_sample"))
+            await s.execute(text("DELETE FROM signals_signal WHERE recipe_id LIKE 'qa7-%'"))
+            await s.commit()
 
 
-def _make_signal(recipe_id: str, *, age_days: float = 1.0, now: datetime = NOW) -> dict[str, object]:
+def _make_signal(
+    recipe_id: str, *, age_days: float = 1.0, now: datetime = NOW
+) -> dict[str, object]:
     """Return kwargs to insert a minimal signal row into ``signals_signal``."""
     from civicsignals_api.ids import uuid7
 
@@ -264,9 +282,16 @@ async def test_sampler_respects_n_limit(db_session: AsyncSession) -> None:
 
 @pytest.mark.skipif(not _DSN, reason="needs live Postgres")
 async def test_sampler_empty_when_no_candidates(db_session: AsyncSession) -> None:
-    """Returns empty list when no signals are within the signal window."""
-    # Use a very short window — no signals within 0 days.
-    samples = await sample_extraction_quality(db_session, now=NOW, n=10, signal_window_days=0)
+    """Returns empty list when no signals are within the signal window.
+
+    Anchored at a far-future ``now`` with a 1-day window so that *no* signal in a
+    shared test DB — QA-7-seeded or otherwise — can fall inside the candidate
+    window. (The db_session fixture also removes QA-7 signals between tests.)
+    """
+    far_future = datetime(2099, 1, 1, 12, 0, 0, tzinfo=UTC)
+    samples = await sample_extraction_quality(
+        db_session, now=far_future, n=10, signal_window_days=1
+    )
     await db_session.commit()
     assert samples == []
 
