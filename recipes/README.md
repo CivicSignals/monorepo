@@ -22,8 +22,8 @@ On every PR, each recipe is validated against the JSON Schema and run against
 its golden fixtures; output is compared to the committed `*.expected.json`.
 Adding a fixture is how you fix "the recipe missed this case in production".
 
-Run the replay locally (the same gate CI uses), implemented by the recipe
-runner (TODO D1, `recipes` module):
+Run the replay locally (the same gate CI uses), via the recipe runner in the
+`recipes` module:
 
 ```bash
 cd apps/api

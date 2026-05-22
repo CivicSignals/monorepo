@@ -24,7 +24,7 @@ from .schemas import ExtractedDocument, FixtureReplayResult
 def _project(doc: ExtractedDocument) -> dict[str, object]:
     """Project an extraction to the committed expected-JSON shape."""
     return {
-        "signal_type": doc.signal_type,
+        "signal_types": list(doc.signal_types),
         "extraction_method": doc.extraction_method,
         "degraded": doc.degraded,
         "fields": dict(doc.fields),

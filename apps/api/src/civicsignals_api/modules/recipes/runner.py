@@ -34,6 +34,8 @@ from typing import Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 import yaml
+from bs4 import BeautifulSoup
+from bs4.element import Tag
 from jsonschema import Draft7Validator
 from jsonschema import exceptions as js_exceptions
 
@@ -259,24 +261,24 @@ def _robots_allows(
 # ----------------------------------------------------------------------------
 
 
-def _extract_field(html: str, spec: FieldSpec) -> str | None:
-    """Extract one field's value using its **primary** selector (index 0).
+def _parse_html(html: str) -> BeautifulSoup:
+    """Parse ``html`` into a single soup, parsed once per document.
 
-    D1 evaluates ``spec.selectors[0]`` only. The ordered fallback chain — try
-    each later selector, flag ``degraded: true`` and tick the drift counter when
-    a fallback matches — is D11. The extension point is intentional: iterate
-    ``spec.selectors`` here and thread a ``degraded`` flag back out.
+    beautifulsoup4 is a core dependency of ``civicsignals-api`` (see pyproject),
+    so a missing import here is a build/packaging error, surfaced at import time.
     """
-    try:
-        from bs4 import BeautifulSoup
-        from bs4.element import Tag
-    except ImportError as exc:  # pragma: no cover - guards a misbuilt image
-        raise RecipeError(
-            "the recipe runner's HTML extractor needs beautifulsoup4 "
-            "(a core dependency of civicsignals-api); install the package deps"
-        ) from exc
+    return BeautifulSoup(html, "html.parser")
 
-    soup = BeautifulSoup(html, "html.parser")
+
+def _extract_field(soup: BeautifulSoup, spec: FieldSpec) -> str | None:
+    """Extract one field's value from an already-parsed ``soup``.
+
+    Takes the shared DOM so ``extract()`` parses the document once regardless of
+    field count. D1 evaluates ``spec.selectors[0]`` only. The ordered fallback
+    chain — try each later selector, flag ``degraded: true`` and tick the drift
+    counter when a fallback matches — is D11. The extension point is intentional:
+    iterate ``spec.selectors`` here and thread a ``degraded`` flag back out.
+    """
     primary = spec.selectors[0]
     element = soup.select_one(primary)
     if element is None or not isinstance(element, Tag):
@@ -410,18 +412,23 @@ class RecipeRunner:
         :class:`RequiredFieldMissingError` — the boundary contract (doc 18 §3.1):
         invalid extractions are rejected, not silently swallowed.
         """
+        soup = _parse_html(raw.content)  # parse once; shared across all fields
         out: dict[str, str | None] = {}
         for name, spec in self.recipe.fields.items():
-            value = _extract_field(raw.content, spec)
+            value = _extract_field(soup, spec)
             if value is None and spec.required:
                 raise RequiredFieldMissingError(name)
             out[name] = value
 
-        signal_type = self.recipe.signal_types[0] if self.recipe.signal_types else None
+        # Carry the recipe's full declared signal-type set through — the runner
+        # does not guess which one a given record is. Selecting/assigning a
+        # concrete signal_type per record is a connector/normalize concern
+        # (doc 16 §17.3: connectors produce canonical records; the matcher decides
+        # signals). D1 must not silently drop the recipe's other declared types.
         return ExtractedDocument(
             recipe_id=self.recipe.recipe_id,
             recipe_version=self.recipe.version,
-            signal_type=signal_type,
+            signal_types=list(self.recipe.signal_types),
             extraction_method="primary",
             degraded=False,
             fields=out,
@@ -442,7 +449,7 @@ class RecipeRunner:
                 recipe_version=self.recipe.version,
                 source_url=source_url,
                 entity=self.recipe.entity,
-                signal_type=extracted.signal_type,
+                signal_types=list(extracted.signal_types),
                 degraded=extracted.degraded,
                 fields=extracted.fields,
             )

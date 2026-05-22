@@ -236,10 +236,20 @@ def test_full_lifecycle_pins_version_and_normalizes() -> None:
     record = out[0]
     assert record.record_type == "Signal"
     assert record.recipe_version == 3  # recipe_version pinned through the chain
-    assert record.signal_type == "rfp_posted"
+    assert record.signal_types == ["rfp_posted"]
     assert record.fields["title"] == "RFP 42 — Fiber Buildout"
     assert record.fields["due_date"] == "2026-01-31"  # read via attr=datetime
     assert record.entity.state == "WA"
+
+
+def test_all_declared_signal_types_carried_through() -> None:
+    # The runner must not collapse the recipe's declared types to one.
+    data = {**VALID_RECIPE, "signal_types": ["rfp_posted", "contract_award"]}
+    recipe = services.parse_recipe(data)
+    fetcher = RecordingFetcher(LISTING_HTML)
+    runner = services.make_runner(recipe, fetcher, clock=FakeClock())
+    out = runner.run(["https://example.gov/rfp-42"])
+    assert out[0].signal_types == ["rfp_posted", "contract_award"]
 
 
 def test_required_field_missing_raises() -> None:

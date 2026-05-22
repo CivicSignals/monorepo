@@ -116,14 +116,16 @@ class ExtractedDocument(BaseModel):
 
     ``extraction_method`` is ``"primary"`` for D1; ``degraded`` stays ``False``
     until the D11 fallback chain can flip it. ``recipe_version`` is carried
-    through for provenance.
+    through for provenance. ``signal_types`` is the recipe's full declared set —
+    the runner does not collapse it to one; assigning a concrete type per record
+    is a connector/normalize concern (doc 16 §17.3).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     recipe_id: str
     recipe_version: int
-    signal_type: str | None = None
+    signal_types: list[str] = Field(default_factory=list)
     extraction_method: str = "primary"
     degraded: bool = False
     fields: dict[str, str | None] = Field(default_factory=dict)
@@ -143,7 +145,7 @@ class CanonicalRecord(BaseModel):
     recipe_version: int
     source_url: str
     entity: EntityRef
-    signal_type: str | None = None
+    signal_types: list[str] = Field(default_factory=list)
     degraded: bool = False
     fields: dict[str, str | None] = Field(default_factory=dict)
 

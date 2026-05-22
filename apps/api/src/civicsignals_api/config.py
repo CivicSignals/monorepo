@@ -55,9 +55,9 @@ class Settings(BaseSettings):
 
     api_v1_prefix: str = Field(default="/api/v1")
 
-    # Recipe DSL + runner (doc 18 §3, TODO D1). Both default to the monorepo
-    # layout (discovered by walking up from the installed package) and can be
-    # overridden in containers where the repo root sits elsewhere.
+    # Recipe DSL + runner (doc 18 §3). Both default to the monorepo layout
+    # (discovered by walking up from the installed package) and can be overridden
+    # in containers where the repo root sits elsewhere.
     recipe_schema_dir: str | None = None
     recipes_dir: str | None = None
 
