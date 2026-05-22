@@ -1,6 +1,6 @@
 """Pydantic request/response shapes for the extraction module (doc 06 §3).
 
-These cover the Stage-2 relevance gate (doc 19 §3, TODO E8): the cheap LLM that
+These cover the Stage-2 relevance gate (doc 19 §3, E8): the cheap LLM that
 decides whether a fetched document is worth running through full extraction.
 """
 

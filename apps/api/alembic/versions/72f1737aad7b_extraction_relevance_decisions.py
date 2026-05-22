@@ -2,7 +2,7 @@
 
 Creates ``extraction_relevance_decision``, owned by the extraction module: the
 Stage-2 relevance-gate decision log used for retrospective FP/FN analysis
-(doc 19 §3.4, TODO E8). Touches only this module's table.
+(doc 19 §3.4, E8). Touches only this module's table.
 
 Revision ID: 72f1737aad7b
 Revises:

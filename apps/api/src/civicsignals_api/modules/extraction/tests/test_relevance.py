@@ -1,10 +1,12 @@
 """Tests for the Stage-2 relevance classifier (doc 19 §3, E8).
 
-All LLM-driven cases use the gateway's deterministic ``FakeBackend`` — no network
-or API keys. The decision-record persistence is exercised against SQLite-compatible
-DDL (the table reuses JSONB, which the live-DB path covers via the Alembic
-migration; here we assert the in-memory persistence shape with a sqlite-portable
-schema) and, when a Postgres DSN is supplied, against a real session.
+All cases here use the gateway's deterministic ``FakeBackend`` — no network or
+API keys — and cover verdict parsing, the ``assume_relevant`` short-circuit,
+truncation, fail-open behaviour, category filtering, and workspace accounting.
+
+Decision-record *persistence* lives in ``test_relevance_persistence.py``: the
+table uses Postgres JSONB, so it is exercised against a live Postgres (gated on
+``EXTRACTION_TEST_DSN``, mirroring A2's seed-test pattern) rather than SQLite.
 """
 
 from __future__ import annotations
@@ -150,8 +152,12 @@ async def test_classifier_prefilter_calls_llm() -> None:
     assert len(backend.calls) == 1
 
 
-async def test_classify_prose_synonym_still_runs_llm() -> None:
-    # Doc 19 §3 prose writes ``prefilter: classify``; treat it as the LLM path.
+async def test_non_assume_relevant_prefilter_runs_llm() -> None:
+    # The service short-circuits only on ``assume_relevant``; any other value runs
+    # the classifier. The canonical recipe schema only allows ``classifier`` /
+    # ``assume_relevant``, but the doc 19 §3 prose writes ``prefilter: classify`` —
+    # at this layer (below recipe validation) it must still route to the LLM
+    # rather than error, so an unvalidated value never silently drops a document.
     gw, backend = _gateway(json.dumps({"relevant": True, "confidence": 0.7}))
     classifier = RelevanceClassifier(gateway=gw)
     await classifier.classify(_doc("text"), prefilter="classify")

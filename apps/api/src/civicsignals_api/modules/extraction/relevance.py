@@ -38,14 +38,20 @@ from .schemas import (
 
 log = structlog.get_logger(__name__)
 
-# Recipe prefilter values (doc 19 §3.3; recipe.schema.json enum). ``assume_relevant``
-# skips the classifier for inherently-relevant sources (a state portal's RFP
-# listing is literally a list of RFPs). ``classifier`` runs the gate. The spec's
-# prose uses ``classify`` as a synonym for ``classifier``; accept both so a recipe
-# written against doc 19 §3 prose still routes to the LLM rather than erroring.
+# Recipe prefilter values. The canonical recipe schema
+# (packages/recipe-schema/schema/recipe.schema.json) restricts ``prefilter`` to the
+# enum ``["classifier", "assume_relevant"]`` (doc 19 §3.3), so those are the only
+# values a schema-validated recipe can carry. ``assume_relevant`` skips the gate
+# for inherently-relevant sources (a state portal's RFP listing is literally a
+# list of RFPs); ``classifier`` runs the LLM gate.
+#
+# This service is a layer *below* recipe validation: ``classify`` short-circuits
+# only on ``assume_relevant`` and runs the classifier for every other value. So
+# the prose synonym ``classify`` (used in doc 19 §3's YAML examples) and any other
+# non-``assume_relevant`` string both route to the LLM — a defensive default that
+# never silently drops a document, even if a caller passes an unvalidated value.
 PREFILTER_ASSUME_RELEVANT: Final = "assume_relevant"
 PREFILTER_CLASSIFIER: Final = "classifier"
-_CLASSIFIER_PREFILTERS: Final = frozenset({PREFILTER_CLASSIFIER, "classify"})
 
 # Method tags recorded on the decision row (doc 19 §3 provenance).
 METHOD_CLASSIFIER: Final = "classifier"
