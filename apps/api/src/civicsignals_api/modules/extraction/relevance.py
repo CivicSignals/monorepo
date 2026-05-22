@@ -86,6 +86,10 @@ _SYSTEM_PROMPT: Final = (
     "is worth deeper analysis. Be terse and output only JSON."
 )
 
+# Rendered as a clean comma-separated list for the prompt, rather than a Python
+# list repr (``['procurement', ...]``), which is harder for the model to read.
+_CATEGORY_LIST: Final = ", ".join(RELEVANCE_CATEGORIES)
+
 # Inlined default prompt (doc 19 §3.2). TODO E3: move to the prompt registry under
 # the name/version above. Kept short to hold the per-call cost near $0.0002.
 _PROMPT_TEMPLATE: Final = """Does this document mention or discuss any of the following?
@@ -132,7 +136,7 @@ def truncate_document(text: str, *, max_chars: int = MAX_DOC_CHARS) -> tuple[str
 
 def _build_prompt(doc: DocumentRef, truncated_text: str) -> str:
     return _PROMPT_TEMPLATE.format(
-        categories=list(RELEVANCE_CATEGORIES),
+        categories=_CATEGORY_LIST,
         source=doc.source or doc.recipe_id,
         document=truncated_text,
     )
@@ -299,13 +303,15 @@ def _coerce_relevant(raw: object) -> bool:
 
     Plain ``bool(raw)`` is wrong here: the string ``"false"`` is truthy and any
     non-zero number reads as ``True``, which would silently flip verdicts toward
-    relevant and inflate false positives. We accept real bools, recognise the
-    common string spellings, and treat anything else as not-relevant.
+    relevant and inflate false positives. The field is meant to be a JSON bool, so
+    we accept real bools and the common string spellings; for the numeric forms a
+    model might emit we accept only an exact ``1`` as relevant and treat every
+    other value (``0``, ``0.2``, ``2``, …) as not-relevant.
     """
     if isinstance(raw, bool):
         return raw
     if isinstance(raw, int | float):
-        return raw != 0
+        return raw == 1
     if isinstance(raw, str):
         return raw.strip().lower() in _RELEVANT_TRUE_STRINGS
     return False

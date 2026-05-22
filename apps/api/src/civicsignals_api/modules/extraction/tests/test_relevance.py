@@ -133,6 +133,34 @@ async def test_relevant_missing_defaults_to_false() -> None:
     assert verdict.relevant is False
 
 
+async def test_relevant_numeric_only_exact_one_is_true() -> None:
+    # A probabilistic/float `relevant` must not be read as a bool: only an exact 1
+    # counts as relevant; 0.2 (and other non-1 numbers) are not.
+    gw, _ = _gateway(json.dumps({"relevant": 0.2, "confidence": 0.9}))
+    classifier = RelevanceClassifier(gateway=gw)
+    assert (await classifier.classify(_doc("a"))).relevant is False
+
+    gw, _ = _gateway(json.dumps({"relevant": 1, "confidence": 0.9}))
+    classifier = RelevanceClassifier(gateway=gw)
+    assert (await classifier.classify(_doc("b"))).relevant is True
+
+    gw, _ = _gateway(json.dumps({"relevant": 0, "confidence": 0.9}))
+    classifier = RelevanceClassifier(gateway=gw)
+    assert (await classifier.classify(_doc("c"))).relevant is False
+
+
+async def test_prompt_renders_categories_as_clean_list() -> None:
+    # Categories must appear as a comma-separated list, not a Python list repr.
+    gw, backend = _gateway(json.dumps({"relevant": True, "confidence": 0.7}))
+    classifier = RelevanceClassifier(gateway=gw)
+    await classifier.classify(_doc("text"))
+    prompt = backend.calls[0]["prompt"]
+    assert isinstance(prompt, str)
+    assert "procurement, budget" in prompt
+    # No Python list/quote artifacts from a repr.
+    assert "['procurement'" not in prompt
+
+
 async def test_unparseable_reply_fails_open() -> None:
     gw, _ = _gateway("I think this is probably relevant, honestly.")
     classifier = RelevanceClassifier(gateway=gw)
