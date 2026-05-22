@@ -72,12 +72,16 @@ async def store_raw_document(
     """Persist a fetched document: bytes -> S3, provenance -> DB (doc 18 §2.2; D3).
 
     Content-addressable: the S3 key is ``sha256/<content_hash>``, so identical
-    bytes dedupe to one object regardless of source. The
-    ``ingestion_raw_document`` row is **idempotent on** ``(recipe_id,
-    content_hash)`` — re-storing the same content for the same recipe returns the
-    existing row (``deduped=True``) without inserting a duplicate or re-uploading.
-    This makes a re-fetch of unchanged content cheap and safe (doc 18 §3.6: the
-    raw snapshot is the source of truth and extraction is replayable against it).
+    bytes dedupe to one object regardless of source. The ``ingestion_raw_document``
+    row is an **idempotent get-or-create keyed on** ``(recipe_id, content_hash)`` —
+    re-storing the same content for the same recipe returns the *existing* row
+    (``deduped=True``) without inserting a duplicate. It is deliberately **not** a
+    field-refreshing upsert: the snapshot is immutable, so the original
+    provenance (``fetched_at``, ``source_url``, ``http_status``, ``entity_id``,
+    ``metadata``) is preserved on a re-fetch of byte-identical content rather than
+    overwritten — that first-observed provenance is the one extraction replays
+    against (doc 18 §3.6: the raw snapshot is the source of truth). Changed content
+    produces a new hash and therefore a new row; that is how an update is recorded.
 
     Ordering keeps the work minimal and correct: the content hash/key are computed
     locally first, so an already-stored document short-circuits on a single SELECT

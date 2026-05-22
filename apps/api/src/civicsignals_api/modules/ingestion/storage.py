@@ -42,6 +42,27 @@ def key_for_hash(hash_hex: str) -> str:
     return f"{_KEY_PREFIX}/{hash_hex}"
 
 
+# A SHA-256 digest is exactly 64 lowercase hex characters. Anything else (wrong
+# length, non-hex, a stray ``/``) would write bytes under a key that is *not* the
+# content's hash, silently breaking the content-addressable invariant.
+_SHA256_HEX_LEN = 64
+
+
+def _resolve_hash(data: bytes, precomputed_hash: str | None) -> str:
+    """Return the content hash, validating any caller-supplied ``precomputed_hash``.
+
+    When a ``precomputed_hash`` is provided we trust it only after confirming it is
+    a well-formed SHA-256 hex digest, so a wrong/garbage value can't corrupt the
+    object key. ``None`` (the default) computes the hash from ``data``.
+    """
+    if precomputed_hash is None:
+        return content_hash(data)
+    candidate = precomputed_hash.lower()
+    if len(candidate) != _SHA256_HEX_LEN or any(c not in "0123456789abcdef" for c in candidate):
+        raise ValueError(f"precomputed_hash {precomputed_hash!r} is not a SHA-256 hex digest")
+    return candidate
+
+
 @dataclass(frozen=True, slots=True)
 class StoredObject:
     """Result of storing bytes: the content address + where/how it landed.
@@ -129,11 +150,12 @@ class RawDocumentStorage:
 
         The key is ``sha256/<hash>``; storing the same bytes again writes the same
         key with byte-identical content (a harmless idempotent overwrite), so
-        identical content dedupes to one object. ``ContentType`` is recorded as
-        object metadata for faithful round-tripping. Pass ``precomputed_hash`` to
-        reuse a hash the caller already computed (avoids re-hashing large bytes).
+        identical content dedupes to one object. ``ContentType`` is recorded as the
+        object's metadata on this PUT. Pass ``precomputed_hash`` (validated as a
+        SHA-256 hex digest) to reuse a hash the caller already computed and avoid
+        re-hashing large bytes.
         """
-        hash_hex = precomputed_hash or content_hash(data)
+        hash_hex = _resolve_hash(data, precomputed_hash)
         key = key_for_hash(hash_hex)
         self._client.put_object(
             Bucket=self._bucket,
@@ -157,10 +179,12 @@ class RawDocumentStorage:
         Because storage is content-addressed, an object already at ``sha256/<hash>``
         is byte-identical to ``data`` — so a re-fetch of unchanged content costs one
         HEAD instead of a PUT. Always returns the :class:`StoredObject` (the content
-        address is computed regardless of whether an upload happened).
-        ``precomputed_hash`` lets the caller reuse a hash it already computed.
+        address is computed regardless of whether an upload happened); the returned
+        ``content_type`` reflects this call's argument, which for the same bytes
+        normally matches what the first uploader wrote. ``precomputed_hash``
+        (validated) lets the caller reuse a hash it already computed.
         """
-        hash_hex = precomputed_hash or content_hash(data)
+        hash_hex = _resolve_hash(data, precomputed_hash)
         key = key_for_hash(hash_hex)
         if not self.exists(key):
             self._client.put_object(

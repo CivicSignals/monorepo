@@ -81,6 +81,25 @@ def test_get_missing_key_raises(storage: RawDocumentStorage) -> None:
     assert exc_info.value.response["Error"]["Code"] == "NoSuchKey"
 
 
+def test_put_rejects_malformed_precomputed_hash(storage: RawDocumentStorage) -> None:
+    """A bad ``precomputed_hash`` is rejected, never used as the object key — so
+    the content-addressable invariant can't be silently corrupted."""
+    data = b"some bytes"
+    for bad in ("not-hex", "abc", "/" * 64, "g" * 64, content_hash(data)[:-1]):
+        with pytest.raises(ValueError, match="SHA-256 hex digest"):
+            storage.put_document(data, precomputed_hash=bad)
+
+
+def test_put_accepts_correct_precomputed_hash(storage: RawDocumentStorage) -> None:
+    """A valid precomputed hash yields the same key as letting put compute it."""
+    data = b"reuse the hash"
+    expected = content_hash(data)
+    stored = storage.put_document(data, precomputed_hash=expected)
+    assert stored.content_hash == expected
+    assert stored.key == key_for_hash(expected)
+    assert storage.get_document(stored.key) == data
+
+
 def test_put_if_absent_skips_upload_when_present() -> None:
     """The conditional put HEADs first and skips the PUT for already-stored bytes."""
 
