@@ -50,13 +50,21 @@ const sidebars: SidebarsConfig = {
     },
   ],
 
-  // TODO Q5 — Recipe authoring guide
+  // Q5 — Recipe authoring guide
   recipesSidebar: [
     {
       type: "category",
       label: "Recipes",
       items: [
         "recipes/intro",
+        "recipes/connectors",
+        "recipes/schema",
+        "recipes/selectors",
+        "recipes/fixtures",
+        "recipes/cli",
+        "recipes/politeness",
+        "recipes/example",
+        "recipes/contributing",
       ],
     },
   ],

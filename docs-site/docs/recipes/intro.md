@@ -7,70 +7,110 @@ slug: /recipes/intro
 
 # Recipe Authoring Guide
 
-A **recipe** is a declarative YAML file that tells CivicSignals how to ingest data from one specific public-sector source (a city council's meeting portal, a county procurement board, a state grants database, etc.).
+A **recipe** is a declarative YAML file that tells CivicSignals how to ingest data from one specific public-sector source — a city council's meeting portal, a county procurement board, a state grants database, and so on.
 
-Recipes are community-contributable — you can add coverage for your jurisdiction by submitting a YAML file via pull request.
+Recipes are **community-contributable**: you can add coverage for your jurisdiction by submitting a YAML file via pull request. No code required — just a valid YAML file, the right connector, field selectors, and a set of golden fixtures so CI can verify your recipe.
 
-<!-- TODO Q5: Replace this stub with the full recipe authoring guide. See task Q5 in TODO.md.
-  Planned content:
-  - Recipe YAML schema reference (sourced from packages/recipe-schema/)
-  - Connector types (http_static, rss, rest_api_pager, boarddocs, granicus_peak, etc.)
-  - Selector syntax (CSS, XPath, JSONPath) + ordered fallback chain
-  - Writing golden fixtures (*.html + *.expected.json in recipes/<id>/fixtures/)
-  - Testing your recipe locally (CLI tool from D5)
-  - Submitting a recipe PR (DCO sign-off, fixture requirements)
-  - Recipe lifecycle: discover → fetch → extract → normalize
-  Requires Q5 dependency tasks: D5 (recipe authoring tooling + CLI).
--->
+This guide teaches you everything you need to author and submit a recipe.
 
-## What's coming (Q5)
+## What you'll learn
 
-Full recipe authoring documentation is planned for **Q5 — Recipe authoring guide**, after the CLI tooling (task **D5**) is built.
+- [Connectors vs recipes](./connectors.md) — what the difference is and why it matters
+- [Recipe YAML schema](./schema.md) — every field, with examples and defaults
+- [Choosing a connector](./connectors.md#available-connectors) — `http_static`, `rss`, `rest_api_pager`, `bulk_download`, `pdf_extractor`, and platform connectors
+- [Field selectors and fallbacks](./selectors.md) — CSS/XPath ordered chains, the `degraded` flag, and LLM-assisted extraction
+- [Golden fixtures](./fixtures.md) — how to write the `*.html` and `*.expected.json` files CI replays
+- [Testing locally with the CLI](./cli.md) — `validate`, `test`, `preview`, and `scaffold`
+- [Politeness and legal rules](./politeness.md) — the non-negotiable posture every recipe must follow
+- [Submitting your PR](./contributing.md) — DCO sign-off, required fixtures, review checklist
 
-## Concepts
+## Quick orientation
 
 ### Connectors vs recipes
 
-| Concept | What it is |
-|---|---|
-| **Connector** | Code for a *source type* — e.g., "BoardDocs-hosted agendas", "Granicus meeting portals". Written by the CivicSignals team. |
-| **Recipe** | Declarative YAML that instantiates a connector for *one specific source* — e.g., the City of Seattle's BoardDocs portal. Community-contributable. |
+| Concept | What it is | Who writes it |
+|---|---|---|
+| **Connector** | Code for a *source type* — e.g., all BoardDocs-hosted agendas, all Granicus portals | CivicSignals team |
+| **Recipe** | Declarative YAML that instantiates a connector for *one specific source* — e.g., the City of Seattle's BoardDocs portal | Community contributors |
 
-### Recipe lifecycle
+A connector is a code path (Python). A recipe is configuration (YAML). The same `http_static` connector powers hundreds of different state and local procurement pages, each with its own recipe that specifies the right selectors, schedule, and entity.
+
+### The four-stage lifecycle
+
+Every recipe runs through four stages:
 
 ```
 discover → fetch → extract → normalize
 ```
 
-Each stage can fall back gracefully:
+1. **discover** — find candidate URLs or records for this run (the index page, the RSS feed, the API paginator)
+2. **fetch** — retrieve raw bytes and store them in S3 before any parsing happens
+3. **extract** — turn the raw bytes into structured fields using CSS/XPath selectors (with ordered fallbacks)
+4. **normalize** — map the extracted fields to canonical records (Signals, Entities, Contacts, etc.)
 
-1. **Primary selectors** (CSS/XPath/JSONPath) — fast, deterministic
-2. **Fallback selectors** — alternative paths for when source layout changes
-3. **LLM-assisted extraction** — Sonnet-class model for ambiguous content
-4. **Dead-letter** — flagged for human review when all fallbacks fail
+As a recipe author, you control **discover** (via your connector choice and seed URL), **fetch** (politeness settings), and **extract** (field selectors). The platform handles normalize automatically.
 
-Recipes that use fallback paths are tagged `degraded: true` in their output.
+### Extraction fallback chain
 
-## Example recipe
+The extractor tries each selector in order. The first non-empty match wins:
 
-```yaml
-# recipes/wa-state-webs/recipe.yaml
-id: wa-state-webs
-connector: http_static
-entity_id: c_wa_dol
-schedule: "0 6 * * *"
-url: "https://www.dol.wa.gov/business/webs/"
-selectors:
-  - type: css
-    path: "table.webs-table tbody tr"
-    fields:
-      title: "td:nth-child(1)"
-      due_date: "td:nth-child(3)"
-      value: "td:nth-child(4)"
+```
+Primary selector (index 0)
+  ↓ (on failure)
+Fallback selector (index 1)
+  ↓ (on failure)
+More fallbacks …
+  ↓ (all failed + llm_assisted: true)
+LLM-assisted extraction via the LLM gateway
+  ↓ (failure)
+Dead-letter queue + recipe drift alert
 ```
 
-## Schema reference
+When a fallback (anything after index 0) produces the match, the document is flagged `degraded: true`. When the LLM-assisted path is used, it is flagged `llm_assisted: true`. The platform counts these events per recipe — a high fallback rate triggers a drift alert prompting a recipe fix.
 
-Recipe YAML is validated against the JSON Schema in [`packages/recipe-schema/`](https://github.com/CivicSignals/monorepo/tree/main/packages/recipe-schema). This schema is the single source of truth for both the Python runner and TypeScript tooling.
+## Worked example: `wa-state-webs`
 
-Full schema documentation and authoring walkthrough will be added in **Q5**.
+The `recipes/wa-state-webs/` directory is the canonical reference recipe. It ingests Washington State's WEBS procurement portal using the `http_static` connector.
+
+```yaml title="recipes/wa-state-webs/recipe.yml"
+recipe_id: wa-state-webs
+connector: http_static
+version: 1
+
+entity:
+  name: Washington State Department of Enterprise Services
+  state: WA
+  kind: state_agency
+
+schedule:
+  cron: "0 */2 * * *"   # every 2 hours
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: assume_relevant   # state portal is pre-vetted; skip relevance classifier
+
+fields:
+  title:
+    selectors:
+      - "h1.solicitation-title"    # primary
+      - ".bid-header > h2"         # fallback 1
+      - "main h1:first-of-type"    # fallback 2
+    required: true
+  due_date:
+    attr: datetime                 # read the <time> element's datetime attribute
+    selectors:
+      - ".bid-closing-date time"
+      - "td:contains('Bid Due') + td"
+    required: false
+
+signal_types:
+  - rfp_posted
+  - contract_award
+```
+
+Its fixture at `recipes/wa-state-webs/fixtures/listing-001.html` contains a sample HTML page, and `listing-001.expected.json` specifies the exact extraction output CI checks against.
+
+Read the [Worked Example](./example.md) page for the full walkthrough.
