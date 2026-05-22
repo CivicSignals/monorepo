@@ -1,0 +1,90 @@
+CivicSignals {{ .Chart.Version }} (app: {{ .Chart.AppVersion }}) deployed successfully.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROCESS TYPES DEPLOYED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.web.enabled }}
+  web          → {{ .Values.web.replicaCount }} replica(s)   image: {{ include "civicsignals.webImage" . }}
+{{- end }}
+{{- if .Values.api.enabled }}
+  api          → {{ .Values.api.replicaCount }} replica(s)   image: {{ include "civicsignals.apiImage" . }}
+{{- end }}
+{{- if .Values.workerIngest.enabled }}
+  worker_ingest  → {{ .Values.workerIngest.replicaCount }} replica(s)
+{{- end }}
+{{- if .Values.workerExtract.enabled }}
+  worker_extract → {{ .Values.workerExtract.replicaCount }} replica(s)
+{{- end }}
+{{- if .Values.workerScore.enabled }}
+  worker_score   → {{ .Values.workerScore.replicaCount }} replica(s)
+{{- end }}
+{{- if .Values.workerNotify.enabled }}
+  worker_notify  → {{ .Values.workerNotify.replicaCount }} replica(s)
+{{- end }}
+{{- if .Values.scheduler.enabled }}
+  scheduler      → 1 replica (SINGLETON — do not scale)
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ENDPOINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if and .Values.ingress.enabled .Values.web.enabled }}
+  Web:  {{ if .Values.ingress.web.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.web.host }}/
+{{- end }}
+{{- if and .Values.ingress.enabled .Values.api.enabled }}
+  API:  {{ if .Values.ingress.api.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.api.host }}/api/v1/
+  Docs: {{ if .Values.ingress.api.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.api.host }}/docs
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATASTORES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.bundled.postgres.enabled }}
+  Postgres: BUNDLED (evaluation only — not suitable for production)
+{{- else }}
+  Postgres: EXTERNAL — configure secrets.databaseUrl / secrets.databaseDirectUrl
+{{- end }}
+{{- if .Values.bundled.redis.enabled }}
+  Redis:    BUNDLED (evaluation only)
+{{- else }}
+  Redis:    EXTERNAL — configure secrets.redisUrl
+{{- end }}
+{{- if .Values.bundled.minio.enabled }}
+  MinIO:    BUNDLED (evaluation only — use S3 in production)
+{{- else }}
+  S3:       EXTERNAL — configure secrets.s3AccessKeyId / secrets.s3SecretAccessKey
+{{- end }}
+{{- if .Values.pgbouncer.enabled }}
+  PgBouncer: enabled (transaction mode, port 6432)
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. SECRETS — the default values contain placeholder strings ("CHANGEME").
+   Replace them BEFORE exposing this release to any network:
+
+     helm upgrade {{ .Release.Name }} ./infra/helm/civicsignals \
+       --set secrets.databaseUrl="postgresql+asyncpg://user:pass@pgbouncer:6432/civicsignals" \
+       --set secrets.secretKey="$(openssl rand -hex 32)"
+
+   Better: use a sealed-secrets or External Secrets Operator integration.
+
+2. INGRESS — TLS is disabled by default. Enable with cert-manager:
+
+     ingress.web.tls.enabled=true
+     ingress.api.tls.enabled=true
+     ingress.annotations."cert-manager.io/cluster-issuer"="letsencrypt-prod"
+
+3. MIGRATION — an Alembic `upgrade head` Job ran as a pre-install hook.
+   Check its logs:
+
+     kubectl logs -l app.kubernetes.io/component=migrate -n {{ .Release.Namespace }}
+
+4. SCHEDULER SINGLETON — the scheduler Deployment uses strategy=Recreate
+   and replicas=1. Do NOT manually scale it. Redis-based leader election
+   is planned for task D14.
+
+5. DOCUMENTATION — see docs/self-host/kubernetes.md for a full walkthrough.
+   SPDX-License-Identifier: AGPL-3.0-only

@@ -1,0 +1,153 @@
+# CivicSignals — HorizontalPodAutoscalers (CPU-based)
+# task O3 / doc 06 §10, §12
+# SPDX-License-Identifier: AGPL-3.0-only
+
+{{- if and .Values.web.enabled .Values.web.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-web
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "civicsignals.fullname" . }}-web
+  minReplicas: {{ .Values.web.hpa.minReplicas }}
+  maxReplicas: {{ .Values.web.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.web.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+
+{{- if and .Values.api.enabled .Values.api.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-api
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "civicsignals.fullname" . }}-api
+  minReplicas: {{ .Values.api.hpa.minReplicas }}
+  maxReplicas: {{ .Values.api.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+
+{{- if and .Values.workerIngest.enabled .Values.workerIngest.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-worker-ingest
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-ingest
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "civicsignals.fullname" . }}-worker-ingest
+  minReplicas: {{ .Values.workerIngest.hpa.minReplicas }}
+  maxReplicas: {{ .Values.workerIngest.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.workerIngest.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+
+{{- if and .Values.workerExtract.enabled .Values.workerExtract.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-worker-extract
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-extract
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "civicsignals.fullname" . }}-worker-extract
+  minReplicas: {{ .Values.workerExtract.hpa.minReplicas }}
+  maxReplicas: {{ .Values.workerExtract.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.workerExtract.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+
+{{- if and .Values.workerScore.enabled .Values.workerScore.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-worker-score
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-score
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "civicsignals.fullname" . }}-worker-score
+  minReplicas: {{ .Values.workerScore.hpa.minReplicas }}
+  maxReplicas: {{ .Values.workerScore.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.workerScore.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+
+{{- if and .Values.workerNotify.enabled .Values.workerNotify.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-worker-notify
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-notify
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "civicsignals.fullname" . }}-worker-notify
+  minReplicas: {{ .Values.workerNotify.hpa.minReplicas }}
+  maxReplicas: {{ .Values.workerNotify.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.workerNotify.hpa.targetCPUUtilizationPercentage }}
+{{- end }}

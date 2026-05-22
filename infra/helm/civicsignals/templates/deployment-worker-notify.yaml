@@ -1,0 +1,77 @@
+# CivicSignals — worker_notify Deployment (Celery, queue=notify)
+# task O3 / doc 06 §1, §8, §10
+# SPDX-License-Identifier: AGPL-3.0-only
+{{- if .Values.workerNotify.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-worker-notify
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-notify
+spec:
+  replicas: {{ .Values.workerNotify.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "civicsignals.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker-notify
+  template:
+    metadata:
+      labels:
+        {{- include "civicsignals.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker-notify
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "civicsignals.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker-notify
+          image: {{ include "civicsignals.apiImage" . }}
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          command:
+            {{- toYaml .Values.workerNotify.command | nindent 12 }}
+          args:
+            {{- toYaml .Values.workerNotify.args | nindent 12 }}
+          env:
+            {{- include "civicsignals.apiEnv" . | nindent 12 }}
+            # CELERYD_CONCURRENCY is read natively by Celery and controls the
+            # worker pool size without requiring changes to docker-entrypoint.sh.
+            - name: CELERYD_CONCURRENCY
+              value: {{ .Values.config.celeryNotifyConcurrency | quote }}
+            {{- with .Values.workerNotify.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.workerNotify.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.workerNotify.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.workerNotify.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.workerNotify.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,514 @@
+# CivicSignals Helm values — doc 06 §10 (Phase 2 self-host K8s distribution)
+# task O3
+#
+# Default: external/managed datastores (RDS + ElastiCache + S3).
+# For evaluation, set bundled.postgres/redis/minio.enabled = true.
+#
+# Override any value with:  helm upgrade --install civicsignals ./infra/helm/civicsignals -f my-values.yaml
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# ---------------------------------------------------------------------------
+# Global image settings
+# ---------------------------------------------------------------------------
+image:
+  api:
+    repository: ghcr.io/civicsignals/api
+    # tag defaults to .Chart.AppVersion (see helpers)
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  web:
+    repository: ghcr.io/civicsignals/web
+    tag: ""
+    pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+# - name: ghcr-pull-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Service account
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  # automountServiceAccountToken=false by default for security (no K8s API access needed).
+  # Set to true (or use SA annotations) when using cloud IAM integrations such as
+  # AWS IRSA (EKS) or GKE Workload Identity that rely on projected SA tokens.
+  automountServiceAccountToken: false
+
+# ---------------------------------------------------------------------------
+# Pod-level settings (applies to all deployments unless overridden per-component)
+# ---------------------------------------------------------------------------
+podAnnotations: {}
+podLabels: {}
+
+# Non-root security context (doc 06 §11)
+# UID/GID 1001 matches the 'appuser' created in the API Dockerfile.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# ---------------------------------------------------------------------------
+# Web frontend (Next.js)
+# ---------------------------------------------------------------------------
+web:
+  enabled: true
+  replicaCount: 2
+  command: []  # uses image default
+  args: []
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+  livenessProbe:
+    httpGet:
+      path: /
+      port: 3000
+    initialDelaySeconds: 20
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /
+      port: 3000
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  hpa:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  # Extra env vars specific to the web container
+  extraEnv: []
+  # - name: NEXT_PUBLIC_API_URL
+  #   value: "https://api.example.com"
+
+# ---------------------------------------------------------------------------
+# API (FastAPI / uvicorn) — process type: api
+# ---------------------------------------------------------------------------
+api:
+  enabled: true
+  replicaCount: 2
+  command: ["/app/docker-entrypoint.sh"]
+  args: ["api"]
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 1Gi
+
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 8000
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /healthz
+      port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Worker: ingest  (queue=ingest)
+# ---------------------------------------------------------------------------
+workerIngest:
+  enabled: true
+  replicaCount: 2
+  command: ["/app/docker-entrypoint.sh"]
+  # CELERYD_CONCURRENCY env var is natively read by Celery to set pool size.
+  args: ["worker_ingest"]
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 60
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Worker: extract  (queue=extract) — LLM-heavy, higher memory limit
+# ---------------------------------------------------------------------------
+workerExtract:
+  enabled: true
+  replicaCount: 2
+  command: ["/app/docker-entrypoint.sh"]
+  args: ["worker_extract"]
+
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 1Gi
+    limits:
+      cpu: 4000m
+      memory: 4Gi
+
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 60
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Worker: score  (queue=score)
+# ---------------------------------------------------------------------------
+workerScore:
+  enabled: true
+  replicaCount: 1
+  command: ["/app/docker-entrypoint.sh"]
+  args: ["worker_score"]
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  hpa:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Worker: notify  (queue=notify)
+# ---------------------------------------------------------------------------
+workerNotify:
+  enabled: true
+  replicaCount: 1
+  command: ["/app/docker-entrypoint.sh"]
+  args: ["worker_notify"]
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  hpa:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Scheduler (Celery beat — SINGLETON, replicas always 1)
+# Leader election via Redis lock is implemented in TODO D14.
+# ---------------------------------------------------------------------------
+scheduler:
+  enabled: true
+  # replicas is intentionally locked to 1 — do NOT scale this.
+  replicaCount: 1
+  command: ["/app/docker-entrypoint.sh"]
+  args: ["scheduler"]
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# ---------------------------------------------------------------------------
+# Alembic migrate Job (Helm hook: pre-install + pre-upgrade)
+# ---------------------------------------------------------------------------
+migrate:
+  enabled: true
+  # Hook weights — runs before api deployment starts
+  hookWeight: "-5"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+# ---------------------------------------------------------------------------
+# Ingress (web + api)
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations: {}
+  # kubernetes.io/ingress.class: nginx
+  # cert-manager.io/cluster-issuer: letsencrypt-prod
+
+  # Web frontend
+  web:
+    host: civicsignals.example.com
+    tls:
+      enabled: false
+      secretName: civicsignals-web-tls
+
+  # API backend
+  # For single-host setups, set api.host = web.host and api.path = /api
+  api:
+    host: api.civicsignals.example.com
+    # path: "/" for dedicated subdomain, or "/api" for single-host path routing
+    path: "/"
+    tls:
+      enabled: false
+      secretName: civicsignals-api-tls
+
+# ---------------------------------------------------------------------------
+# Application secrets (mounted as env vars from a K8s Secret)
+# Set these via --set or a values override — never commit real values!
+# ---------------------------------------------------------------------------
+secrets:
+  # Postgres connection strings (PgBouncer + direct)
+  # In production, DATABASE_URL points at PgBouncer (port 6432).
+  # DATABASE_DIRECT_URL bypasses it (port 5432) for Alembic, LISTEN/NOTIFY.
+  #
+  # Hostname placeholders: when using the bundled PgBouncer, use:
+  #   <release-name>-civicsignals-pgbouncer:6432
+  # When using bundled postgres directly (no pgbouncer), use:
+  #   <release-name>-postgresql:5432
+  # Alembic uses async_engine_from_config so both URLs must use an async driver.
+  databaseUrl: "postgresql+asyncpg://civicsignals:CHANGEME@RELEASE-NAME-civicsignals-pgbouncer:6432/civicsignals"
+  # DATABASE_DIRECT_URL bypasses PgBouncer (port 5432) for Alembic DDL, LISTEN/NOTIFY.
+  # Must point at the raw Postgres service, NOT PgBouncer.
+  databaseDirectUrl: "postgresql+asyncpg://civicsignals:CHANGEME@RELEASE-NAME-postgresql:5432/civicsignals"
+
+  # Celery broker + result backend (separate Redis DBs to avoid key collisions)
+  # When using bundled Redis: redis://RELEASE-NAME-redis-master:6379/1
+  celeryBrokerUrl: "redis://RELEASE-NAME-civicsignals-redis-master:6379/1"
+  celeryResultBackend: "redis://RELEASE-NAME-civicsignals-redis-master:6379/2"
+
+  redisUrl: "redis://RELEASE-NAME-civicsignals-redis-master:6379/0"
+
+  # S3 / MinIO credentials
+  s3AccessKeyId: "CHANGEME"
+  s3SecretAccessKey: "CHANGEME"
+
+  # JWT / session signing key  (generate: openssl rand -hex 32)
+  secretKey: "CHANGEME-32-byte-hex-secret-key-here"
+
+  # LLM provider keys (leave empty to disable the provider)
+  anthropicApiKey: ""
+  openaiApiKey: ""
+
+  # Email / SMTP (Resend SMTP or any SMTP relay)
+  smtpHost: "smtp.resend.com"
+  smtpPort: "587"
+  smtpUser: "resend"
+  smtpPassword: ""
+  # Matches Settings.email_from (env var EMAIL_FROM) in apps/api/src/civicsignals_api/config.py
+  emailFrom: "noreply@civicsignals.example.com"
+
+  # PgBouncer DB password (used by the bundled PgBouncer Deployment).
+  # Set to the Postgres user password; not needed when bundled.postgres.enabled=true
+  # if the bundled subchart manages credentials internally.
+  pgbouncerDbPassword: "CHANGEME"
+
+  # Sentry (optional; leave empty to disable)
+  sentryDsn: ""
+
+# ---------------------------------------------------------------------------
+# ConfigMap (non-secret runtime config)
+# ---------------------------------------------------------------------------
+config:
+  # S3 settings — env var names match apps/api/src/civicsignals_api/config.py Settings
+  # S3_ENDPOINT_URL: empty string = AWS S3; set to MinIO URL for bundled/eval
+  # e.g. "http://RELEASE-NAME-civicsignals-minio:9000" when bundled.minio.enabled=true
+  s3EndpointUrl: ""
+  s3RawBucket: "civicsignals"
+  s3Region: "us-east-1"
+
+  # Log level: DEBUG | INFO | WARNING | ERROR
+  logLevel: "INFO"
+
+  # Environment label (development | staging | production)
+  environment: "production"
+
+  # API public base URL (used for webhook callbacks, email links)
+  apiBaseUrl: "https://api.civicsignals.example.com"
+  webBaseUrl: "https://civicsignals.example.com"
+
+  # Celery concurrency per worker type.
+  # Injected as CELERYD_CONCURRENCY env var (read natively by Celery to set pool size).
+  # Increase for CPU-bound workers; tune alongside resource limits.
+  celeryIngestConcurrency: "4"
+  celeryExtractConcurrency: "2"
+  celeryScoreConcurrency: "4"
+  celeryNotifyConcurrency: "4"
+
+# ---------------------------------------------------------------------------
+# Bundled datastores (for evaluation / local K8s; NOT for production)
+# Set bundled.*.enabled = true to include the subchart.
+# Each `enabled` flag is read by Chart.yaml dependency conditions.
+#
+# Subchart configuration lives under the top-level alias keys below
+# (postgresql / redis / minio) which Helm passes to each subchart.
+# ---------------------------------------------------------------------------
+bundled:
+  postgres:
+    enabled: false
+  redis:
+    enabled: false
+  minio:
+    enabled: false
+
+# Bitnami postgresql subchart values (alias: postgresql).
+# Only applied when bundled.postgres.enabled=true.
+postgresql:
+  auth:
+    username: civicsignals
+    password: civicsignals
+    database: civicsignals
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+    # pgvector extension — created via initdbScripts on first boot
+    initdbScripts:
+      enable_pgvector.sql: |
+        CREATE EXTENSION IF NOT EXISTS vector;
+
+# Bitnami redis subchart values (alias: redis).
+# Only applied when bundled.redis.enabled=true.
+redis:
+  auth:
+    enabled: false
+  master:
+    persistence:
+      enabled: true
+      size: 2Gi
+
+# Bitnami minio subchart values (alias: minio).
+# Only applied when bundled.minio.enabled=true.
+minio:
+  auth:
+    rootUser: civicsignals
+    rootPassword: civicsignals
+  defaultBuckets: "civicsignals"
+  persistence:
+    enabled: true
+    size: 20Gi
+
+# ---------------------------------------------------------------------------
+# PgBouncer sidecar/deployment (transaction-mode connection pool)
+# Only relevant when using external Postgres. For bundled postgres, you may
+# disable PgBouncer and point DATABASE_URL directly at the Postgres service.
+# ---------------------------------------------------------------------------
+pgbouncer:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: edoburu/pgbouncer
+    # Pin to a specific version for reproducibility; bump explicitly on upgrade.
+    tag: "1.23.1"
+    pullPolicy: IfNotPresent
+
+  # edoburu/pgbouncer connection parameters (DB_HOST / DB_USER / etc.)
+  # Defaults assume the bundled postgresql subchart; override for external RDS.
+  # dbHost defaults to "<release>-postgresql" (Bitnami subchart Service name).
+  dbHost: ""       # e.g. "my-rds.cluster.us-east-1.rds.amazonaws.com"
+  dbPort: "5432"
+  dbUser: "civicsignals"
+  dbName: "civicsignals"
+  # DB_PASSWORD is read from secrets.pgbouncerDbPassword; add it to your
+  # values override.  It defaults to "" (no auth) which is only safe in dev.
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  service:
+    port: 6432

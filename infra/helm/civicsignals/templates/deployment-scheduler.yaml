@@ -1,0 +1,94 @@
+# CivicSignals — scheduler Deployment (Celery beat — SINGLETON)
+#
+# IMPORTANT: replicas is ALWAYS 1. Running multiple Celery beat instances
+# causes duplicate task scheduling. Leader election via Redis distributed lock
+# is planned for task D14.  Until then, this Deployment enforces singleton
+# semantics at the Kubernetes level (Recreate strategy, replicas: 1).
+#
+# task O3 / doc 06 §1, §8, §10
+# SPDX-License-Identifier: AGPL-3.0-only
+{{- if .Values.scheduler.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-scheduler
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+  annotations:
+    # Document the singleton requirement for operators
+    civicsignals.io/note: "Celery beat scheduler — must run as a singleton (replicas=1). See TODO D14."
+spec:
+  # SINGLETON — do not override replicas for this component
+  replicas: 1
+  # Recreate (not RollingUpdate) prevents two beat instances being alive at
+  # the same time during a rollout, which would cause duplicate task runs.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "civicsignals.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: scheduler
+  template:
+    metadata:
+      labels:
+        {{- include "civicsignals.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: scheduler
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "civicsignals.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: scheduler
+          image: {{ include "civicsignals.apiImage" . }}
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          command:
+            {{- toYaml .Values.scheduler.command | nindent 12 }}
+          args:
+            {{- toYaml .Values.scheduler.args | nindent 12 }}
+          env:
+            {{- include "civicsignals.apiEnv" . | nindent 12 }}
+            {{- with .Values.scheduler.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            # Celery beat stores its schedule in a file; use an emptyDir so
+            # the scheduler pod can write to it (readOnlyRootFilesystem=true
+            # means we need an explicit writable mount).
+            - name: beat-schedule
+              mountPath: /app/celerybeat-schedule
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: beat-schedule
+          emptyDir: {}
+      {{- with .Values.scheduler.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduler.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduler.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

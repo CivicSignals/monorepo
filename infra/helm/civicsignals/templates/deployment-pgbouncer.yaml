@@ -1,0 +1,114 @@
+# CivicSignals — PgBouncer Deployment (transaction-mode connection pool)
+#
+# In production the API app connects through PgBouncer (port 6432) rather
+# than directly to Postgres. This caps backend connections at ~25-40 per RDS
+# instance even when many worker pods are running (doc 06 §4).
+#
+# The edoburu/pgbouncer image is configured via DB_HOST, DB_USER, DB_PASSWORD,
+# DB_NAME env vars (not a connection URL). See infra/docker-compose.yml for the
+# reference configuration.
+#
+# task O3 / doc 06 §4, §10
+# SPDX-License-Identifier: AGPL-3.0-only
+{{- if .Values.pgbouncer.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-pgbouncer
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbouncer
+spec:
+  replicas: {{ .Values.pgbouncer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "civicsignals.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pgbouncer
+  template:
+    metadata:
+      labels:
+        {{- include "civicsignals.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: pgbouncer
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "civicsignals.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: pgbouncer
+          image: {{ .Values.pgbouncer.image.repository }}:{{ .Values.pgbouncer.image.tag }}
+          imagePullPolicy: {{ .Values.pgbouncer.image.pullPolicy }}
+          ports:
+            - name: pgbouncer
+              containerPort: 6432
+              protocol: TCP
+          env:
+            # edoburu/pgbouncer expects individual connection parameters,
+            # not a connection URL.  Override these via pgbouncer.extraEnv
+            # or set pgbouncer.dbHost/dbUser/dbPassword/dbName in values.
+            # Default to <release>-postgresql which matches the Bitnami postgresql
+            # subchart Service name (alias: postgresql). Override for external RDS.
+            - name: DB_HOST
+              value: {{ .Values.pgbouncer.dbHost | default (printf "%s-postgresql" .Release.Name) | quote }}
+            - name: DB_PORT
+              value: {{ .Values.pgbouncer.dbPort | default "5432" | quote }}
+            - name: DB_USER
+              value: {{ .Values.pgbouncer.dbUser | default "civicsignals" | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "civicsignals.fullname" . }}-secret
+                  key: PGBOUNCER_DB_PASSWORD
+                  optional: true
+            - name: DB_NAME
+              value: {{ .Values.pgbouncer.dbName | default "civicsignals" | quote }}
+            - name: POOL_MODE
+              value: "transaction"
+            - name: AUTH_TYPE
+              value: "scram-sha-256"
+            - name: MAX_CLIENT_CONN
+              value: "1000"
+            - name: DEFAULT_POOL_SIZE
+              value: "25"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            tcpSocket:
+              port: 6432
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: 6432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.pgbouncer.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "civicsignals.fullname" . }}-pgbouncer
+  labels:
+    {{- include "civicsignals.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbouncer
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.pgbouncer.service.port }}
+      targetPort: pgbouncer
+      protocol: TCP
+      name: pgbouncer
+  selector:
+    {{- include "civicsignals.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbouncer
+{{- end }}
