@@ -18,14 +18,20 @@ import json
 from pathlib import Path
 
 from .runner import Recipe, RecipeError, RecipeRunner, load_recipe, recipes_dir
-from .schemas import ExtractedDocument, FixtureReplayResult
+from .schemas import ExtractedDocument, ExtractionMethod, FixtureReplayResult
 
 
 def _project(doc: ExtractedDocument) -> dict[str, object]:
-    """Project an extraction to the committed expected-JSON shape."""
+    """Project an extraction to the committed expected-JSON shape.
+
+    ``extraction_method`` is an :class:`ExtractionMethod` enum on the model; we
+    project its string value so the committed ``*.expected.json`` (which stores a
+    plain string like ``"primary"`` / ``"fallback"``) compares cleanly.
+    """
+    method = doc.extraction_method
     return {
         "signal_types": list(doc.signal_types),
-        "extraction_method": doc.extraction_method,
+        "extraction_method": method.value if isinstance(method, ExtractionMethod) else method,
         "degraded": doc.degraded,
         "fields": dict(doc.fields),
     }

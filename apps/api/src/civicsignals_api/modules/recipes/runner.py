@@ -1,4 +1,4 @@
-"""Recipe DSL loader + lifecycle runner (doc 18 §2, §3; TODO D1).
+"""Recipe DSL loader + lifecycle runner (doc 18 §2, §3; TODO D1, D11).
 
 This is the orchestration skeleton for the connector lifecycle
 ``discover -> fetch -> extract -> normalize``. It is deliberately connector- and
@@ -12,9 +12,11 @@ here we:
   thing is testable offline,
 * honor ``robots.txt`` and a **politeness window** (delay + jitter) in ``fetch``,
 * pin the ``recipe_version`` onto every raw/extracted/canonical record,
-* extract fields using the recipe's **primary selector** (index 0). The ordered
-  fallback chain (flag ``degraded: true`` on a fallback hit) is a clean,
-  documented extension point left for D11 — see ``_extract_field``.
+* extract fields through the **ordered fallback chain** (doc 18 §3.4): primary
+  selector → fallback selector(s) → optional **LLM-assisted** extraction →
+  **dead-letter**. The first non-empty result wins; a non-primary win flags the
+  document ``degraded: true`` and ticks the per-recipe drift counters that E7
+  (drift detection) will consume. See ``_extract_field``.
 
 The public surface other modules call is in ``services.py``; this module is the
 implementation it delegates to.
@@ -22,6 +24,7 @@ implementation it delegates to.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import random
@@ -43,10 +46,16 @@ from civicsignals_api.config import get_settings
 
 from .schemas import (
     CanonicalRecord,
+    DeadLetterEntry,
+    DriftCounters,
     ExtractedDocument,
+    ExtractionMethod,
+    FieldExtraction,
     FieldSpec,
     RawDocument,
     Recipe,
+    Selector,
+    SelectorType,
     SourcePointer,
 )
 
@@ -225,6 +234,99 @@ class RealClock:
             time.sleep(seconds)
 
 
+# ----------------------------------------------------------------------------
+# LLM-assisted extraction seam (doc 18 §2.3, §3.4)
+# ----------------------------------------------------------------------------
+# The third rung of the fallback chain: when every CSS/XPath selector misses on a
+# field flagged ``llm_assisted``, ask the LLM gateway to pull the value out of the
+# raw text. The seam is a Protocol so tests inject a deterministic extractor
+# (backed by the gateway's FakeBackend) and the runner stays offline; production
+# wires the real gateway via :class:`GatewayFieldExtractor`.
+
+
+@runtime_checkable
+class LLMFieldExtractor(Protocol):
+    """Extract one field's value from raw text via the LLM gateway.
+
+    Returns the extracted string, or ``None`` when the model produced nothing
+    usable (which dead-letters the field). Implementations must route through
+    ``civicsignals_api.llm_gateway`` — never a vendor SDK directly (doc 06 §7).
+    """
+
+    def extract_field(
+        self,
+        *,
+        field_name: str,
+        text: str,
+        recipe_id: str,
+        prompt_name: str | None,
+    ) -> str | None: ...
+
+
+# Default LLM-assisted extraction prompt. The prompt registry (TODO E3) will
+# resolve ``prompt_name`` to a versioned prompt; until it lands we inline this
+# sensible default and thread ``prompt_name`` through for accounting/provenance.
+_DEFAULT_LLM_EXTRACTION_SYSTEM = (
+    "You extract a single field value from a web page's visible text. "
+    "Return only the field's value as plain text, with no labels, quotes, or "
+    "commentary. If the value is not present, return an empty string."
+)
+# Cap the raw text we hand the model so a pathological page can't blow the token
+# budget; the meaningful content for a single field is near the top of the doc.
+_LLM_TEXT_CHAR_BUDGET = 12_000
+
+
+class GatewayFieldExtractor:
+    """Default :class:`LLMFieldExtractor` backed by the shared LLM gateway.
+
+    Uses the gateway's ``extraction`` task policy (a small/cheap model first, per
+    doc 18 §6.6) and the inline default prompt. The gateway is imported lazily so
+    the recipes module imports cleanly in images without the extraction extra; a
+    missing/disabled backend surfaces as ``None`` (field dead-letters) rather
+    than crashing the whole run.
+    """
+
+    def __init__(self, *, workspace_id: str | None = None) -> None:
+        self._workspace_id = workspace_id
+
+    def extract_field(
+        self,
+        *,
+        field_name: str,
+        text: str,
+        recipe_id: str,
+        prompt_name: str | None,
+    ) -> str | None:
+        # Lazy import: only the extract worker carries the gateway's deps.
+        from civicsignals_api.llm_gateway import TASK_EXTRACTION, LLMError, get_gateway
+
+        gateway = get_gateway()
+        prompt = (
+            f"# TODO E3: replace with the versioned registry prompt "
+            f"{prompt_name or '<default>'!r}.\n"
+            f"Recipe: {recipe_id}\n"
+            f"Extract the value of the field {field_name!r} from this page text:\n\n"
+            f"{text[:_LLM_TEXT_CHAR_BUDGET]}"
+        )
+        try:
+            result = asyncio.run(
+                gateway.complete(
+                    prompt=prompt,
+                    task=TASK_EXTRACTION,
+                    system=_DEFAULT_LLM_EXTRACTION_SYSTEM,
+                    max_tokens=256,
+                    workspace_id=self._workspace_id,
+                    prompt_name=prompt_name,
+                )
+            )
+        except LLMError:
+            # Provider down / no backend / permanent error -> dead-letter the
+            # field. Drift counters + the dead-letter sink make this visible.
+            return None
+        value = result.text.strip()
+        return value or None
+
+
 def _content_hash(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -257,7 +359,8 @@ def _robots_allows(
 
 
 # ----------------------------------------------------------------------------
-# Extractor: CSS-selector-based, primary selector only (D1)
+# Extractor: ordered selector fallback chain (CSS/XPath), then LLM, then
+# dead-letter (D11; doc 18 §3.4)
 # ----------------------------------------------------------------------------
 
 
@@ -270,27 +373,101 @@ def _parse_html(html: str) -> BeautifulSoup:
     return BeautifulSoup(html, "html.parser")
 
 
-def _extract_field(soup: BeautifulSoup, spec: FieldSpec) -> str | None:
-    """Extract one field's value from an already-parsed ``soup``.
+def _value_from_element(element: Tag, attr: str | None) -> str | None:
+    """Read ``attr`` (or the text content) off a matched element.
 
-    Takes the shared DOM so ``extract()`` parses the document once regardless of
-    field count. D1 evaluates ``spec.selectors[0]`` only. The ordered fallback
-    chain — try each later selector, flag ``degraded: true`` and tick the drift
-    counter when a fallback matches — is D11. The extension point is intentional:
-    iterate ``spec.selectors`` here and thread a ``degraded`` flag back out.
+    Returns ``None`` for an empty/absent value so the caller treats it as a miss
+    and advances to the next selector (first non-empty result wins, doc 18 §3.4).
     """
-    primary = spec.selectors[0]
-    element = soup.select_one(primary)
-    if element is None or not isinstance(element, Tag):
-        return None
-    if spec.attr is not None:
-        value = element.get(spec.attr)
+    if attr is not None:
+        value = element.get(attr)
         if value is None:
             return None
-        if isinstance(value, list):  # multi-valued attr (e.g. class)
-            return " ".join(value)
-        return str(value)
-    return element.get_text(strip=True)
+        text = " ".join(value) if isinstance(value, list) else str(value)
+    else:
+        text = element.get_text(strip=True)
+    return text or None
+
+
+def _eval_css(soup: BeautifulSoup, selector: str, attr: str | None) -> str | None:
+    element = soup.select_one(selector)
+    if element is None or not isinstance(element, Tag):
+        return None
+    return _value_from_element(element, attr)
+
+
+def _eval_xpath(html: str, selector: str, attr: str | None) -> str | None:
+    """Evaluate an XPath selector against ``html`` using lxml.
+
+    lxml ships only with the ``ingestion`` extra (see pyproject), so we import it
+    lazily and raise a clear :class:`RecipeError` if a recipe declares an XPath
+    selector in an image that lacks it — rather than failing at module import.
+    """
+    try:
+        from lxml import html as lxml_html  # type: ignore[import-untyped]
+    except ImportError as exc:  # pragma: no cover - depends on the install extra
+        raise RecipeError("xpath selectors require lxml (install the 'ingestion' extra)") from exc
+
+    tree = lxml_html.fromstring(html)
+    matches = tree.xpath(selector)
+    if not matches:
+        return None
+    first = matches[0]
+    if attr is not None:
+        # On an element node, read the attribute; on a string result (e.g. the
+        # xpath already selected `@attr` or `text()`), use it directly.
+        value = first.get(attr) if hasattr(first, "get") else None
+        text = "" if value is None else str(value)
+    elif hasattr(first, "text_content"):
+        text = str(first.text_content()).strip()
+    else:
+        text = str(first).strip()
+    return text or None
+
+
+def _eval_selector(
+    soup: BeautifulSoup, html: str, selector: Selector, attr: str | None
+) -> str | None:
+    """Evaluate one selector (CSS or XPath) and return its value or ``None``."""
+    if selector.type is SelectorType.XPATH:
+        return _eval_xpath(html, selector.selector, attr)
+    return _eval_css(soup, selector.selector, attr)
+
+
+def _extract_field(soup: BeautifulSoup, html: str, name: str, spec: FieldSpec) -> FieldExtraction:
+    """Run the ordered *selector* chain for one field (doc 18 §3.4).
+
+    Tries ``spec.selectors`` in order; the first non-empty match wins. Index 0 is
+    the primary (``method=primary``); any later hit is a fallback
+    (``method=fallback``, which flags the document degraded). Takes the shared
+    DOM + raw html so ``extract()`` parses the document once regardless of field
+    count. The LLM-assisted and dead-letter rungs are applied by the caller
+    (:meth:`RecipeRunner._resolve_field`) because they need the raw text and the
+    injected LLM extractor.
+    """
+    for index, selector in enumerate(spec.selectors):
+        value = _eval_selector(soup, html, selector, spec.attr)
+        if value is not None:
+            return FieldExtraction(
+                name=name,
+                value=value,
+                method=ExtractionMethod.PRIMARY if index == 0 else ExtractionMethod.FALLBACK,
+                selector_index=index,
+                selector=selector.selector,
+            )
+    # No selector matched — the caller decides between the LLM rung and
+    # dead-letter. Report the miss as dead-letter; the caller may upgrade it.
+    return FieldExtraction(name=name, value=None, method=ExtractionMethod.DEAD_LETTER)
+
+
+# Document-level escalation severity, used to derive the high-water mark
+# ``extraction_method`` from the per-field results.
+_METHOD_SEVERITY: dict[ExtractionMethod, int] = {
+    ExtractionMethod.PRIMARY: 0,
+    ExtractionMethod.FALLBACK: 1,
+    ExtractionMethod.LLM_ASSISTED: 2,
+    ExtractionMethod.DEAD_LETTER: 3,
+}
 
 
 # ----------------------------------------------------------------------------
@@ -312,10 +489,16 @@ class RecipeRunner:
         fetcher: Fetcher,
         *,
         clock: Clock | None = None,
+        llm_extractor: LLMFieldExtractor | None = None,
     ) -> None:
         self.recipe = recipe
         self.fetcher = fetcher
         self.clock = clock if clock is not None else RealClock()
+        # LLM-assisted fallback rung (doc 18 §3.4). Lazily defaulted to the
+        # gateway-backed extractor only when a field actually opts in via
+        # ``llm_assisted: true`` — tests inject a deterministic one, and a
+        # selector-only recipe never constructs the gateway.
+        self._llm_extractor = llm_extractor
         # Per-host timestamp of the last fetch, for the politeness window.
         self._last_fetch_at: dict[str, float] = {}
         # Per-host parsed robots.txt, cached for the duration of this run so a
@@ -323,6 +506,16 @@ class RecipeRunner:
         # ``host in cache`` distinguishes "not yet looked up" from a cached
         # ``None`` (host ships no robots.txt — permissive).
         self._robots_cache: dict[str, urllib.robotparser.RobotFileParser | None] = {}
+
+    def _llm(self) -> LLMFieldExtractor:
+        """Return the LLM extractor, defaulting to the gateway-backed one.
+
+        Constructed lazily so a recipe with no ``llm_assisted`` field never
+        touches the gateway (and so tests that inject one win).
+        """
+        if self._llm_extractor is None:
+            self._llm_extractor = GatewayFieldExtractor()
+        return self._llm_extractor
 
     # -- discover -----------------------------------------------------------
     def discover(self, seed_urls: Sequence[str]) -> list[SourcePointer]:
@@ -407,42 +600,136 @@ class RecipeRunner:
         )
 
     # -- extract ------------------------------------------------------------
-    def extract(self, raw: RawDocument) -> ExtractedDocument:
-        """Run the primary selectors over a raw doc (doc 18 §2.3, §3.1).
+    def _resolve_field(
+        self,
+        *,
+        soup: BeautifulSoup,
+        html: str,
+        page_text: str,
+        name: str,
+        spec: FieldSpec,
+        raw: RawDocument,
+    ) -> tuple[FieldExtraction, DeadLetterEntry | None]:
+        """Resolve one field through the full chain (doc 18 §3.4).
 
-        Required fields (``required: true``) that yield nothing raise
-        :class:`RequiredFieldMissingError` — the boundary contract (doc 18 §3.1):
-        invalid extractions are rejected, not silently swallowed.
+        Selector chain → (if ``llm_assisted``) LLM rung → dead-letter. Returns the
+        winning :class:`FieldExtraction` and, when the field could not be
+        extracted at all, a :class:`DeadLetterEntry` describing the miss.
+        """
+        result = _extract_field(soup, html, name, spec)
+        if result.method is not ExtractionMethod.DEAD_LETTER:
+            return result, None  # primary or fallback selector hit
+
+        # All selectors missed. Try the LLM rung iff this field opted in.
+        if spec.llm_assisted:
+            value = self._llm().extract_field(
+                field_name=name,
+                text=page_text,
+                recipe_id=self.recipe.recipe_id,
+                prompt_name=spec.prompt_name,
+            )
+            if value is not None:
+                return (
+                    FieldExtraction(name=name, value=value, method=ExtractionMethod.LLM_ASSISTED),
+                    None,
+                )
+            reason = "all selectors missed; llm-assisted extraction returned nothing"
+        else:
+            reason = "all selectors missed; llm-assisted extraction disabled for this field"
+
+        # Dead-letter: nothing produced a value. Record why + which selectors we
+        # tried so a human (and E7) can fix the recipe, then replay (doc 18 §3.6).
+        entry = DeadLetterEntry(
+            recipe_id=self.recipe.recipe_id,
+            recipe_version=self.recipe.version,
+            source_url=raw.url,
+            content_hash=raw.content_hash,
+            field_name=name,
+            reason=reason,
+            tried_selectors=[s.selector for s in spec.selectors],
+        )
+        return result, entry
+
+    def extract(self, raw: RawDocument) -> ExtractedDocument:
+        """Run the ordered fallback chain over a raw doc (doc 18 §2.3, §3.1, §3.4).
+
+        Each field is resolved primary → fallback(s) → optional LLM-assisted →
+        dead-letter; the first non-empty result wins. A non-primary win flags the
+        document ``degraded: true`` and ticks the per-recipe drift counters
+        (consumed later by E7). Required fields (``required: true``) that produce
+        nothing — even after the LLM rung — raise
+        :class:`RequiredFieldMissingError`: the boundary contract (doc 18 §3.1)
+        rejects invalid extractions rather than silently swallowing them. (The
+        accompanying dead-letter row still records the miss for replay.)
         """
         soup = _parse_html(raw.content)  # parse once; shared across all fields
+        # Visible text for the LLM rung; computed once and only when needed.
+        page_text = soup.get_text(" ", strip=True) if self._any_llm_assisted() else ""
+
         out: dict[str, str | None] = {}
+        field_extractions: list[FieldExtraction] = []
+        degraded_fields: list[str] = []
+        dead_letters: list[DeadLetterEntry] = []
+        drift = DriftCounters(fields_total=len(self.recipe.fields))
+
         for name, spec in self.recipe.fields.items():
-            value = _extract_field(soup, spec)
-            if value is None and spec.required:
+            result, dead_letter = self._resolve_field(
+                soup=soup, html=raw.content, page_text=page_text, name=name, spec=spec, raw=raw
+            )
+            field_extractions.append(result)
+            out[name] = result.value
+
+            if result.method is ExtractionMethod.FALLBACK:
+                drift.selector_fallbacks += 1
+                drift.fallback_by_field[name] = drift.fallback_by_field.get(name, 0) + 1
+            elif result.method is ExtractionMethod.LLM_ASSISTED:
+                drift.llm_fallbacks += 1
+                drift.llm_by_field[name] = drift.llm_by_field.get(name, 0) + 1
+            if result.degraded:
+                degraded_fields.append(name)
+            if dead_letter is not None:
+                drift.dead_letters += 1
+                drift.dead_letter_by_field[name] = drift.dead_letter_by_field.get(name, 0) + 1
+                dead_letters.append(dead_letter)
+
+            if result.value is None and spec.required:
                 raise RequiredFieldMissingError(name)
-            out[name] = value
+
+        # Document escalation high-water mark across all fields.
+        method = ExtractionMethod.PRIMARY
+        for result in field_extractions:
+            if _METHOD_SEVERITY[result.method] > _METHOD_SEVERITY[method]:
+                method = result.method
 
         # Carry the recipe's full declared signal-type set through — the runner
         # does not guess which one a given record is. Selecting/assigning a
         # concrete signal_type per record is a connector/normalize concern
         # (doc 16 §17.3: connectors produce canonical records; the matcher decides
-        # signals). D1 must not silently drop the recipe's other declared types.
+        # signals). The runner must not silently drop the recipe's other types.
         return ExtractedDocument(
             recipe_id=self.recipe.recipe_id,
             recipe_version=self.recipe.version,
             signal_types=list(self.recipe.signal_types),
-            extraction_method="primary",
-            degraded=False,
+            extraction_method=method,
+            degraded=bool(degraded_fields),
             fields=out,
+            field_extractions=field_extractions,
+            degraded_fields=degraded_fields,
+            dead_letters=dead_letters,
+            drift=drift,
         )
+
+    def _any_llm_assisted(self) -> bool:
+        return any(spec.llm_assisted for spec in self.recipe.fields.values())
 
     # -- normalize ----------------------------------------------------------
     def normalize(self, extracted: ExtractedDocument, source_url: str) -> list[CanonicalRecord]:
         """Map an extraction to canonical records (doc 18 §2.4, doc 16 §17.3).
 
-        D1 emits the skeleton record carrying the recipe's entity ref + extracted
-        fields + provenance. Entity resolution and signal scoring are downstream
-        (doc 14, doc 18 §2.4).
+        Emits the skeleton record carrying the recipe's entity ref + extracted
+        fields + provenance (degraded flag, degraded field names, dead-letter
+        entries). Entity resolution and signal scoring are downstream (doc 14,
+        doc 18 §2.4).
         """
         return [
             CanonicalRecord(
@@ -453,6 +740,8 @@ class RecipeRunner:
                 entity=self.recipe.entity,
                 signal_types=list(extracted.signal_types),
                 degraded=extracted.degraded,
+                degraded_fields=list(extracted.degraded_fields),
+                dead_letters=list(extracted.dead_letters),
                 fields=extracted.fields,
             )
         ]
@@ -488,6 +777,8 @@ class RecipeRunner:
 __all__ = [
     "Clock",
     "Fetcher",
+    "GatewayFieldExtractor",
+    "LLMFieldExtractor",
     "RealClock",
     "Recipe",
     "RecipeError",
