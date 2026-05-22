@@ -27,9 +27,9 @@ from civicsignals_api.modules.smart_search.schemas import SearchFilters, Structu
 from civicsignals_api.modules.smart_search.services import QueryRewriter
 
 
-def _gateway(backend: FakeBackend, **kwargs: object) -> LLMGateway:
+def _gateway(backend: FakeBackend, *, max_attempts: int = 3) -> LLMGateway:
     policy = TaskModelPolicy(overrides={TASK_SMART_SEARCH_REWRITE: ModelChoice("fake", "haiku")})
-    return LLMGateway({"fake": backend}, policy=policy, **kwargs)  # type: ignore[arg-type]
+    return LLMGateway({"fake": backend}, policy=policy, max_attempts=max_attempts)
 
 
 # --- NL -> structured (canned good output) -------------------------------
@@ -89,6 +89,29 @@ async def test_rewrite_tolerates_markdown_fenced_json() -> None:
 
     assert query.filters.signal_type == ["grant_awarded"]
     assert query.text == "grants"
+    assert query.degraded is False
+
+
+async def test_rewrite_extracts_first_object_with_trailing_prose_braces() -> None:
+    # Balanced-brace extraction: a trailing "}" in prose (or a second object) must
+    # not corrupt the slice into the first complete object.
+    first = json.dumps({"text": "rfps", "filters": {"signal_type": ["rfp_posted"]}})
+    canned = first + "\n\nNote: use {curly braces} carefully. {also: ignored}"
+    rewriter = QueryRewriter(_gateway(FakeBackend(responses=[canned])))
+    query, _ = await rewriter.rewrite("open rfps")
+
+    assert query.filters.signal_type == ["rfp_posted"]
+    assert query.text == "rfps"
+    assert query.degraded is False
+
+
+async def test_rewrite_extracts_object_with_braces_inside_strings() -> None:
+    # A "}" inside a string literal must not be treated as the closing brace.
+    canned = json.dumps({"text": "weird } value", "filters": {}})
+    rewriter = QueryRewriter(_gateway(FakeBackend(responses=[canned])))
+    query, _ = await rewriter.rewrite("weird")
+
+    assert query.text == "weird } value"
     assert query.degraded is False
 
 
@@ -241,6 +264,13 @@ def test_search_filters_dedupes_and_uppercases_state() -> None:
     assert f.state == ["WA", "OR"]
 
 
+def test_search_filters_drops_blank_and_non_two_letter_states() -> None:
+    # Blanks and full names (e.g. an unresolved "Washington") are discarded so
+    # only valid two-letter codes reach downstream query building.
+    f = SearchFilters(state=["WASHINGTON", "  ", "tx", "1A"])
+    assert f.state == ["TX"]
+
+
 def test_structured_query_is_empty_helper() -> None:
     assert SearchFilters().is_empty()
     assert not SearchFilters(min_score=0.0).is_empty()
@@ -284,6 +314,14 @@ def test_rewrite_endpoint_returns_structured_query(monkeypatch: pytest.MonkeyPat
 def test_rewrite_endpoint_rejects_empty_query() -> None:
     client = TestClient(app)
     response = client.post("/api/v1/smart-search/rewrite", json={"query": ""})
+    assert response.status_code == 422
+
+
+def test_rewrite_endpoint_rejects_whitespace_only_query() -> None:
+    # Whitespace is stripped at the schema level, so a blank body fails the same
+    # 422 path as an empty string rather than yielding a 200 with empty text.
+    client = TestClient(app)
+    response = client.post("/api/v1/smart-search/rewrite", json={"query": "   "})
     assert response.status_code == 422
 
 

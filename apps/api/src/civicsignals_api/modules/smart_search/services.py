@@ -181,17 +181,43 @@ class QueryRewriter:
 
     @staticmethod
     def _extract_json_object(raw: str) -> dict[str, Any] | None:
-        """Pull the first JSON object out of a model body.
+        """Pull the first balanced JSON object out of a model body.
 
-        Tolerates surrounding prose or ```` ```json ```` fences by slicing from the
-        first ``{`` to the last ``}`` before parsing.
+        Tolerates surrounding prose or ```` ```json ```` fences. Scans from the
+        first ``{`` and tracks brace depth (ignoring braces inside string
+        literals) to find the matching ``}``, so trailing braces in prose or a
+        second object after the first do not break parsing.
         """
         start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end < start:
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        candidate: str | None = None
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start : i + 1]
+                    break
+        if candidate is None:
             return None
         try:
-            obj = json.loads(raw[start : end + 1])
+            obj = json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
             return None
         return obj if isinstance(obj, dict) else None

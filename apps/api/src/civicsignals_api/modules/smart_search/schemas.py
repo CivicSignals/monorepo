@@ -12,9 +12,9 @@ it does not execute the search.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 # Closed enums copied from the documented feed filters (doc 08 §3.2). The rewrite
 # must only emit values from these sets; anything else is dropped during repair so
@@ -65,10 +65,16 @@ class SearchFilters(BaseModel):
     def _normalize_and_check(self) -> SearchFilters:
         # State codes are case-insensitive in NL ("washington" is resolved to the
         # code upstream); store them upper-cased and de-duplicated, order-stable.
+        # Only keep two-letter codes — blanks and full names like "WASHINGTON"
+        # are dropped here so invalid values never reach downstream query building
+        # (the rewrite's repair pass should resolve names to codes; anything that
+        # slips through is discarded rather than propagated).
         if self.state:
             seen: dict[str, None] = {}
             for code in self.state:
-                seen.setdefault(code.strip().upper(), None)
+                normalized = code.strip().upper()
+                if len(normalized) == 2 and normalized.isalpha():
+                    seen.setdefault(normalized, None)
             self.state = list(seen)
         # A backwards date range is incoherent; reject so repair/fallback runs.
         if (
@@ -128,11 +134,16 @@ class RewriteUsage(BaseModel):
 
 
 class RewriteRequest(BaseModel):
-    """``POST /smart-search/rewrite`` request body."""
+    """``POST /smart-search/rewrite`` request body.
+
+    ``query`` is whitespace-stripped before length validation so a blank/whitespace
+    -only body is rejected with a 422 rather than silently producing an empty
+    rewrite. ``max_length`` guards the upstream prompt size.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(min_length=1, max_length=2000)
+    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
 
 
 class RewriteResponse(BaseModel):
