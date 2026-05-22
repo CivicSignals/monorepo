@@ -110,7 +110,7 @@ Rules:
 """
 
 # TODO E3: inline default summary prompt. Move to
-# apps/api/prompts/smart_search_summary/v1.txt once the prompt registry exists;
+# apps/api/prompts/smart_search_summary/v1.md once the prompt registry exists;
 # reference it via SUMMARY_PROMPT_NAME/SUMMARY_PROMPT_VERSION.
 _SUMMARY_SYSTEM_PROMPT = """\
 You synthesize the top results from a CivicSignals smart search into a concise
@@ -469,6 +469,12 @@ class ResultSummarizer:
         top = list(results[:SUMMARY_TOP_N])
         prompt = self._build_prompt(query, top)
         try:
+            # E2 seam: ``prompt=`` is set, so the gateway uses the raw inline
+            # text and treats ``prompt_name``/``prompt_version`` as provenance
+            # metadata only (no registry lookup). Once E3 lands, remove
+            # ``prompt=`` and ``system=`` here; the registry will resolve
+            # ``SUMMARY_PROMPT_NAME`` to ``apps/api/prompts/
+            # smart_search_summary/v1.md`` and render both body + system.
             result = await self._gateway.complete(
                 prompt=prompt,
                 task=TASK_SMART_SEARCH_SUMMARY,
