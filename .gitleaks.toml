@@ -1,0 +1,22 @@
+# gitleaks configuration for CivicSignals
+#
+# Extends the default gitleaks ruleset and adds a narrow allowlist for a known
+# class of false positives in our Kubernetes/Helm manifests.
+title = "CivicSignals gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Kubernetes manifests reference ConfigMap/Secret KEY NAMES via `key: <NAME>` inside
+`valueFrom` blocks (e.g. `key: S3_RAW_BUCKET`). These are configuration key *names*,
+not secret values — actual secrets are injected from Kubernetes Secrets at deploy time.
+The default `generic-api-key` rule false-positives on the uppercase key name, so we
+allowlist lines that are exactly a `key:` reference to an UPPER_SNAKE_CASE config key.
+This does not suppress real secret values (quoted/base64/mixed-case high-entropy strings).
+"""
+regexTarget = "line"
+regexes = [
+  '''^\s*key:\s*[A-Z][A-Z0-9_]+\s*$''',
+]
