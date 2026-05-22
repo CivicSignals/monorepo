@@ -16,6 +16,7 @@ Test cases:
 
 from __future__ import annotations
 
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -23,7 +24,6 @@ from fastapi.testclient import TestClient
 
 from civicsignals_api import events
 from civicsignals_api.events import AUTH_PASSWORD_RESET_COMPLETED, AUTH_PASSWORD_RESET_REQUESTED
-from civicsignals_api.main import app
 from civicsignals_api.modules.notifications import services as notifications_services
 
 SIGNUP = "/api/v1/auth/signup"
@@ -47,13 +47,12 @@ def _token_from_reset_email(recorder: notifications_services.RecordingEmailSende
     raise AssertionError("no reset token found in email body")
 
 
-def _signup_and_login(
-    client: TestClient, email: str = EMAIL, password: str = PASSWORD
-) -> str:
+def _signup_and_login(client: TestClient, email: str = EMAIL, password: str = PASSWORD) -> str:
     """Sign up a user and return an access token."""
     r = client.post(SIGNUP, json={"email": email, "password": password})
     assert r.status_code == 201, r.text
-    return r.json()["tokens"]["access_token"]
+    token: str = r.json()["tokens"]["access_token"]
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +169,9 @@ def test_reset_confirm_invalidates_other_pending_tokens(
 
 
 def test_reset_confirm_unknown_token_is_400(client: TestClient) -> None:
-    resp = client.post(RESET_CONFIRM, json={"token": "totally-made-up-xyz", "new_password": NEW_PASSWORD})
+    resp = client.post(
+        RESET_CONFIRM, json={"token": "totally-made-up-xyz", "new_password": NEW_PASSWORD}
+    )
     assert resp.status_code == 400
     assert resp.headers["content-type"].startswith("application/problem+json")
     assert resp.json()["type"].endswith("/invalid_reset_token")
@@ -203,9 +204,9 @@ async def test_reset_request_emits_audit_event(
     _signup_and_login(client)
     recorder.sent.clear()
 
-    emitted: list[dict] = []
+    emitted: list[dict[str, Any]] = []
 
-    async def _capture(payload: dict) -> None:  # type: ignore[type-arg]
+    async def _capture(payload: dict[str, Any]) -> None:
         emitted.append(payload)
 
     events.subscribe(AUTH_PASSWORD_RESET_REQUESTED, _capture)
@@ -234,9 +235,9 @@ async def test_reset_confirm_emits_audit_event(
     _signup_and_login(client)
     recorder.sent.clear()
 
-    emitted: list[dict] = []
+    emitted: list[dict[str, Any]] = []
 
-    async def _capture(payload: dict) -> None:  # type: ignore[type-arg]
+    async def _capture(payload: dict[str, Any]) -> None:
         emitted.append(payload)
 
     events.subscribe(AUTH_PASSWORD_RESET_COMPLETED, _capture)

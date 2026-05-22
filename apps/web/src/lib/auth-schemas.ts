@@ -29,3 +29,33 @@ export const loginSchema = z.object({
 });
 
 export type LoginValues = z.infer<typeof loginSchema>;
+
+// --- B3: Password reset -------------------------------------------------------
+
+export const forgotPasswordSchema = z.object({
+  email: z.string().email("Enter a valid email address."),
+});
+
+export type ForgotPasswordValues = z.infer<typeof forgotPasswordSchema>;
+
+export const resetPasswordSchema = z
+  .object({
+    token: z.string().min(1, "Reset token is required."),
+    new_password: z
+      .string()
+      .min(
+        PASSWORD_MIN_LEN,
+        `Password must be at least ${PASSWORD_MIN_LEN} characters.`,
+      )
+      .max(
+        PASSWORD_MAX_LEN,
+        `Password must be at most ${PASSWORD_MAX_LEN} characters.`,
+      ),
+    confirm_password: z.string().min(1, "Confirm your new password."),
+  })
+  .refine((data) => data.new_password === data.confirm_password, {
+    message: "Passwords do not match.",
+    path: ["confirm_password"],
+  });
+
+export type ResetPasswordValues = z.infer<typeof resetPasswordSchema>;
