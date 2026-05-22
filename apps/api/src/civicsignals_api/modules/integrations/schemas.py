@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
@@ -94,6 +95,9 @@ class PushLogOut(BaseModel):
     target: str
     status: PushStatus
     external_id: str | None = None
+    # The (secret-redacted) request payload shaped for the provider. Surfaced so
+    # the recovery UI can show what was sent (model stores it redacted already).
+    request: dict[str, Any] = Field(default_factory=dict)
     error: PushErrorOut | None = None
     attempt_count: int
     retry_at: datetime | None = None
@@ -117,6 +121,7 @@ class PushLogOut(BaseModel):
             target=log.target,
             status=log.status,
             external_id=log.external_id,
+            request=dict(log.request or {}),
             error=error,
             attempt_count=log.attempt_count,
             retry_at=log.retry_at,

@@ -365,7 +365,9 @@ def test_retry_non_failed_row_is_conflict(client: TestClient) -> None:
 
     resp = client.post(_retry_url(log_id), headers=_hdr(token, ws["id"]))
     assert resp.status_code == 409, resp.text
-    assert resp.json()["code"] == "not_retryable"
+    # RFC 7807 problem body carries the machine code in the ``type`` URI
+    # (https://docs.civicsignals.io/errors/<code>), not a top-level ``code``.
+    assert resp.json()["type"].endswith("/not_retryable")
 
 
 def test_retry_missing_row_is_404(client: TestClient) -> None:

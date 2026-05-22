@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
+from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -32,6 +34,7 @@ from civicsignals_api.modules.accounts.models import (  # noqa: F401
 )
 from civicsignals_api.modules.admin.models import AuditEvent  # noqa: F401
 from civicsignals_api.modules.auth.models import EmailVerificationToken  # noqa: F401
+from civicsignals_api.modules.integrations import services
 from civicsignals_api.modules.integrations.models import (  # noqa: F401
     Connection,
     FieldMapping,
@@ -80,3 +83,70 @@ def client() -> Iterator[TestClient]:
         yield test_client
     app.dependency_overrides.pop(get_session, None)
     asyncio.run(engine.dispose())
+
+
+# ---------------------------------------------------------------------------
+# Mock Salesforce REST transport injected via services.default_http_client.
+# Shared from conftest so both test_salesforce_api.py and the K6 template
+# auto-apply-on-push test (test_templates.py) can drive a push without a live org.
+# ---------------------------------------------------------------------------
+
+
+def _salesforce_handler(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    if path.endswith("/sobjects"):
+        return httpx.Response(
+            200,
+            json={
+                "sobjects": [
+                    {"name": "Opportunity", "label": "Opportunity", "createable": True},
+                    {
+                        "name": "Civic_Signal__c",
+                        "label": "Civic Signal",
+                        "createable": True,
+                        "custom": True,
+                    },
+                    {"name": "ReadOnly", "label": "RO", "createable": False},
+                ]
+            },
+        )
+    if path.endswith("/describe"):
+        return httpx.Response(
+            200,
+            json={
+                "fields": [
+                    {
+                        "name": "Name",
+                        "label": "Name",
+                        "type": "string",
+                        "createable": True,
+                        "updateable": True,
+                        "nillable": False,
+                    },
+                    {
+                        "name": "Amount",
+                        "label": "Amount",
+                        "type": "currency",
+                        "createable": True,
+                        "updateable": True,
+                        "nillable": True,
+                    },
+                ]
+            },
+        )
+    if request.method == "POST":
+        return httpx.Response(201, json={"id": "0061T00000ABCDE", "success": True})
+    if request.method == "PATCH":
+        return httpx.Response(204)
+    return httpx.Response(404, json=[{"message": "not found"}])
+
+
+@pytest.fixture
+def salesforce_http(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Mock the Salesforce REST transport (a fresh client per service call)."""
+    monkeypatch.setattr(
+        services,
+        "default_http_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(_salesforce_handler)),
+    )
+    yield
