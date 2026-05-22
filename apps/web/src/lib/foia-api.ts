@@ -337,7 +337,7 @@ export function listFoiaAttachments(
   requestId: string,
   cursor?: string,
 ): Promise<FoiaAttachmentPage> {
-  const params = new URLSearchParams({ limit: "25" });
+  const params = new URLSearchParams({ limit: String(FOIA_PAGE_LIMIT) });
   if (cursor) params.set("cursor", cursor);
   return request<FoiaAttachmentPage>(
     `/foia/requests/${encodeURIComponent(requestId)}/attachments?${params.toString()}`,
