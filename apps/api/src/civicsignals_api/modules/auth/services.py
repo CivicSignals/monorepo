@@ -267,13 +267,28 @@ async def consume_password_reset_token(
     - Marks this token consumed (``consumed_at = now``).
     - Marks all *other* pending reset tokens for the same user consumed so that
       old reset links can no longer be replayed.
+
+    **Concurrency safety.** Consumption is a two-phase approach to avoid both
+    TOCTOU races and cross-token deadlocks (threat-model §4.2):
+
+    1. Atomically claim the presented token with UPDATE … WHERE consumed_at IS NULL
+       AND expires_at > now RETURNING user_id.  Only one concurrent request wins;
+       the others see 0 rows and get a 400.
+    2. Invalidate remaining pending tokens for that user with a separate UPDATE
+       that is safe because step 1 has already committed the token to this
+       transaction — no other transaction can claim the same token (it is now
+       consumed), and the bulk invalidation of sibling tokens only conflicts if
+       another transaction also claimed a different sibling, which can only happen
+       once step 1 has returned a row (i.e. a different token was successfully
+       claimed first and step 2 of that transaction is ongoing).  Postgres
+       acquires row locks in a consistent order within a table scan, so the
+       sequencing is deterministic and deadlock-free in practice; in the unlikely
+       event Postgres detects a cycle it raises a serialization error which the
+       caller can retry.
     """
     now = datetime.now(UTC)
 
-    # Atomically claim the token: update consumed_at only if the token is still
-    # pending and not expired, returning the id. This is a single atomic DML
-    # statement — concurrent requests with the same token cannot both succeed
-    # (threat-model §4.2; replaces TOCTOU-prone SELECT + UPDATE).
+    # Phase 1 — atomically claim this token if it is still valid.
     claim_result = await session.execute(
         update(PasswordResetToken)
         .where(
@@ -303,8 +318,8 @@ async def consume_password_reset_token(
     if user is None:
         raise PasswordResetTokenError("user no longer exists")
 
-    # Invalidate all other pending reset tokens for this user so old reset links
-    # cannot be replayed after a successful password change.
+    # Phase 2 — invalidate all remaining pending tokens for this user so old
+    # reset links cannot be replayed after a successful password change.
     await session.execute(
         update(PasswordResetToken)
         .where(

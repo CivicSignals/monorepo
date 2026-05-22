@@ -30,10 +30,14 @@ def subscribe(event: str, handler: Handler) -> None:
 
 
 def unsubscribe(event: str, handler: Handler) -> None:
-    """Remove a previously registered handler (idempotent — no-op if not found)."""
+    """Remove all registrations of ``handler`` for ``event`` (idempotent).
+
+    If the same handler was registered more than once, all copies are removed so
+    the caller can call this once without regard to the registration count.
+    """
     handlers = _subscribers.get(event)
-    if handlers and handler in handlers:
-        handlers.remove(handler)
+    if handlers:
+        _subscribers[event] = [h for h in handlers if h is not handler]
 
 
 async def publish(event: str, payload: dict[str, Any]) -> None:

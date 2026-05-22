@@ -191,12 +191,17 @@ def _send_password_reset_email(email: str, raw_token: str, settings: Settings) -
     link = f"{settings.web_base_url}/reset-password?token={raw_token}"
     # Derive a human-readable TTL from settings rather than hard-coding "1 hour"
     # so the copy stays accurate if the operator changes password_reset_ttl_seconds.
-    ttl_minutes = settings.password_reset_ttl_seconds // 60
-    if ttl_minutes < 60:
-        ttl_str = f"{ttl_minutes} minute{'s' if ttl_minutes != 1 else ''}"
+    # Use the most natural unit that divides cleanly; fall back to minutes, then
+    # seconds for unusual values — avoids misleading rounding (e.g. 90 min → "1 hour").
+    ttl_secs = settings.password_reset_ttl_seconds
+    if ttl_secs % 3600 == 0:
+        n = ttl_secs // 3600
+        ttl_str = f"{n} hour{'s' if n != 1 else ''}"
+    elif ttl_secs % 60 == 0:
+        n = ttl_secs // 60
+        ttl_str = f"{n} minute{'s' if n != 1 else ''}"
     else:
-        ttl_hours = ttl_minutes // 60
-        ttl_str = f"{ttl_hours} hour{'s' if ttl_hours != 1 else ''}"
+        ttl_str = f"{ttl_secs} seconds"
     message = notifications_services.OutboundEmail(
         to=email,
         subject="Reset your CivicSignals password",
@@ -245,9 +250,11 @@ async def password_reset_request(
         # TODO B9: persist audit entry — currently emitted on the in-process bus only.
         # Best-effort: a failing subscriber must not leak user existence via 500 vs 204.
         try:
+            # Use user.email (normalized/canonical) rather than the raw request
+            # value so downstream audit consumers receive consistent casing.
             await events.publish(
                 AUTH_PASSWORD_RESET_REQUESTED,
-                {"user_id": str(user.id), "email": email},
+                {"user_id": str(user.id), "email": user.email},
             )
         except Exception:
             logger.warning("password_reset_requested_event_failed")
