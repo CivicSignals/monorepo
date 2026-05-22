@@ -14,12 +14,20 @@ entity:
 schedule:
   cron: "0 */2 * * *" # every 2 hours
 
+# Fetch-time politeness + legal posture (doc 18 §2.2, doc 16 §18). Static HTML,
+# public listings only; honor robots.txt strictly with the default 10s window.
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
 # State portal RFP listings are pre-vetted, so skip the Stage-2 relevance
 # classifier (doc 19 §3).
 prefilter: assume_relevant
 
-# Ordered selectors: primary → fallbacks (doc 18 §3.4). A fallback hit flags the
-# extraction `degraded: true` and ticks the recipe drift counter.
+# Ordered selectors: primary → fallbacks (doc 18 §3.4). D1 evaluates the primary
+# (first) selector; the ordered fallback chain (with `degraded: true` flagging) is
+# wired up in D11.
 fields:
   title:
     selectors:
@@ -28,6 +36,9 @@ fields:
       - "main h1:first-of-type"
     required: true
   due_date:
+    # The visible text is "July 15, 2025"; the machine-readable date is the
+    # <time> element's `datetime` attribute, so read that instead of text.
+    attr: datetime
     selectors:
       - ".bid-closing-date time"
       - "td:contains('Bid Due') + td"

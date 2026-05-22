@@ -1,5 +1,5 @@
 {
-  "signal_type": "rfp_posted",
+  "signal_types": ["rfp_posted", "contract_award"],
   "extraction_method": "primary",
   "degraded": false,
   "fields": {

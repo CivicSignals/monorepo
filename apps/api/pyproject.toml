@@ -24,13 +24,20 @@ dependencies = [
     "structlog>=24.4",
     "tenacity>=9.0",
     "pyyaml>=6.0",
+    # Recipe DSL + runner (D1). jsonschema validates recipe YAML against the
+    # canonical draft-07 schema (packages/recipe-schema); beautifulsoup4 backs
+    # the runner's default HTML extractor. Both are light and live in *core*
+    # (not the `ingestion` extra) because any process that runs a recipe needs
+    # them and the Docker images install with `uv sync --no-dev` (no extras).
+    "jsonschema>=4.23",
+    "beautifulsoup4>=4.12",
 ]
 
 [project.optional-dependencies]
 # Heavy, connector-specific deps. Installed in the worker_ingest / worker_extract
 # images, not the api image. See infra/Dockerfile (TODO D2, D6, E9).
+# (beautifulsoup4 is in core `dependencies` above — the recipe runner needs it.)
 ingestion = [
-    "beautifulsoup4>=4.12",
     "lxml>=5.3",
     "feedparser>=6.0",
     "playwright>=1.47",
@@ -50,6 +57,10 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
     "schemathesis>=3.36",
+    # Typing stubs for the recipe runner's deps (D1).
+    "types-jsonschema>=4.23",
+    "types-beautifulsoup4>=4.12",
+    "types-pyyaml>=6.0",
 ]
 
 [build-system]

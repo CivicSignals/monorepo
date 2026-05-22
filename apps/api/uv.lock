@@ -331,10 +331,12 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "asyncpg" },
+    { name = "beautifulsoup4" },
     { name = "boto3" },
     { name = "celery", extra = ["redis"] },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "jsonschema" },
     { name = "passlib", extra = ["bcrypt"] },
     { name = "pgvector" },
     { name = "pydantic" },
@@ -357,7 +359,6 @@ extraction = [
     { name = "spacy" },
 ]
 ingestion = [
-    { name = "beautifulsoup4" },
     { name = "feedparser" },
     { name = "lxml" },
     { name = "playwright" },
@@ -371,6 +372,9 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
     { name = "schemathesis" },
+    { name = "types-beautifulsoup4" },
+    { name = "types-jsonschema" },
+    { name = "types-pyyaml" },
 ]
 
 [package.metadata]
@@ -378,12 +382,13 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "anthropic", marker = "extra == 'extraction'", specifier = ">=0.39" },
     { name = "asyncpg", specifier = ">=0.30" },
-    { name = "beautifulsoup4", marker = "extra == 'ingestion'", specifier = ">=4.12" },
+    { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "boto3", specifier = ">=1.35" },
     { name = "celery", extras = ["redis"], specifier = ">=5.4" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "feedparser", marker = "extra == 'ingestion'", specifier = ">=6.0" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "jsonschema", specifier = ">=4.23" },
     { name = "lxml", marker = "extra == 'ingestion'", specifier = ">=5.3" },
     { name = "openai", marker = "extra == 'extraction'", specifier = ">=1.51" },
     { name = "passlib", extras = ["bcrypt"], specifier = ">=1.7" },
@@ -412,6 +417,9 @@ dev = [
     { name = "pytest-cov", specifier = ">=5.0" },
     { name = "ruff", specifier = ">=0.7" },
     { name = "schemathesis", specifier = ">=3.36" },
+    { name = "types-beautifulsoup4", specifier = ">=4.12" },
+    { name = "types-jsonschema", specifier = ">=4.23" },
+    { name = "types-pyyaml", specifier = ">=6.0" },
 ]
 
 [[package]]
@@ -1852,6 +1860,60 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e4/51/9aed62104cea109b820bbd6c14245af756112017d309da813ef107d42e7e/typer-0.25.1.tar.gz", hash = "sha256:9616eb8853a09ffeabab1698952f33c6f29ffdbceb4eaeecf571880e8d7664cc", size = 122276, upload-time = "2026-04-30T19:32:16.964Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/f9/2b3ff4e56e5fa7debfaf9eb135d0da96f3e9a1d5b27222223c7296336e5f/typer-0.25.1-py3-none-any.whl", hash = "sha256:75caa44ed46a03fb2dab8808753ffacdbfea88495e74c85a28c5eefcf5f39c89", size = 58409, upload-time = "2026-04-30T19:32:18.271Z" },
+]
+
+[[package]]
+name = "types-beautifulsoup4"
+version = "4.12.0.20250516"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "types-html5lib" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6d/d1/32b410f6d65eda94d3dfb0b3d0ca151f12cb1dc4cef731dcf7cbfd8716ff/types_beautifulsoup4-4.12.0.20250516.tar.gz", hash = "sha256:aa19dd73b33b70d6296adf92da8ab8a0c945c507e6fb7d5db553415cc77b417e", size = 16628, upload-time = "2025-05-16T03:09:09.93Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/79/d84de200a80085b32f12c5820d4fd0addcbe7ba6dce8c1c9d8605e833c8e/types_beautifulsoup4-4.12.0.20250516-py3-none-any.whl", hash = "sha256:5923399d4a1ba9cc8f0096fe334cc732e130269541d66261bb42ab039c0376ee", size = 16879, upload-time = "2025-05-16T03:09:09.051Z" },
+]
+
+[[package]]
+name = "types-html5lib"
+version = "1.1.11.20260518"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "types-webencodings" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b8/5a/0c708d1b0d35ad48b6a223c77c4a882fd016b40c25becb082a92e02a9c00/types_html5lib-1.1.11.20260518.tar.gz", hash = "sha256:4f33c087cb1119d65c4c80eca4323c2b501f9eaf8af9616b8b732ed4d8eae8fa", size = 18420, upload-time = "2026-05-18T06:07:23.662Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4d/d0/b088b9f11eb69637d6826843f06caaff60247156735a25512922d3dc2c13/types_html5lib-1.1.11.20260518-py3-none-any.whl", hash = "sha256:9baa7912224ebb37027c5ccb7e3768e43ea47b1dfdd977e7ddc4b0a4a550584d", size = 24339, upload-time = "2026-05-18T06:07:22.876Z" },
+]
+
+[[package]]
+name = "types-jsonschema"
+version = "4.26.0.20260518"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "referencing" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dd/46/73b6a5d61a61015c4248030a8cb07e5bdddb4041430fae9e585a68692578/types_jsonschema-4.26.0.20260518.tar.gz", hash = "sha256:e1dd53dc97a64f5eccdd6fa9839666e09bb500a8ebba2db6fdaf1789faea81a6", size = 16638, upload-time = "2026-05-18T06:06:44.106Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/d5/134f8a147dcecda10db7f60cfc6af0578a25a5c53c87b3907a64385e0184/types_jsonschema-4.26.0.20260518-py3-none-any.whl", hash = "sha256:30b30a518c7fe335df85c919fcbcc631b69c03d4a4b5b632fa916bea03065307", size = 16072, upload-time = "2026-05-18T06:06:43.264Z" },
+]
+
+[[package]]
+name = "types-pyyaml"
+version = "6.0.12.20260518"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b8/83/4a1afc3fbfcf5b8d46fc390cd95ed6b0dc9010a265f4e9f46314efffa37a/types_pyyaml-6.0.12.20260518.tar.gz", hash = "sha256:d917f83fb38462550338c1297faedd860b3ec83912b96b1e3d73255f7473e466", size = 17850, upload-time = "2026-05-18T06:01:58.675Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/06/a2/c01db32be2ae7d6a1689972f3c492b149ee4e164b12fdfd9f64b50888215/types_pyyaml-6.0.12.20260518-py3-none-any.whl", hash = "sha256:d2150f75a231c9fe9c7463bd29487d93e60bac90400287351384bc2284eba7cd", size = 20312, upload-time = "2026-05-18T06:01:57.368Z" },
+]
+
+[[package]]
+name = "types-webencodings"
+version = "0.5.0.20260408"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1c/d2/21567fac142315580ce3ee37d08a4e8819921dae833bbcd27b9f8b373799/types_webencodings-0.5.0.20260408.tar.gz", hash = "sha256:28c596619f367e43eee393d85f63e8d2fdb6874c654a8d441c37f8afe29c6d0d", size = 7504, upload-time = "2026-04-08T04:28:51.735Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/e4/f13be8f6d9a561166f7d963012d0ccc833e13aee3044c4f1a8fb1fee462a/types_webencodings-0.5.0.20260408-py3-none-any.whl", hash = "sha256:19a2afe5c22d9b1e880b49ff823c7b531f473a390fe47ac903c0bdb5cd677dd9", size = 8717, upload-time = "2026-04-08T04:28:50.943Z" },
 ]
 
 [[package]]
