@@ -268,45 +268,51 @@ async def consume_password_reset_token(
     - Marks all *other* pending reset tokens for the same user consumed so that
       old reset links can no longer be replayed.
     """
-    # SELECT FOR UPDATE locks the token row so concurrent requests with the same
-    # token serialize here rather than both seeing consumed_at IS NULL and both
-    # proceeding to set a new password (TOCTOU race, threat-model §4.2).
-    result = await session.execute(
-        select(PasswordResetToken)
-        .where(PasswordResetToken.token_hash == _hash_token(raw_token))
-        .with_for_update()
-    )
-    record = result.scalar_one_or_none()
-    if record is None:
-        raise PasswordResetTokenError("unknown token")
-    if record.consumed_at is not None:
-        raise PasswordResetTokenError("token already used")
-    expires_at = record.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-    if expires_at < datetime.now(UTC):
-        raise PasswordResetTokenError("token expired")
+    now = datetime.now(UTC)
 
-    user = await accounts_services.get_user_by_id(session, record.user_id)
+    # Atomically claim the token: update consumed_at only if the token is still
+    # pending and not expired, returning the id. This is a single atomic DML
+    # statement — concurrent requests with the same token cannot both succeed
+    # (threat-model §4.2; replaces TOCTOU-prone SELECT + UPDATE).
+    claim_result = await session.execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.token_hash == _hash_token(raw_token),
+            PasswordResetToken.consumed_at.is_(None),
+            PasswordResetToken.expires_at > now,
+        )
+        .values(consumed_at=now)
+        .returning(PasswordResetToken.id, PasswordResetToken.user_id)
+    )
+    claimed = claim_result.first()
+    if claimed is None:
+        # Distinguish "never existed" from "expired/consumed" where possible;
+        # both map to the same 400 from the route (no user enumeration).
+        token_exists = await session.execute(
+            select(PasswordResetToken.id).where(
+                PasswordResetToken.token_hash == _hash_token(raw_token)
+            )
+        )
+        if token_exists.first() is None:
+            raise PasswordResetTokenError("unknown token")
+        raise PasswordResetTokenError("token expired or already used")
+
+    _token_id, user_id = claimed
+
+    user = await accounts_services.get_user_by_id(session, user_id)
     if user is None:
         raise PasswordResetTokenError("user no longer exists")
-
-    now = datetime.now(UTC)
 
     # Invalidate all other pending reset tokens for this user so old reset links
     # cannot be replayed after a successful password change.
     await session.execute(
         update(PasswordResetToken)
         .where(
-            PasswordResetToken.user_id == record.user_id,
-            PasswordResetToken.id != record.id,
+            PasswordResetToken.user_id == user_id,
             PasswordResetToken.consumed_at.is_(None),
         )
         .values(consumed_at=now)
     )
-
-    # Consume this token.
-    record.consumed_at = now
 
     # Update the password.
     user.password_hash = hash_password(new_password)

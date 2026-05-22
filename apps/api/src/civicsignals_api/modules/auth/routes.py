@@ -250,11 +250,14 @@ async def password_reset_request(
                 {"user_id": str(user.id), "email": email},
             )
         except Exception:
-            logger.warning("password_reset_requested_event_failed", email=email)
+            logger.warning("password_reset_requested_event_failed")
     else:
         # No commit needed — nothing changed; rollback for cleanliness.
         await session.rollback()
-        logger.info("password_reset_request_unknown_email", email=email)
+        # Do NOT log the raw email address: this is an unauthenticated endpoint
+        # and logging user-supplied addresses would retain PII and could enable
+        # log-based user enumeration if logs are ever exposed (threat-model §4.2).
+        logger.info("password_reset_request_no_match")
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
