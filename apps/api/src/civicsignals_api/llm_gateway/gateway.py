@@ -6,7 +6,9 @@ which owns:
 - model/provider selection per logical task (:class:`TaskModelPolicy`),
 - per-workspace token + cost accounting (:class:`TokenAccountant`),
 - retry with backoff on transient errors (``tenacity``),
-- prompt versioning (the ``prompt_name``/``prompt_version`` seam; TODO E3).
+- prompt versioning via the injected :class:`PromptRegistry` (TODO E3) — the
+  ``prompt_name``/``prompt_version`` arguments resolve + render an on-disk,
+  version-pinned prompt instead of (or in addition to) raw text.
 
 The cache of identical ``(prompt_version, raw_document_hash)`` extractions
 (doc 18 §6.6) and persistent usage metering (TODO N3) attach behind this class
@@ -23,6 +25,8 @@ from tenacity import (
     wait_exponential,
 )
 
+# The gateway depends on the registry, not the other way round — no import cycle.
+from ..prompt_registry import PromptRegistry
 from .accounting import (
     InMemoryTokenAccountant,
     TokenAccountant,
@@ -53,6 +57,7 @@ class LLMGateway:
         policy: TaskModelPolicy | None = None,
         accountant: TokenAccountant | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        prompt_registry: PromptRegistry | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
@@ -60,11 +65,22 @@ class LLMGateway:
         self._policy = policy or TaskModelPolicy()
         self._accountant: TokenAccountant = accountant or InMemoryTokenAccountant()
         self._max_attempts = max_attempts
+        # Injected so it is overridable in tests; lazily resolved to the
+        # process-wide singleton on first prompt-registry use (avoids loading the
+        # prompts dir for raw ``prompt=`` callers).
+        self._prompt_registry = prompt_registry
+
+    def _registry(self) -> PromptRegistry:
+        if self._prompt_registry is None:
+            from ..prompt_registry import get_prompt_registry
+
+            self._prompt_registry = get_prompt_registry()
+        return self._prompt_registry
 
     async def complete(
         self,
         *,
-        prompt: str,
+        prompt: str | None = None,
         task: str = TASK_CLASSIFY,
         provider: str | None = None,
         model: str | None = None,
@@ -72,18 +88,43 @@ class LLMGateway:
         temperature: float = 0.0,
         system: str | None = None,
         workspace_id: str | None = None,
-        # Prompt-registry seam (TODO E3): the prompt identity is threaded through
-        # and recorded on the result; the registry will resolve name+version to
-        # the actual prompt/system text upstream of this call.
+        # Prompt registry (TODO E3): pass ``prompt_name`` (+ optional
+        # ``prompt_version``, default "latest") to resolve and render a
+        # version-pinned on-disk prompt instead of raw ``prompt`` text.
+        # ``prompt_vars`` fills the template's ``{variable}`` placeholders.
         prompt_name: str | None = None,
         prompt_version: str | None = None,
+        prompt_vars: dict[str, str] | None = None,
     ) -> LLMResult:
         """Run a completion, routing ``task`` to a backend + model via the policy.
 
+        Pass raw ``prompt`` text (backward compatible) and/or a ``prompt_name``:
+
+        - ``prompt`` set: used verbatim; ``prompt_name``/``prompt_version`` are
+          recorded as metadata only (the E2 seam — no registry lookup).
+        - ``prompt`` unset + ``prompt_name`` set: the registry resolves and
+          renders the version-pinned prompt (``prompt_vars`` fills its
+          ``{variable}`` placeholders), and its declared ``task`` and ``system``
+          are applied. The prompt's ``model_hint`` stays advisory (read it off
+          the resolved :class:`Prompt`) and never bypasses the policy.
+
         Explicit ``provider``/``model`` override the policy (e.g. confidence-driven
         Haiku→Sonnet escalation, doc 19 §5.1). Transient errors are retried with
-        exponential backoff. Usage is recorded against ``workspace_id``.
+        exponential backoff. Usage is recorded against ``workspace_id``. The
+        resolved prompt identity (with the concrete ``vN``) is recorded on the
+        result.
         """
+        prompt, system, task, provider, model, prompt_version = self._resolve_prompt(
+            prompt=prompt,
+            system=system,
+            task=task,
+            provider=provider,
+            model=model,
+            prompt_name=prompt_name,
+            prompt_version=prompt_version,
+            prompt_vars=prompt_vars,
+        )
+
         choice = self._policy.resolve(task, provider=provider, model=model)
         backend = self._backends.get(choice.provider)
         if backend is None:
@@ -122,6 +163,54 @@ class LLMGateway:
                 cost_usd=cost,
             )
         return result
+
+    def _resolve_prompt(
+        self,
+        *,
+        prompt: str | None,
+        system: str | None,
+        task: str,
+        provider: str | None,
+        model: str | None,
+        prompt_name: str | None,
+        prompt_version: str | None,
+        prompt_vars: dict[str, str] | None,
+    ) -> tuple[str, str | None, str, str | None, str | None, str | None]:
+        """Resolve raw vs. registry prompt into the final call parameters.
+
+        Returns ``(prompt, system, task, provider, model, prompt_version)``.
+
+        - Raw ``prompt`` given: used verbatim; any ``prompt_name`` /
+          ``prompt_version`` are recorded as metadata only (the E2 seam — no
+          registry lookup, no rendering). This keeps E2 callers working.
+        - No ``prompt`` but a ``prompt_name``: resolve + render from the registry.
+          The rendered body becomes ``prompt``, the prompt's system text fills
+          ``system`` (unless the caller passed one), and the resolved concrete
+          version is reported back so the result records ``vN`` even when the
+          caller asked for "latest".
+        """
+        if prompt is not None:
+            # Raw-text path (backward compatible): prompt_name/version are
+            # pass-through metadata only.
+            return prompt, system, task, provider, model, prompt_version
+        if prompt_name is None:
+            raise LLMError("complete() requires either 'prompt' or 'prompt_name'")
+
+        resolved = self._registry().get(prompt_name, prompt_version)
+        rendered = resolved.render(prompt_vars)
+        rendered_system = system if system is not None else resolved.render_system(prompt_vars)
+
+        # The prompt's declared task drives model routing only when the caller
+        # left task at the default and gave no explicit provider/model — an
+        # explicit caller choice always wins (doc 19 §5.1 escalation). Routing
+        # then flows through TaskModelPolicy, so a self-hoster's settings
+        # overrides still govern which provider/model actually runs. The prompt's
+        # ``model_hint`` stays advisory (exposed on the Prompt) and never bypasses
+        # the policy — applying it here would override a self-host Ollama config.
+        if task == TASK_CLASSIFY and resolved.task is not None:
+            task = resolved.task
+
+        return rendered, rendered_system, task, provider, model, resolved.version
 
     async def _complete_with_retry(
         self,
