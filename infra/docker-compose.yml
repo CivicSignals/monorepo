@@ -315,6 +315,157 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # Observability stack (A6) — optional; activate with:
+  #   docker compose -f infra/docker-compose.yml --profile observability up -d
+  #
+  # Services: OTel Collector, Prometheus, Loki, Promtail, Grafana, Tempo.
+  # All data is persisted in named volumes.  Access Grafana at :3100 on the
+  # host (override GRAFANA_PORT in .env if needed).
+  #
+  # To connect the api to the collector, add to .env:
+  #   OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+  #
+  # See docs/self-host/observability.md for full setup instructions.
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.110.0
+    command: ["--config=/etc/otel-collector-config.yml"]
+    volumes:
+      - ./observability/otel-collector-config.yml:/etc/otel-collector-config.yml:ro
+    networks:
+      - internal
+    restart: unless-stopped
+    profiles:
+      - observability
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.6.0
+    command: ["-config.file=/etc/tempo.yml"]
+    volumes:
+      - tempodata:/var/tempo
+    networks:
+      - internal
+    restart: unless-stopped
+    profiles:
+      - observability
+    # Inline Tempo config -- enough to receive OTLP and serve Grafana queries.
+    configs:
+      - source: tempo_config
+        target: /etc/tempo.yml
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    networks:
+      - internal
+    restart: unless-stopped
+    profiles:
+      - observability
+
+  loki:
+    image: grafana/loki:3.2.0
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - lokidata:/loki
+    networks:
+      - internal
+    restart: unless-stopped
+    profiles:
+      - observability
+
+  promtail:
+    image: grafana/promtail:3.2.0
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./observability/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - internal
+    restart: unless-stopped
+    profiles:
+      - observability
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Preconfigured data sources: Prometheus, Loki, Tempo.
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3100}:3000"
+    networks:
+      - internal
+    restart: unless-stopped
+    profiles:
+      - observability
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+# ---------------------------------------------------------------------------
+# Configs (inline for services that need small config files without a volume).
+# ---------------------------------------------------------------------------
+configs:
+  tempo_config:
+    content: |
+      stream_over_http_enabled: true
+      server:
+        http_listen_port: 3200
+      distributor:
+        receivers:
+          otlp:
+            protocols:
+              grpc:
+                endpoint: "0.0.0.0:4317"
+              http:
+                endpoint: "0.0.0.0:4318"
+      ingester:
+        lifecycler:
+          ring:
+            kvstore:
+              store: memberlist
+            replication_factor: 1
+          final_sleep: 0s
+        flush_check_period: 10s
+        flush_op_timeout: 10m
+        complete_block_timeout: 15m
+        close_idle_period: 10m
+        max_block_duration: 5m
+      memberlist:
+        bind_addr: ["0.0.0.0"]
+        bind_port: 7946
+        join_members: []
+      storage:
+        trace:
+          backend: local
+          local:
+            path: /var/tempo/blocks
+          wal:
+            path: /var/tempo/wal
+      compactor:
+        compaction:
+          block_retention: 336h
+      query_frontend:
+        search:
+          duration_slo: 5s
+          throughput_bytes_slo: 1.073741824e+09
+
 # ---------------------------------------------------------------------------
 # Named volumes — persistent across container restarts and upgrades.
 # ---------------------------------------------------------------------------
@@ -326,6 +477,14 @@ volumes:
   miniodata:
     driver: local
   certdata:
+    driver: local
+  prometheusdata:
+    driver: local
+  lokidata:
+    driver: local
+  tempodata:
+    driver: local
+  grafanadata:
     driver: local
 
 # ---------------------------------------------------------------------------

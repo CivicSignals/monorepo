@@ -1,4 +1,5 @@
 """Smoke test: the public_feed module imports and exposes a router."""
+
 from civicsignals_api.modules.public_feed import routes
 
 

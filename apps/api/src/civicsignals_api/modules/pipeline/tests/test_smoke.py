@@ -1,4 +1,5 @@
 """Smoke test: the pipeline module imports and exposes a router."""
+
 from civicsignals_api.modules.pipeline import routes
 
 

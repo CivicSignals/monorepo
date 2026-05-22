@@ -1,4 +1,5 @@
 """Smoke test: the admin module imports and exposes a router."""
+
 from civicsignals_api.modules.admin import routes
 
 

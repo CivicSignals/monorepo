@@ -1,4 +1,5 @@
 """HTTP endpoints for the public_feed module, mounted under `/api/v1/public`."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter

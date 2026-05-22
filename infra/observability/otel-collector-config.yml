@@ -1,0 +1,41 @@
+# OpenTelemetry Collector configuration (A6).
+#
+# Receives OTLP/gRPC and OTLP/HTTP traces from the api and worker processes,
+# then exports to Grafana Tempo for storage and querying.
+#
+# Used by the `observability` Compose profile (see infra/docker-compose.yml).
+# SPDX-License-Identifier: AGPL-3.0-only
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+      http:
+        endpoint: "0.0.0.0:4318"
+
+processors:
+  # Batch spans before exporting to reduce overhead.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # Grafana Tempo -- the default local trace back-end for the observability stack.
+  otlp/tempo:
+    endpoint: "tempo:4317"
+    tls:
+      insecure: true
+
+  # Debug exporter: log span summaries to the collector stdout.
+  # Useful during first-time setup; disable in production by removing it from
+  # the pipeline below.
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]

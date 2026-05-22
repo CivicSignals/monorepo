@@ -1,4 +1,5 @@
 """Smoke test: the auth module imports and exposes a router."""
+
 from civicsignals_api.modules.auth import routes
 
 

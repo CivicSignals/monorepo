@@ -1,4 +1,5 @@
 """Smoke test: the entities module imports and exposes a router."""
+
 from civicsignals_api.modules.entities import routes
 
 

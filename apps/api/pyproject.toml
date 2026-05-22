@@ -36,6 +36,19 @@ dependencies = [
     # them and the Docker images install with `uv sync --no-dev` (no extras).
     "jsonschema>=4.23",
     "beautifulsoup4>=4.12",
+    # Observability (A6). All three are config-gated: Sentry is a no-op when
+    # SENTRY_DSN is unset; OTel is a no-op when OTEL_EXPORTER_OTLP_ENDPOINT is
+    # unset; prometheus-client exposes /metrics (always on, no external account
+    # needed). The OTel packages are kept light — we only pull the OTLP exporter
+    # and the SQLAlchemy + ASGI instrumentations.
+    "sentry-sdk[fastapi]>=2.0",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+    "opentelemetry-instrumentation-celery>=0.48b0",
+    "prometheus-client>=0.21",
+    "starlette-prometheus>=0.10",
 ]
 
 [project.optional-dependencies]
@@ -123,6 +136,14 @@ module = [
     "anthropic.*",
     "openai.*",
     "spacy.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# OTel and starlette-prometheus ship incomplete type annotations (A6).
+module = [
+    "opentelemetry.*",
+    "starlette_prometheus.*",
 ]
 ignore_missing_imports = true
 

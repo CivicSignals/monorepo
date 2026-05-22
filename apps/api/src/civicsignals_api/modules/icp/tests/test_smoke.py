@@ -1,4 +1,5 @@
 """Smoke test: the icp module imports and exposes a router."""
+
 from civicsignals_api.modules.icp import routes
 
 
