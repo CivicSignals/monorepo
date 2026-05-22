@@ -8,6 +8,7 @@ fine, but the first ``complete`` call raises
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from ..types import (
@@ -70,6 +71,9 @@ class AnthropicBackend:
             kwargs["system"] = system
         try:
             message = await client.messages.create(**kwargs)
+        except asyncio.CancelledError:
+            # Never swallow cancellation — let it propagate.
+            raise
         except Exception as exc:
             # Normalize SDK errors to the gateway's transient/permanent taxonomy.
             raise _normalize_error(exc) from exc

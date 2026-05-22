@@ -25,6 +25,12 @@ class ModelChoice:
     model: str
 
 
+# Providers the gateway knows how to route to. Used to disambiguate the
+# "provider:model" override syntax from model ids that themselves contain a
+# colon (e.g. Ollama tags like ``llama3:latest``).
+KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "openai", "ollama"})
+
+
 # Sensible defaults per task. Haiku-class for cheap/high-volume work, Sonnet for
 # extraction and summarization where quality matters more than per-call cost.
 DEFAULT_TASK_MODELS: dict[str, ModelChoice] = {

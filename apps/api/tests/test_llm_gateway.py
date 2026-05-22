@@ -6,6 +6,7 @@ the lazy-import guard — all without network or API keys via the FakeBackend.
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from civicsignals_api.config import Settings
@@ -19,6 +20,7 @@ from civicsignals_api.llm_gateway import (
     LLMError,
     LLMGateway,
     ModelChoice,
+    OllamaBackend,
     OpenAIBackend,
     TaskModelPolicy,
     build_gateway,
@@ -316,3 +318,45 @@ def test_build_gateway_applies_task_model_overrides() -> None:
     choice_extract = gw._policy.resolve("extraction")  # type: ignore[attr-defined]
     assert choice_classify == ModelChoice("ollama", "llama3")
     assert choice_extract == ModelChoice("openai", "gpt-4o")
+
+
+def test_override_with_colon_in_model_id_is_not_split_as_provider() -> None:
+    # "llama3:latest" is an Ollama tag, not a provider:model — the whole string
+    # must stay the model id and use the default provider.
+    settings = Settings(
+        llm_default_provider="ollama",
+        llm_task_models={"classify": "llama3:latest"},
+    )
+    gw = build_gateway(settings)
+    assert gw._policy.resolve("classify") == ModelChoice("ollama", "llama3:latest")  # type: ignore[attr-defined]
+
+
+def test_override_with_known_provider_prefix_is_split() -> None:
+    settings = Settings(llm_task_models={"classify": "anthropic:claude-3-5-haiku-latest"})
+    gw = build_gateway(settings)
+    assert gw._policy.resolve("classify") == ModelChoice(  # type: ignore[attr-defined]
+        "anthropic", "claude-3-5-haiku-latest"
+    )
+
+
+# --- ollama backend client lifecycle ------------------------------------
+
+
+async def test_ollama_reuses_long_lived_client() -> None:
+    backend = OllamaBackend(base_url="http://localhost:11434")
+    # No client until first use; the same client is reused across calls.
+    assert backend._client is None  # type: ignore[attr-defined]
+    c1 = backend._get_client()  # type: ignore[attr-defined]
+    c2 = backend._get_client()  # type: ignore[attr-defined]
+    assert c1 is c2
+    await backend.aclose()
+    assert backend._client is None  # type: ignore[attr-defined]
+
+
+async def test_ollama_does_not_close_injected_client() -> None:
+    injected = httpx.AsyncClient()
+    backend = OllamaBackend(base_url="http://localhost:11434", client=injected)
+    assert backend._get_client() is injected  # type: ignore[attr-defined]
+    await backend.aclose()  # no-op for injected clients
+    assert not injected.is_closed
+    await injected.aclose()

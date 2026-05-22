@@ -22,7 +22,7 @@ from .accounting import (
 )
 from .backends import AnthropicBackend, FakeBackend, OllamaBackend, OpenAIBackend
 from .gateway import LLMGateway
-from .policy import DEFAULT_TASK_MODELS, ModelChoice, TaskModelPolicy
+from .policy import DEFAULT_TASK_MODELS, KNOWN_PROVIDERS, ModelChoice, TaskModelPolicy
 from .types import (
     TASK_CLASSIFY,
     TASK_EXTRACTION,
@@ -38,6 +38,7 @@ from .types import (
 
 __all__ = [
     "DEFAULT_TASK_MODELS",
+    "KNOWN_PROVIDERS",
     "TASK_CLASSIFY",
     "TASK_EXTRACTION",
     "TASK_SUMMARY",
@@ -70,9 +71,13 @@ def _policy_from_settings(settings: Settings) -> TaskModelPolicy:
     overrides: dict[str, ModelChoice] = {}
     default_provider = settings.llm_default_provider
     for task, raw in settings.llm_task_models.items():
-        # Each override is "provider:model" or just "model" (uses default provider).
-        if ":" in raw:
-            provider, model = raw.split(":", 1)
+        # Each override is "provider:model" or just "model" (uses default
+        # provider). Only treat a colon prefix as a provider when it actually
+        # names a known one — otherwise it's part of the model id (e.g. the
+        # Ollama tag "llama3:latest"), so keep the whole string as the model.
+        prefix, sep, rest = raw.partition(":")
+        if sep and prefix in KNOWN_PROVIDERS:
+            provider, model = prefix, rest
         else:
             provider, model = default_provider, raw
         overrides[task] = ModelChoice(provider=provider, model=model)

@@ -19,9 +19,31 @@ class OllamaBackend:
 
     provider = "ollama"
 
-    def __init__(self, *, base_url: str, timeout: float = 120.0) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout: float = 120.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        # A long-lived client enables connection pooling / keep-alives across
+        # calls. Lazily created so constructing the backend needs no event loop;
+        # an injected client (e.g. for tests) is used as-is and not owned.
+        self._client = client
+        self._owns_client = client is None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the owned client (call on shutdown). No-op for injected ones."""
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     async def complete(
         self,
@@ -41,9 +63,10 @@ class OllamaBackend:
         if system is not None:
             payload["system"] = system
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(f"{self._base_url}/api/generate", json=payload)
-                response.raise_for_status()
+            response = await self._get_client().post(
+                f"{self._base_url}/api/generate", json=payload
+            )
+            response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status >= 500 or status == 429:
