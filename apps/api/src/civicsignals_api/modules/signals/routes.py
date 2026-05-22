@@ -13,6 +13,7 @@ joins on top. Writes happen only through the extraction funnel (E1 →
   GET  /signals/fuzzy-reviews/{id}           — get one review row
   POST /signals/fuzzy-reviews/{id}/approve   — approve → merge candidate into match
   POST /signals/fuzzy-reviews/{id}/reject    — reject → keep candidate as distinct
+  GET  /signals/{id}/sources                 — public source citations for a signal (P2)
   GET  /signals/{id}                         — get one signal
 
 Route ordering note: ``/feed``, ``/fuzzy-reviews`` and their sub-paths MUST be
@@ -42,7 +43,7 @@ from civicsignals_api.db import get_session
 from civicsignals_api.modules.auth.dependencies import RequireAdmin, RequireViewer
 
 from . import services
-from .schemas import SignalPage, SignalRead
+from .schemas import SignalPage, SignalRead, SignalSourcesRead
 from .services import WorkspaceFeedPage
 
 router = APIRouter(prefix="/signals", tags=["signals"])
@@ -406,6 +407,37 @@ async def reject_fuzzy_review(
         )
     await session.commit()
     return FuzzyReviewRead.model_validate(row)
+
+
+# ---------------------------------------------------------------------------
+# Public source citations (P2) — read-only, unauthenticated.
+#
+# Registered before /{signal_id} so the static ``/sources`` suffix is matched as a
+# sub-resource of the signal id (mirrors entities' ``/{entity_id}/children``).
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{signal_id}/sources",
+    response_model=SignalSourcesRead,
+    summary="Public source citations for a signal (P2)",
+)
+async def get_signal_sources(
+    signal_id: uuid.UUID,
+    session: SessionDep,
+) -> SignalSourcesRead | JSONResponse:
+    """Public, unauthenticated source citations for a signal (P2; doc 07 §3).
+
+    Signals are global (like the entity directory), so this read endpoint requires
+    no ``X-Workspace-Id`` and no auth — it powers the public ``/s/{id}`` signal page,
+    which cites where each fact came from. Returns the public-safe provenance of every
+    corroborating ``ingestion_raw_document`` (source URL + recipe + fetch time); the
+    S3 key and internal metadata are never exposed.
+    """
+    result = await services.get_signal_sources(session, signal_id)
+    if result is None:
+        return _problem(404, "Signal not found", f"No signal with id {signal_id}.")
+    return result
 
 
 # ---------------------------------------------------------------------------

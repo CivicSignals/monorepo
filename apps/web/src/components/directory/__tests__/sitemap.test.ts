@@ -25,6 +25,10 @@ describe("sitemap()", () => {
       DIRECTORY_REVALIDATE_SECONDS: 300,
       SITEMAP_ENTITY_LIMIT: 1000,
     }));
+    vi.doMock("@/lib/public-signals-api", () => ({
+      fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      SITEMAP_SIGNAL_LIMIT: 1000,
+    }));
 
     const { default: sitemap } = await import("@/app/sitemap");
     const entries = await sitemap();
@@ -46,6 +50,10 @@ describe("sitemap()", () => {
       DIRECTORY_REVALIDATE_SECONDS: 300,
       SITEMAP_ENTITY_LIMIT: 1000,
     }));
+    vi.doMock("@/lib/public-signals-api", () => ({
+      fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      SITEMAP_SIGNAL_LIMIT: 1000,
+    }));
 
     const { default: sitemap } = await import("@/app/sitemap");
     const entries = await sitemap();
@@ -65,6 +73,10 @@ describe("sitemap()", () => {
       DIRECTORY_REVALIDATE_SECONDS: 300,
       SITEMAP_ENTITY_LIMIT: 1000,
     }));
+    vi.doMock("@/lib/public-signals-api", () => ({
+      fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      SITEMAP_SIGNAL_LIMIT: 1000,
+    }));
 
     const { default: sitemap } = await import("@/app/sitemap");
     const entries = await sitemap();
@@ -82,6 +94,10 @@ describe("sitemap()", () => {
       fetchPublicEntityChildren: vi.fn(),
       DIRECTORY_REVALIDATE_SECONDS: 300,
       SITEMAP_ENTITY_LIMIT: 1000,
+    }));
+    vi.doMock("@/lib/public-signals-api", () => ({
+      fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      SITEMAP_SIGNAL_LIMIT: 1000,
     }));
 
     const { default: sitemap } = await import("@/app/sitemap");
@@ -108,6 +124,10 @@ describe("sitemap()", () => {
       DIRECTORY_REVALIDATE_SECONDS: 300,
       SITEMAP_ENTITY_LIMIT: 1000,
     }));
+    vi.doMock("@/lib/public-signals-api", () => ({
+      fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      SITEMAP_SIGNAL_LIMIT: 1000,
+    }));
 
     const { default: sitemap } = await import("@/app/sitemap");
     const entries = await sitemap();
@@ -125,6 +145,10 @@ describe("sitemap()", () => {
       fetchPublicEntityChildren: vi.fn(),
       DIRECTORY_REVALIDATE_SECONDS: 300,
       SITEMAP_ENTITY_LIMIT: 1000,
+    }));
+    vi.doMock("@/lib/public-signals-api", () => ({
+      fetchAllSignalIdsForSitemap: vi.fn().mockResolvedValue([]),
+      SITEMAP_SIGNAL_LIMIT: 1000,
     }));
 
     const { default: sitemap } = await import("@/app/sitemap");

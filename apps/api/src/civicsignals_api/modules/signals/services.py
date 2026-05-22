@@ -94,6 +94,8 @@ from .schemas import (
     SignalPage,
     SignalPayload,
     SignalRead,
+    SignalSource,
+    SignalSourcesRead,
     SignalType,
     SignalValidationError,
     parse_signal_payload,
@@ -472,6 +474,62 @@ async def get_signal(session: AsyncSession, signal_id: uuid.UUID) -> SignalRead 
     """Fetch one global signal by id (doc 08; the signal-detail read seam)."""
     row = await session.get(Signal, signal_id)
     return SignalRead.model_validate(row) if row is not None else None
+
+
+async def get_signal_sources(
+    session: AsyncSession, signal_id: uuid.UUID
+) -> SignalSourcesRead | None:
+    """Resolve a signal's source citations for the public signal page (P2).
+
+    A signal corroborates from one or more ``ingestion_raw_document`` rows
+    (``signals_signal.raw_document_ids``, doc 19 §7.3). This walks those refs and
+    returns the **public-safe** provenance of each — the ``source_url`` the document
+    was fetched from, the producing recipe slug, and the fetch time — so the public
+    signal page can cite where the data came from (the signal analogue of an entity's
+    ``source_urls``, C5 req 3).
+
+    Cross-module rule (doc 06 §3): the raw-document rows are owned by the
+    ``ingestion`` module, so they are read through ``ingestion.services`` only —
+    never by importing its models here. The import is local to avoid a module-load
+    cycle (signals ← ingestion ← signals via the event bus), matching how
+    ``foia.services`` reaches the same seam.
+
+    Returns ``None`` when the signal does not exist (so the route can 404), and a
+    :class:`SignalSourcesRead` with possibly-empty ``sources`` when it exists but has
+    no resolvable documents (an unresolved/manual signal — the page still renders,
+    just without citations). Documents whose ids no longer resolve are skipped rather
+    than erroring: a missing raw-document row must not 500 a public page.
+    """
+    from civicsignals_api.modules.ingestion import services as ingestion_services
+
+    signal = await session.get(Signal, signal_id)
+    if signal is None:
+        return None
+
+    sources: list[SignalSource] = []
+    seen_urls: set[str] = set()
+    for raw_id in signal.raw_document_ids:
+        try:
+            doc_uuid = raw_id if isinstance(raw_id, uuid.UUID) else uuid.UUID(str(raw_id))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        doc = await ingestion_services.get_raw_document(session, doc_uuid)
+        if doc is None:
+            continue
+        # De-dupe by URL: merged signals can append the same source twice
+        # (doc 19 §7.3), and a public citation list should show each source once.
+        if doc.source_url in seen_urls:
+            continue
+        seen_urls.add(doc.source_url)
+        sources.append(
+            SignalSource(
+                document_id=doc.id,
+                source_url=doc.source_url,
+                recipe_id=doc.recipe_id,
+                fetched_at=doc.fetched_at,
+            )
+        )
+    return SignalSourcesRead(signal_id=signal_id, sources=sources)
 
 
 async def list_signals(
@@ -1137,6 +1195,8 @@ __all__ = [
     "SignalPage",
     "SignalPayload",
     "SignalRead",
+    "SignalSource",
+    "SignalSourcesRead",
     "SignalType",
     "SignalValidationError",
     "WorkspaceFeedItem",
@@ -1159,6 +1219,7 @@ __all__ = [
     "find_duplicate",
     "get_fuzzy_review",
     "get_signal",
+    "get_signal_sources",
     "is_high_stakes_type",
     "list_fuzzy_reviews",
     "list_signals",
