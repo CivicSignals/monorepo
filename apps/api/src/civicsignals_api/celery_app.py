@@ -17,6 +17,7 @@ from celery import Celery
 from celery.schedules import crontab
 
 from civicsignals_api.config import get_settings
+from civicsignals_api.telemetry import register_tasks as _register_telemetry_tasks
 
 _settings = get_settings()
 
@@ -58,6 +59,12 @@ celery_app.conf.beat_schedule = {
         "task": "contacts.revalidate_stale",
         "schedule": crontab(hour=4, minute=0),
     },
+    # Anonymous self-host telemetry ping (O6).  No-op when
+    # CIVICSIGNALS_TELEMETRY_ENABLED is false (the default).
+    "telemetry.ping": {
+        "task": "telemetry.ping",
+        "schedule": crontab(hour=3, minute=0, day_of_week=1),  # weekly, Monday 03:00
+    },
 }
 
 # Import module tasks so Celery registers them (filled in by later epics).
@@ -65,3 +72,7 @@ celery_app.autodiscover_tasks(
     packages=["civicsignals_api.modules"],
     related_name="tasks",
 )
+
+# Register the telemetry ping task (O6).  Done here, after autodiscover, so
+# the celery_app object is fully configured before the task is attached.
+_register_telemetry_tasks(celery_app)

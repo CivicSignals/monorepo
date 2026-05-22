@@ -162,6 +162,23 @@ class Settings(BaseSettings):
     # token disables the endpoint entirely (fail-closed). See recipes/routes.py.
     recipe_preview_staff_token: str | None = None
 
+    # ---------------------------------------------------------------------------
+    # Anonymous telemetry ping (O6).  OFF by default; set
+    # CIVICSIGNALS_TELEMETRY_ENABLED=true to opt in.  No PII is ever sent —
+    # only coarse aggregate counts, version, and a random instance-id that is
+    # NOT linked to any user or workspace.  See docs/self-host/telemetry.md.
+    # ---------------------------------------------------------------------------
+    civicsignals_telemetry_enabled: bool = False
+    # Where to POST the anonymous ping.  Change if you run an internal telemetry
+    # collector; leave unset to use the project default (noop until the endpoint
+    # is live; a connection error is silently swallowed).
+    civicsignals_telemetry_endpoint: str = "https://telemetry.civicsignals.io/v1/ping"
+    # Path to a small state file that persists the random instance-id between
+    # restarts.  Defaults to /tmp so no write permissions are needed; operators
+    # can override to a persistent volume path so the id survives container
+    # restarts.
+    civicsignals_telemetry_id_path: str = "/tmp/civicsignals-instance-id"
+
 
 @lru_cache
 def get_settings() -> Settings:
