@@ -1,0 +1,14 @@
+# gitleaks:allow fingerprints for documentation false-positives.
+#
+# These fingerprints correspond to example `curl` commands and placeholder
+# token values in the API documentation (docs-site/docs/api/). The values
+# are documentation examples — not real credentials — and the files have
+# since been updated to use environment variable references ($API_TOKEN,
+# $PAT_TOKEN, etc.) instead of inline placeholders.
+#
+# Format: one fingerprint per line (commit:file:rule:line).
+4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/authentication.md:curl-auth-header:167
+4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/authentication.md:generic-api-key:120
+4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/workspace-scoping.md:curl-auth-header:54
+4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/workspace-scoping.md:curl-auth-header:67
+4dc73b15ac5ec11c2a9d0c6c2a6aca74632b2489:docs-site/docs/api/intro.md:curl-auth-header:62
