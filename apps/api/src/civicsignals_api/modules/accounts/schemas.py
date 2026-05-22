@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -67,3 +68,39 @@ class WorkspacePage(BaseModel):
 
     items: list[WorkspaceOut]
     next_cursor: str | None = None
+
+
+# --- Members (B7) -----------------------------------------------------------
+
+
+class MemberOut(BaseModel):
+    """A workspace membership (doc 08 §2 ``/workspaces/{id}/members``)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    workspace_id: UUID
+    user_id: UUID
+    role: MembershipRole
+    invited_by: UUID | None = None
+    invited_at: datetime | None = None
+    joined_at: datetime | None = None
+    created_at: datetime
+
+
+class MemberPage(BaseModel):
+    """A cursor-paginated page of workspace members (doc 06 §5, doc 08 §1.5)."""
+
+    items: list[MemberOut]
+    next_cursor: str | None = None
+
+
+class MemberRoleUpdate(BaseModel):
+    """Request body for ``PATCH /workspaces/{id}/members/{user_id}`` — set a role.
+
+    ``owner`` is intentionally not assignable here: ownership is a single seat set
+    at creation and transferred via a dedicated (later) flow, not by a generic
+    role change. Admins manage ``admin``/``member``/``viewer``.
+    """
+
+    role: Literal[MembershipRole.ADMIN, MembershipRole.MEMBER, MembershipRole.VIEWER]
