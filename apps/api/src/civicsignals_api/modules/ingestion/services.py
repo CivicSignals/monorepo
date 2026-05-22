@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from civicsignals_api.modules.recipes import services as recipes_services
@@ -32,6 +33,7 @@ from civicsignals_api.modules.recipes.services import (
     Fetcher,
 )
 
+from . import storage as storage_module
 from .models import RawDocument
 from .schemas import StoredRawDocument
 from .storage import RawDocumentStorage
@@ -77,48 +79,80 @@ async def store_raw_document(
     This makes a re-fetch of unchanged content cheap and safe (doc 18 §3.6: the
     raw snapshot is the source of truth and extraction is replayable against it).
 
-    The caller owns the transaction: on a new insert this flushes (to populate
-    ``id``/defaults) but does **not** commit, so it composes inside a larger unit
-    of work. ``fetched_at`` defaults to ``datetime.now`` (UTC-aware via the DB
-    ``server_default`` is bypassed because we set it explicitly for provenance).
+    Ordering keeps the work minimal and correct: the content hash/key are computed
+    locally first, so an already-stored document short-circuits on a single SELECT
+    with **no S3 write**. Only a genuinely new ``(recipe_id, content_hash)`` uploads
+    (and even then ``put_document_if_absent`` HEADs first so identical bytes from a
+    different recipe aren't re-PUT). The insert uses ``ON CONFLICT DO NOTHING`` and
+    re-selects, so two ingest workers racing on the same content can't trip the
+    UNIQUE constraint — the loser simply observes ``deduped=True``.
+
+    The caller owns the transaction: this flushes (to materialize the row) but does
+    **not** commit, so it composes inside a larger unit of work. ``fetched_at``
+    defaults to ``datetime.now(UTC)`` (set explicitly for provenance rather than
+    relying on the DB ``server_default``).
     """
     from datetime import UTC
 
     fetched_at = fetched_at or datetime.now(UTC)
-    stored = storage.put_document(content, content_type=content_type)
+    content_hash = storage_module.content_hash(content)
 
-    # Idempotent on (recipe_id, content_hash): a re-fetch of unchanged content
-    # for the same recipe reuses the existing provenance row.
-    existing = (
-        await session.execute(
-            select(RawDocument).where(
-                RawDocument.recipe_id == recipe_id,
-                RawDocument.content_hash == stored.content_hash,
-            )
-        )
-    ).scalar_one_or_none()
+    # Short-circuit: an existing row means the bytes are already stored (the key
+    # is the hash), so we neither re-upload nor re-insert (doc 18 §3.6).
+    existing = await _find_by_recipe_and_hash(session, recipe_id, content_hash)
     if existing is not None:
         return _to_schema(existing, deduped=True)
 
-    row = RawDocument(
-        recipe_id=recipe_id,
-        recipe_version=recipe_version,
-        connector=connector,
-        source_url=source_url,
-        fetched_at=fetched_at,
-        http_status=http_status,
-        content_hash=stored.content_hash,
-        blob_key=stored.key,
-        content_type=stored.content_type,
-        bytes_size=stored.size,
-        entity_id=entity_id,
-        doc_metadata=metadata or {},
+    # New content: upload (skipping the PUT if the object is already present) then
+    # insert idempotently. ON CONFLICT DO NOTHING makes the SELECT->INSERT safe
+    # under concurrent ingestion of identical content.
+    stored = storage.put_document_if_absent(content, content_type=content_type)
+    new_id = uuid.uuid4()
+    stmt = (
+        pg_insert(RawDocument)
+        .values(
+            id=new_id,
+            recipe_id=recipe_id,
+            recipe_version=recipe_version,
+            connector=connector,
+            source_url=source_url,
+            fetched_at=fetched_at,
+            http_status=http_status,
+            content_hash=stored.content_hash,
+            blob_key=stored.key,
+            content_type=stored.content_type,
+            bytes_size=stored.size,
+            entity_id=entity_id,
+            doc_metadata=metadata or {},
+        )
+        .on_conflict_do_nothing(constraint="ingestion_raw_document_dedupe")
+        .returning(RawDocument.id)
     )
-    session.add(row)
-    # Flush (not commit) to populate id + server defaults while letting the
-    # caller own the surrounding transaction boundary.
+    inserted_id = (await session.execute(stmt)).scalar_one_or_none()
     await session.flush()
+
+    if inserted_id is None:
+        # A concurrent writer won the race; re-select the row it inserted.
+        existing = await _find_by_recipe_and_hash(session, recipe_id, content_hash)
+        assert existing is not None  # the conflicting row must exist post-insert
+        return _to_schema(existing, deduped=True)
+
+    row = await session.get(RawDocument, inserted_id)
+    assert row is not None
     return _to_schema(row, deduped=False)
+
+
+async def _find_by_recipe_and_hash(
+    session: AsyncSession, recipe_id: str, content_hash: str
+) -> RawDocument | None:
+    return (
+        await session.execute(
+            select(RawDocument).where(
+                RawDocument.recipe_id == recipe_id,
+                RawDocument.content_hash == content_hash,
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def get_raw_document(

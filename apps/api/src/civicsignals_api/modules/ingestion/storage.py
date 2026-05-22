@@ -144,6 +144,35 @@ class RawDocumentStorage:
             content_type=content_type,
         )
 
+    def put_document_if_absent(
+        self,
+        data: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> StoredObject:
+        """Like :meth:`put_document` but skip the upload when the object is present.
+
+        Because storage is content-addressed, an object already at ``sha256/<hash>``
+        is byte-identical to ``data`` — so a re-fetch of unchanged content costs one
+        HEAD instead of a PUT. Always returns the :class:`StoredObject` (the content
+        address is computed locally regardless of whether an upload happened).
+        """
+        hash_hex = content_hash(data)
+        key = key_for_hash(hash_hex)
+        if not self.exists(key):
+            self._client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
+        return StoredObject(
+            key=key,
+            content_hash=hash_hex,
+            size=len(data),
+            content_type=content_type,
+        )
+
     def get_document(self, key: str) -> bytes:
         """Fetch the raw bytes stored at ``key`` (raises if the key is absent)."""
         response = self._client.get_object(Bucket=self._bucket, Key=key)
@@ -157,12 +186,22 @@ class RawDocumentStorage:
         Lets the upsert path skip a redundant upload when the content-addressed
         object is already present (the bytes can't differ — the key *is* the
         hash), so a re-fetch of unchanged content costs one HEAD, not a PUT.
+
+        Returns ``False`` only for a genuine *not-found*; any other client error
+        (credentials, throttling, endpoint outage) is re-raised so an operational
+        problem surfaces instead of being silently read as "absent".
         """
+        from botocore.exceptions import ClientError
+
         try:
             self._client.head_object(Bucket=self._bucket, Key=key)
-        except Exception:
-            # Any client error (incl. a 404 ClientError) means the object is absent.
-            return False
+        except ClientError as exc:
+            # A HEAD on a missing key surfaces as 404 / NoSuchKey / NotFound; any
+            # other error code is operational and must propagate.
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
         return True
 
 

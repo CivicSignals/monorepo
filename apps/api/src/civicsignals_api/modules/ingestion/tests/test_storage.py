@@ -12,6 +12,7 @@ from collections.abc import Iterator
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from civicsignals_api.modules.ingestion.storage import (
@@ -74,5 +75,58 @@ def test_exists_reflects_presence(storage: RawDocumentStorage) -> None:
 
 
 def test_get_missing_key_raises(storage: RawDocumentStorage) -> None:
-    with pytest.raises(Exception):  # noqa: B017 - moto raises the boto ClientError
+    with pytest.raises(ClientError) as exc_info:
         storage.get_document("sha256/deadbeef")
+    # A read of an absent key surfaces as a NoSuchKey ClientError.
+    assert exc_info.value.response["Error"]["Code"] == "NoSuchKey"
+
+
+def test_put_if_absent_skips_upload_when_present() -> None:
+    """The conditional put HEADs first and skips the PUT for already-stored bytes."""
+
+    class _CountingClient:
+        def __init__(self) -> None:
+            self.puts = 0
+            self._objects: dict[str, bytes] = {}
+
+        def put_object(self, **kwargs: object) -> object:
+            self.puts += 1
+            self._objects[str(kwargs["Key"])] = b""
+            return {}
+
+        def head_object(self, **kwargs: object) -> object:
+            if str(kwargs["Key"]) not in self._objects:
+                raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
+            return {}
+
+        def get_object(self, **kwargs: object) -> object:  # pragma: no cover - unused
+            return {}
+
+    client = _CountingClient()
+    store = RawDocumentStorage(client, "bucket")
+    data = b"same bytes"
+    first = store.put_document_if_absent(data)
+    second = store.put_document_if_absent(data)
+    assert first.key == second.key
+    # Uploaded exactly once despite two calls — the second HEAD found it present.
+    assert client.puts == 1
+
+
+def test_exists_reraises_non_404() -> None:
+    """A non-404 client error (e.g. AccessDenied) propagates rather than reading
+    as 'absent', so operational problems surface."""
+
+    class _FailingClient:
+        def head_object(self, **kwargs: object) -> object:
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+
+        def put_object(self, **kwargs: object) -> object:  # pragma: no cover
+            return {}
+
+        def get_object(self, **kwargs: object) -> object:  # pragma: no cover
+            return {}
+
+    store = RawDocumentStorage(_FailingClient(), "bucket")
+    with pytest.raises(ClientError) as exc_info:
+        store.exists("sha256/whatever")
+    assert exc_info.value.response["Error"]["Code"] == "AccessDenied"

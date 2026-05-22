@@ -33,7 +33,7 @@ from civicsignals_api.db import Base
 from civicsignals_api.modules.entities.models import Entity
 from civicsignals_api.modules.ingestion import services
 from civicsignals_api.modules.ingestion.models import RawDocument
-from civicsignals_api.modules.ingestion.storage import RawDocumentStorage
+from civicsignals_api.modules.ingestion.storage import RawDocumentStorage, StoredObject
 
 _DSN = (
     os.environ.get("INGESTION_TEST_DSN")
@@ -131,14 +131,31 @@ async def test_store_persists_provenance_and_bytes(
     await session.rollback()
 
 
+class _CountingStorage(RawDocumentStorage):
+    """A storage that counts its conditional-upload calls, so a test can assert the
+    dedupe path issues no S3 write (the bytes are already stored). Subclasses the
+    real storage and reuses its bucket/client; only the counter is added."""
+
+    def __init__(self, inner: RawDocumentStorage) -> None:
+        super().__init__(inner._client, inner.bucket)
+        self.if_absent_calls = 0
+
+    def put_document_if_absent(
+        self, data: bytes, *, content_type: str = "application/octet-stream"
+    ) -> StoredObject:
+        self.if_absent_calls += 1
+        return super().put_document_if_absent(data, content_type=content_type)
+
+
 async def test_store_is_idempotent_on_recipe_and_hash(
     session: AsyncSession, storage: RawDocumentStorage
 ) -> None:
+    counting = _CountingStorage(storage)
     content = b"identical fetched content"
     async with session.begin():
         first = await services.store_raw_document(
             session,
-            storage,
+            counting,
             content=content,
             recipe_id="r1",
             connector="http_static",
@@ -147,7 +164,7 @@ async def test_store_is_idempotent_on_recipe_and_hash(
     async with session.begin():
         second = await services.store_raw_document(
             session,
-            storage,
+            counting,
             content=content,
             recipe_id="r1",
             connector="http_static",
@@ -159,6 +176,8 @@ async def test_store_is_idempotent_on_recipe_and_hash(
     assert second.deduped is True
     assert second.id == first.id
     assert second.content_hash == first.content_hash
+    # The dedupe path short-circuits on the DB row and never touches S3.
+    assert counting.if_absent_calls == 1
 
     # Exactly one row exists for this (recipe_id, content_hash).
     rows = (
