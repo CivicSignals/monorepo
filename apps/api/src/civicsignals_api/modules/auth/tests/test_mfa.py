@@ -111,7 +111,8 @@ def test_mfa_enroll_again_while_active_fails(client: TestClient) -> None:
     # Try to begin enrollment again while active.
     resp = client.post(MFA_ENROLL, headers=_auth_header(token))
     assert resp.status_code == 400, resp.text
-    assert resp.json()["code"] == "mfa_already_active"
+    # RFC 7807: the code is embedded in the "type" URI (…/errors/<code>)
+    assert resp.json()["type"].endswith("mfa_already_active")
 
 
 # ---- MFA status test --------------------------------------------------------
@@ -273,7 +274,8 @@ def test_disable_mfa_not_active_returns_400(client: TestClient) -> None:
     token = _signup_and_get_token(client, "mfa_disable_inactive@example.com")
     resp = client.post(MFA_DISABLE, json={"code": "123456"}, headers=_auth_header(token))
     assert resp.status_code == 400, resp.text
-    assert resp.json()["code"] == "mfa_not_active"
+    # RFC 7807: the code is embedded in the "type" URI (…/errors/<code>)
+    assert resp.json()["type"].endswith("mfa_not_active")
 
 
 # ---- Regenerate backup codes ------------------------------------------------
@@ -329,10 +331,10 @@ def test_secret_not_returned_in_status_or_after_activation(client: TestClient) -
 
 
 # ---- Unit-level service tests (no DB) ----------------------------------------
+# These are pure-logic tests that don't need a DB or event loop.
 
 
-@pytest.mark.asyncio
-async def test_mfa_challenge_token_round_trips() -> None:
+def test_mfa_challenge_token_round_trips() -> None:
     """Issue and verify an MFA challenge token without a DB."""
     from uuid import uuid4
 
@@ -347,8 +349,7 @@ async def test_mfa_challenge_token_round_trips() -> None:
     assert recovered == user_id
 
 
-@pytest.mark.asyncio
-async def test_mfa_challenge_token_wrong_type_rejected() -> None:
+def test_mfa_challenge_token_wrong_type_rejected() -> None:
     from uuid import uuid4
 
     from civicsignals_api.config import Settings
@@ -361,8 +362,7 @@ async def test_mfa_challenge_token_wrong_type_rejected() -> None:
         auth_services.verify_mfa_challenge_token(access_token, settings=settings)
 
 
-@pytest.mark.asyncio
-async def test_totp_secret_encrypt_decrypt_round_trips() -> None:
+def test_totp_secret_encrypt_decrypt_round_trips() -> None:
     from civicsignals_api.config import Settings
 
     settings = Settings(secret_key="test-secret-key-for-mfa")
