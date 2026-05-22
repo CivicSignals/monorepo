@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// C3 — Entity profile: renders entity fields + children list.
+// C3/C4 — Entity profile: renders entity fields + children list + contacts section.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { EntityProfile } from "@/app/entities/[id]/entity-profile";
 import type { EntityPage, EntityRead } from "@/lib/entities-api";
+import type { ContactPage, ContactRead } from "@/lib/contacts-api";
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
@@ -58,6 +59,28 @@ const CHILD_ENTITY: EntityRead = {
   source_urls: [],
 };
 
+const NOW_ISO = new Date().toISOString();
+
+const VERIFIED_CONTACT: ContactRead = {
+  id: "contact-1",
+  entity_id: "ent-abc",
+  name: "Dr. Lisa Hong",
+  department: "Curriculum",
+  title: "Director of Curriculum",
+  status: "active",
+  canonical_email: "lhong@nsd.org",
+  attributes: {},
+  source: "nsd.org/staff",
+  source_url: "https://nsd.org/staff",
+  source_recipe_id: null,
+  confidence: 0.95,
+  observed_at: NOW_ISO,
+  verified: true,
+  last_verified_at: NOW_ISO,
+  created_at: NOW_ISO,
+  updated_at: NOW_ISO,
+};
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -78,6 +101,13 @@ beforeEach(() => {
     if (path === "/api/v1/entities/ent-abc/children") {
       const page: EntityPage = {
         items: [CHILD_ENTITY],
+        next_cursor: null,
+      };
+      return jsonResponse(page);
+    }
+    if (path === "/api/v1/contacts") {
+      const page: ContactPage = {
+        items: [VERIFIED_CONTACT],
         next_cursor: null,
       };
       return jsonResponse(page);
@@ -165,10 +195,10 @@ describe("EntityProfile", () => {
     expect(childLink.getAttribute("href")).toBe("/entities/ent-child-1");
   });
 
-  it("renders the Contacts placeholder section with TODO C4 note", async () => {
+  it("renders the Contacts section with contact names (C4)", async () => {
     render(<EntityProfile id="ent-abc" />, { wrapper });
     await screen.findByRole("heading", { name: /Contacts/i });
-    expect(screen.getByText(/future release/i)).toBeTruthy();
+    expect(await screen.findByText("Dr. Lisa Hong")).toBeTruthy();
   });
 
   it("renders 'Load more children' when next_cursor is set", async () => {
