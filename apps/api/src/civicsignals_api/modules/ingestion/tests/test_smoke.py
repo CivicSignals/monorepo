@@ -1,4 +1,5 @@
 """Smoke test: the ingestion module imports and exposes a router."""
+
 from civicsignals_api.modules.ingestion import routes
 
 

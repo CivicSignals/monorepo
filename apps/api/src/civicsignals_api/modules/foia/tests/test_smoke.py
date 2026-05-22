@@ -1,4 +1,5 @@
 """Smoke test: the foia module imports and exposes a router."""
+
 from civicsignals_api.modules.foia import routes
 
 

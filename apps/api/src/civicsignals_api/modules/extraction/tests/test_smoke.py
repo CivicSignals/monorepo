@@ -1,4 +1,5 @@
 """Smoke test: the extraction module imports and exposes a router."""
+
 from civicsignals_api.modules.extraction import routes
 
 

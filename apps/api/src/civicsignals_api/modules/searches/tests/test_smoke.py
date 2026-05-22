@@ -1,4 +1,5 @@
 """Smoke test: the searches module imports and exposes a router."""
+
 from civicsignals_api.modules.searches import routes
 
 

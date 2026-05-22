@@ -71,8 +71,12 @@ DEMO_USER = {
 
 # A handful of synthetic public-sector entities (TODO C1 will own the real ones).
 DEMO_ENTITIES: list[dict[str, str]] = [
-    {"slug": "tx-austin-isd", "name": "Austin Independent School District",
-     "kind": "k12_district", "state": "TX"},
+    {
+        "slug": "tx-austin-isd",
+        "name": "Austin Independent School District",
+        "kind": "k12_district",
+        "state": "TX",
+    },
     {"slug": "ca-sac-county", "name": "Sacramento County", "kind": "county", "state": "CA"},
     {"slug": "wa-seattle-city", "name": "City of Seattle", "kind": "city", "state": "WA"},
 ]
@@ -87,7 +91,7 @@ DEMO_SIGNALS: list[_Signal] = [
         "signal_type": "rfp_posted",
         "title": "RFP: District-wide ERP modernization",
         "summary": "Austin ISD seeks vendors for a multi-year ERP replacement covering "
-                   "finance, HR, and procurement.",
+        "finance, HR, and procurement.",
         "score": 88,
         "age_days": 2,
     },
@@ -97,7 +101,7 @@ DEMO_SIGNALS: list[_Signal] = [
         "signal_type": "contract_expiring",
         "title": "Fleet telematics contract expiring in 120 days",
         "summary": "Sacramento County's incumbent fleet-tracking contract lapses in Q3; "
-                   "renewal or rebid expected.",
+        "renewal or rebid expected.",
         "score": 74,
         "age_days": 9,
     },
@@ -107,7 +111,7 @@ DEMO_SIGNALS: list[_Signal] = [
         "signal_type": "budget_published",
         "title": "Proposed 2027 budget published",
         "summary": "Seattle's proposed 2027 budget allocates new capital spending for "
-                   "transportation and IT modernization.",
+        "transportation and IT modernization.",
         "score": 61,
         "age_days": 21,
     },
@@ -126,7 +130,7 @@ DEMO_SIGNALS: list[_Signal] = [
         "signal_type": "board_agenda",
         "title": "Council agenda: public-safety technology review",
         "summary": "Upcoming council session includes a review of public-safety technology "
-                   "vendors and contracts.",
+        "vendors and contracts.",
         "score": 47,
         "age_days": 4,
     },

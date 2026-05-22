@@ -79,6 +79,34 @@ class Settings(BaseSettings):
     recipe_schema_dir: str | None = None
     recipes_dir: str | None = None
 
+    # ---------------------------------------------------------------------------
+    # Observability (A6) — all optional, safe defaults = disabled.
+    # No external accounts are required to run the app; these enable integrations
+    # with self-hosted or cloud observability back-ends.
+    # ---------------------------------------------------------------------------
+
+    # Sentry error tracking (doc 06 §9). Set to a full DSN string to enable.
+    # Leave unset (default) or empty for a no-op; no Sentry network calls are made.
+    # Self-host options: Sentry OSS (https://develop.sentry.dev/self-hosted/) or
+    # GlitchTip (https://glitchtip.com/). Source-map / release tagging: TODO LC-15.
+    sentry_dsn: str | None = None
+    # Sentry sample rates (0.0-1.0). Safe defaults = 10% errors, 5% traces.
+    sentry_traces_sample_rate: float = 0.05
+    sentry_profiles_sample_rate: float = 0.0
+
+    # OpenTelemetry tracing (doc 06 §9). Set to your OTLP receiver endpoint
+    # (e.g. "http://otel-collector:4317") to enable. Leave unset for no-op.
+    # Exporter: OTLP/gRPC (opentelemetry-exporter-otlp-proto-grpc).
+    # Self-host: run the OTel Collector + Tempo/Jaeger (see infra/observability/).
+    otel_exporter_otlp_endpoint: str | None = None
+    # OTLP headers as a comma-separated "key=value,..." string (for cloud providers
+    # such as Honeycomb or Grafana Cloud that require an API key header).
+    otel_exporter_otlp_headers: str | None = None
+    # Service name reported in spans (defaults to the project name).
+    otel_service_name: str = "civicsignals-api"
+    # Sample ratio for OTel traces (1.0 = all; fraction = head-based sampling).
+    otel_traces_sample_ratio: float = 1.0
+
 
 @lru_cache
 def get_settings() -> Settings:

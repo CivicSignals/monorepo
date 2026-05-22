@@ -1,4 +1,5 @@
 """Smoke test: the notifications module imports and exposes a router."""
+
 from civicsignals_api.modules.notifications import routes
 
 

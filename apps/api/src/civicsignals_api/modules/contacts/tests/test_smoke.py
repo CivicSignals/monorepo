@@ -1,4 +1,5 @@
 """Smoke test: the contacts module imports and exposes a router."""
+
 from civicsignals_api.modules.contacts import routes
 
 

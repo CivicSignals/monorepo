@@ -63,9 +63,7 @@ class OllamaBackend:
         if system is not None:
             payload["system"] = system
         try:
-            response = await self._get_client().post(
-                f"{self._base_url}/api/generate", json=payload
-            )
+            response = await self._get_client().post(f"{self._base_url}/api/generate", json=payload)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
