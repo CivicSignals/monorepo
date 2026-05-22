@@ -215,6 +215,12 @@ class SmartSearchRequest(BaseModel):
     a UI with filter chips can pass them without round-tripping through NL. ``top_n``
     is the page size; ``candidate_limit`` caps how many rows each retriever pulls
     before fusion. ``weights`` overrides the default fusion weights for tuning.
+
+    ``summarize``: request an optional LLM synthesis of the top-N results (I4).
+    Default ``False`` so plain search has zero LLM cost beyond the rewrite.
+    The summary is generated over the first page only (no summary on paginated
+    follow-up pages) and capped at :data:`SUMMARY_TOP_N` signals to bound token cost.
+    # TODO I5: enforce per-workspace smart-search LLM spend budget before summarizing.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -225,6 +231,8 @@ class SmartSearchRequest(BaseModel):
     candidate_limit: int = Field(default=DEFAULT_CANDIDATE_LIMIT, ge=1, le=MAX_CANDIDATE_LIMIT)
     weights: FusionWeights = Field(default_factory=FusionWeights)
     cursor: str | None = None
+    # I4: optional LLM synthesis of the top-N ranked results.
+    summarize: bool = False
 
 
 class SmartSearchResult(BaseModel):
@@ -247,7 +255,13 @@ class SmartSearchResult(BaseModel):
 
 
 class SmartSearchResponse(BaseModel):
-    """``POST /smart-search`` response: a ranked, cursor-paginated page of hits."""
+    """``POST /smart-search`` response: a ranked, cursor-paginated page of hits.
+
+    ``summary`` is ``None`` unless the request included ``summarize=true`` **and**
+    the summarizer succeeded **and** there are results to summarize. Callers must
+    tolerate ``None`` even when they requested a summary (graceful degradation on
+    LLM failure, I4).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -256,3 +270,6 @@ class SmartSearchResponse(BaseModel):
     # Echo back the structured rewrite so the client can show "we searched for …".
     query: StructuredQuery
     degraded: bool = False
+    # I4: optional LLM summary of the top-N results. Absent (None) when not
+    # requested, when there are no results, or when summarization failed.
+    summary: str | None = None

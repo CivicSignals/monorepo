@@ -15,6 +15,7 @@ from .types import (
     TASK_CLASSIFY,
     TASK_EXTRACTION,
     TASK_SMART_SEARCH_REWRITE,
+    TASK_SMART_SEARCH_SUMMARY,
     TASK_SUMMARY,
     TASK_TRANSLATE,
 )
@@ -34,12 +35,15 @@ KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "openai", "ollama"})
 
 # Sensible defaults per task. Haiku-class for cheap/high-volume work, Sonnet for
 # extraction and summarization where quality matters more than per-call cost.
+# smart_search_summary uses Haiku (not Sonnet) because it is latency-sensitive
+# (user waits) and the synthesis is short — quality/cost balance favours Haiku.
 DEFAULT_TASK_MODELS: dict[str, ModelChoice] = {
     TASK_CLASSIFY: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
     TASK_EXTRACTION: ModelChoice("anthropic", "claude-3-5-sonnet-latest"),
     TASK_SUMMARY: ModelChoice("anthropic", "claude-3-5-sonnet-latest"),
     TASK_TRANSLATE: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
     TASK_SMART_SEARCH_REWRITE: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
+    TASK_SMART_SEARCH_SUMMARY: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
 }
 
 
