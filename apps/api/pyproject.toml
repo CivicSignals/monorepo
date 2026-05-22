@@ -23,7 +23,7 @@ dependencies = [
     # the backend version, which bcrypt removed in 4.1+, and bcrypt 4.1+ also
     # raises on >72-byte secrets instead of truncating. Both break passlib's
     # bcrypt handler. (B1; revisit when passlib ships a 1.7.4+ fix.)
-    "bcrypt>=4.0.1,<4.1",
+    "bcrypt>=4.0.1,<5.1",
     "pyjwt>=2.9",
     "python-multipart>=0.0.12",
     "structlog>=24.4",
