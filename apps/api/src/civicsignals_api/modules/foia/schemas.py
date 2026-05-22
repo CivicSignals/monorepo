@@ -1,15 +1,26 @@
-"""Pydantic request/response shapes for the foia module (doc 06 §3).
+"""Pydantic request/response shapes for the foia module (doc 06 §3, M2).
 
 Template responses are **global reference data** — not workspace-scoped —
-so these shapes carry no workspace fields. The template list response uses
+so those shapes carry no workspace fields. The template list response uses
 ``items`` + ``total`` (not cursor-paginated) because the library is small
-and static (M1). M2 may introduce cursor pagination if the library grows
-to the point where a single response is impractical.
+and static (M1).
+
+FOIA request shapes are workspace-scoped and use cursor pagination per
+doc 06 §5 (``cursor`` + ``limit`` query params, ``next_cursor`` in responses).
 """
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
+
+from .models import FoiaRequestStatus, SubmissionMethod
+
+# ---------------------------------------------------------------------------
+# Template shapes (M1, unchanged)
+# ---------------------------------------------------------------------------
 
 
 class FoiaTemplateRead(BaseModel):
@@ -101,3 +112,157 @@ class FoiaTemplateRenderResponse(BaseModel):
 
     jurisdiction: str
     rendered_body: str = Field(description="Fully rendered request body, ready to send.")
+
+
+# ---------------------------------------------------------------------------
+# FOIA request shapes (M2)
+# ---------------------------------------------------------------------------
+
+
+class FoiaRequestCreate(BaseModel):
+    """Request body for ``POST /api/v1/foia/requests`` (create a new request).
+
+    The request can be created in two ways:
+    1. **From a template** — supply ``jurisdiction`` and ``template_context``; the
+       service will call ``render_template(jurisdiction, template_context)`` and
+       use the result as ``body``.  If ``body`` is also supplied it takes
+       precedence (useful for post-render edits before saving).
+    2. **Freeform** — supply ``body`` directly without ``jurisdiction``.
+
+    ``entity_id`` is required: a FOIA request must always target a known agency
+    in the entity directory (C1). The entity is validated via
+    ``entities.services.get_entity`` before the row is inserted.
+    """
+
+    model_config = ConfigDict(from_attributes=False)
+
+    entity_id: uuid.UUID = Field(description="Target agency / entity (must exist in directory).")
+    subject: str = Field(
+        min_length=1,
+        max_length=512,
+        description="Short description of records requested.",
+    )
+
+    # Template-based creation (optional; freeform if absent).
+    jurisdiction: str | None = Field(
+        default=None,
+        description=(
+            "Jurisdiction code (e.g. 'CA-PRA') to use for template-based body generation. "
+            "Required when template_context is supplied."
+        ),
+    )
+    template_context: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Placeholder values passed to render_template when jurisdiction is set. "
+            "See the template's 'placeholders' list for required keys."
+        ),
+    )
+
+    # Body may be supplied directly (freeform) or derived from the template.
+    body: str | None = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Full request body text. If omitted, jurisdiction + template_context must be "
+            "provided and the body is rendered from the template. If both body and "
+            "jurisdiction/template_context are provided, body takes precedence."
+        ),
+    )
+
+    submission_method: SubmissionMethod = Field(
+        default=SubmissionMethod.MANUAL,
+        description="How the request will be physically submitted (default: manual).",
+    )
+    submission_target: str | None = Field(
+        default=None,
+        max_length=1024,
+        description="Email address, portal URL, or mailing address for submission.",
+    )
+
+
+class FoiaRequestUpdate(BaseModel):
+    """Request body for ``PATCH /api/v1/foia/requests/{id}`` (draft-only edits).
+
+    All fields are optional; only supplied fields are updated.  Raises a 409
+    ``foia_not_draft`` error if the request is not in ``draft`` status.
+    """
+
+    model_config = ConfigDict(from_attributes=False)
+
+    subject: str | None = Field(default=None, min_length=1, max_length=512)
+    body: str | None = Field(default=None, min_length=1)
+    submission_method: SubmissionMethod | None = Field(default=None)
+    submission_target: str | None = Field(default=None, max_length=1024)
+
+
+class FoiaRequestTransition(BaseModel):
+    """Request body for ``POST /api/v1/foia/requests/{id}/transition``.
+
+    ``status`` is the *target* status.  Allowed paths:
+        draft → sent → ack → response
+
+    Illegal transitions (e.g. draft → response) raise a 409
+    ``foia_illegal_transition`` RFC 7807 error. ``response_notes`` is accepted
+    only when transitioning to ``response`` (ignored otherwise).
+    """
+
+    model_config = ConfigDict(from_attributes=False)
+
+    status: FoiaRequestStatus = Field(description="Target status to transition to.")
+    response_notes: str | None = Field(
+        default=None,
+        description="Free-text notes (accepted on ack→response transition).",
+    )
+
+
+class FoiaRequestRead(BaseModel):
+    """A FOIA request as returned by the API.
+
+    Workspace-scoped — the caller's workspace is always the same as
+    ``workspace_id``.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    created_by: uuid.UUID
+    entity_id: uuid.UUID
+    jurisdiction: str | None
+    subject: str
+    body: str
+    submission_method: str
+    submission_target: str | None
+    status: str
+    sent_at: datetime | None
+    ack_at: datetime | None
+    response_at: datetime | None
+    response_notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class FoiaRequestPage(BaseModel):
+    """Cursor-paginated list of FOIA requests (doc 06 §5)."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    items: list[FoiaRequestRead]
+    next_cursor: str | None = Field(
+        default=None,
+        description="Opaque cursor for the next page; null when this is the last page.",
+    )
+
+
+class FoiaRequestEventRead(BaseModel):
+    """One status-transition event in a FOIA request's history."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    request_id: uuid.UUID
+    actor_id: uuid.UUID
+    from_status: str
+    to_status: str
+    occurred_at: datetime
