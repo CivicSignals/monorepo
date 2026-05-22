@@ -41,6 +41,16 @@ celery_app.conf.task_routes = {
 
 # Beat schedule (doc 06 §8). Tasks are defined in each module's tasks.py.
 celery_app.conf.beat_schedule = {
+    # D4: per-recipe cadence dispatcher. Ticks every minute on the singleton
+    # ``scheduler`` process (leader-elected via a Redis lock, doc 18 §6.1); each
+    # tick scans active recipes and enqueues ``ingestion.crawl_recipe`` for the
+    # ones whose cron + per-recipe jitter say they're due (doc 06 §8 per-recipe
+    # cadence ~5 min to 24 h). The 1-min tick is the *scan* cadence, not a recipe's
+    # cadence — a recipe's own ``schedule.cron`` governs how often it actually runs.
+    "ingestion.dispatch_due_recipes": {
+        "task": "ingestion.dispatch_due_recipes",
+        "schedule": 60.0,
+    },
     "extraction.run_pending_documents": {
         "task": "extraction.run_pending_documents",
         "schedule": 60.0,
