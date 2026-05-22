@@ -15,18 +15,24 @@ import {
   type DiscoveredObject,
   type FieldMapping,
   type FieldMappingInput,
+  type FieldMappingTemplate,
+  type FieldMappingTemplateInput,
   type PushInput,
   type PushLogEntry,
+  applyFieldMappingTemplate,
   connectHubspot,
   connectSalesforce,
   deleteFieldMapping,
+  deleteFieldMappingTemplate,
   disconnect,
   discoverFields,
   discoverObjects,
   listConnections,
+  listFieldMappingTemplates,
   listFieldMappings,
   pushSignal,
   saveFieldMapping,
+  saveFieldMappingTemplate,
 } from "@/lib/salesforce-api";
 import { useSessionStore } from "@/store/session";
 
@@ -56,6 +62,17 @@ export const fieldMappingsKey = (
   connectionId: string | undefined,
 ) =>
   ["integrations", "field-mappings", workspaceId ?? "none", connectionId ?? "none"] as const;
+
+export const fieldMappingTemplatesKey = (
+  workspaceId: string | undefined,
+  connectionId: string | undefined,
+) =>
+  [
+    "integrations",
+    "field-mapping-templates",
+    workspaceId ?? "none",
+    connectionId ?? "none",
+  ] as const;
 
 /** List the active workspace's integration connections (admin only). */
 export function useConnections(workspaceId: string | undefined) {
@@ -212,6 +229,98 @@ export function useDeleteFieldMapping(
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: fieldMappingsKey(workspaceId, connectionId),
+      });
+    },
+  });
+}
+
+// --- Field-mapping templates / per-connection defaults (K6) -----------------
+
+/** List the connection's saved field-mapping templates (default first). */
+export function useFieldMappingTemplates(
+  workspaceId: string | undefined,
+  connectionId: string | undefined,
+) {
+  const token = useSessionStore((s) => s.accessToken);
+  return useQuery<FieldMappingTemplate[]>({
+    queryKey: fieldMappingTemplatesKey(workspaceId, connectionId),
+    queryFn: async () => {
+      if (!token || !workspaceId || !connectionId) return [];
+      return listFieldMappingTemplates(token, workspaceId, connectionId);
+    },
+    enabled: token !== null && !!workspaceId && !!connectionId,
+  });
+}
+
+/** Save the current mapping as a named template (optionally the default). */
+export function useSaveFieldMappingTemplate(
+  workspaceId: string | undefined,
+  connectionId: string | undefined,
+) {
+  const token = useSessionStore((s) => s.accessToken);
+  const queryClient = useQueryClient();
+  return useMutation<FieldMappingTemplate, Error, FieldMappingTemplateInput>({
+    mutationFn: (input) => {
+      if (!token || !workspaceId || !connectionId)
+        return Promise.reject(new Error("no active workspace"));
+      return saveFieldMappingTemplate(token, workspaceId, connectionId, input);
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: fieldMappingTemplatesKey(workspaceId, connectionId),
+      });
+    },
+  });
+}
+
+/** Apply a saved template onto the connection's live per-target mapping. */
+export function useApplyFieldMappingTemplate(
+  workspaceId: string | undefined,
+  connectionId: string | undefined,
+) {
+  const token = useSessionStore((s) => s.accessToken);
+  const queryClient = useQueryClient();
+  return useMutation<FieldMapping, Error, string>({
+    mutationFn: (templateId) => {
+      if (!token || !workspaceId || !connectionId)
+        return Promise.reject(new Error("no active workspace"));
+      return applyFieldMappingTemplate(
+        token,
+        workspaceId,
+        connectionId,
+        templateId,
+      );
+    },
+    onSuccess: () => {
+      // The live mapping changed — refresh the mapping list too.
+      void queryClient.invalidateQueries({
+        queryKey: fieldMappingsKey(workspaceId, connectionId),
+      });
+    },
+  });
+}
+
+/** Delete a saved field-mapping template. */
+export function useDeleteFieldMappingTemplate(
+  workspaceId: string | undefined,
+  connectionId: string | undefined,
+) {
+  const token = useSessionStore((s) => s.accessToken);
+  const queryClient = useQueryClient();
+  return useMutation<void, Error, string>({
+    mutationFn: (templateId) => {
+      if (!token || !workspaceId || !connectionId)
+        return Promise.reject(new Error("no active workspace"));
+      return deleteFieldMappingTemplate(
+        token,
+        workspaceId,
+        connectionId,
+        templateId,
+      );
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: fieldMappingTemplatesKey(workspaceId, connectionId),
       });
     },
   });

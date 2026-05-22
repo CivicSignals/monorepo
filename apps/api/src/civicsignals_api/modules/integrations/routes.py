@@ -65,6 +65,9 @@ from .schemas import (
     FieldDiscoveryOut,
     FieldMappingList,
     FieldMappingOut,
+    FieldMappingTemplateList,
+    FieldMappingTemplateOut,
+    FieldMappingTemplateSave,
     FieldMappingUpsert,
     ObjectDiscoveryOut,
     PushFailureOut,
@@ -505,6 +508,145 @@ async def delete_field_mapping(
     if mapping is None:
         raise _not_found()
     await services.delete_field_mapping(session, mapping)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- Field-mapping templates / per-connection defaults (K6) -----------------
+# Saving/applying a reusable mapping template is workspace *data* work (not
+# workspace administration), so — like the K5 recovery surface — these gate on
+# RequireMember rather than RequireAdmin.
+
+
+async def _require_connection_member(
+    workspace_id: uuid.UUID, session: AsyncSession, connection_id: uuid.UUID
+) -> Connection:
+    connection = await services.get_connection(session, workspace_id, connection_id)
+    if connection is None:
+        raise _not_found()
+    return connection
+
+
+@router.get(
+    "/connections/{connection_id}/field-mapping-templates",
+    response_model=FieldMappingTemplateList,
+    summary="List a connection's saved field-mapping templates (member and up)",
+)
+async def list_field_mapping_templates(
+    connection_id: uuid.UUID, ctx: RequireMember, session: SessionDep
+) -> FieldMappingTemplateList:
+    """List the connection's saved field-mapping templates (default first) (K6)."""
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    templates = await services.list_field_mapping_templates(
+        session, workspace_id=ctx.workspace_id, connection_id=connection_id
+    )
+    return FieldMappingTemplateList(
+        data=[FieldMappingTemplateOut.from_orm_template(t) for t in templates]
+    )
+
+
+@router.post(
+    "/connections/{connection_id}/field-mapping-templates",
+    response_model=FieldMappingTemplateOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Save the current mapping as a named template/default (member and up)",
+)
+async def save_field_mapping_template(
+    connection_id: uuid.UUID,
+    body: FieldMappingTemplateSave,
+    ctx: RequireMember,
+    session: SessionDep,
+) -> FieldMappingTemplateOut:
+    """Save the current field mapping as a reusable template for the connection (K6).
+
+    Upserts by ``(connection, name)``. When ``is_default`` is set, this becomes
+    the connection's auto-applied default (any prior default is cleared).
+    """
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    template = await services.save_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        name=body.name,
+        target_object=body.target_object,
+        field_map=dict(body.field_map),
+        constants=dict(body.constants),
+        is_default=body.is_default,
+    )
+    await session.commit()
+    await session.refresh(template)
+    return FieldMappingTemplateOut.from_orm_template(template)
+
+
+@router.post(
+    "/connections/{connection_id}/field-mapping-templates/{template_id}/apply",
+    response_model=FieldMappingOut,
+    summary="Apply a saved template onto the connection's live mapping (member and up)",
+)
+async def apply_field_mapping_template(
+    connection_id: uuid.UUID,
+    template_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+) -> FieldMappingOut:
+    """Apply a saved template onto the connection's per-target field mapping (K6).
+
+    Copies the template's field map + constants onto the live
+    :class:`FieldMapping` for the template's target object. ``404`` when the
+    template is not in this workspace/connection.
+    """
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    template = await services.get_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        template_id=template_id,
+    )
+    if template is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Template not found",
+            detail="No such field-mapping template in this workspace.",
+        )
+    mapping = await services.apply_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        template=template,
+    )
+    await session.commit()
+    await session.refresh(mapping)
+    return FieldMappingOut.from_orm_mapping(mapping)
+
+
+@router.delete(
+    "/connections/{connection_id}/field-mapping-templates/{template_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a saved field-mapping template (member and up)",
+)
+async def delete_field_mapping_template(
+    connection_id: uuid.UUID,
+    template_id: uuid.UUID,
+    ctx: RequireMember,
+    session: SessionDep,
+) -> Response:
+    """Delete a saved field-mapping template (K6)."""
+    await _require_connection_member(ctx.workspace_id, session, connection_id)
+    template = await services.get_field_mapping_template(
+        session,
+        workspace_id=ctx.workspace_id,
+        connection_id=connection_id,
+        template_id=template_id,
+    )
+    if template is None:
+        raise ProblemException(
+            status=status.HTTP_404_NOT_FOUND,
+            code="not_found",
+            title="Template not found",
+            detail="No such field-mapping template in this workspace.",
+        )
+    await services.delete_field_mapping_template(session, template)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

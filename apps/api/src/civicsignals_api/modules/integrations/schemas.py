@@ -12,6 +12,7 @@ from .models import (
     Connection,
     ConnectionStatus,
     FieldMapping,
+    FieldMappingTemplate,
     IntegrationProviderKind,
     PushErrorCode,
     PushLog,
@@ -259,6 +260,52 @@ class FieldMappingList(BaseModel):
     """GET .../field-mappings response — a connection's mappings (K2)."""
 
     data: list[FieldMappingOut]
+
+
+# --- Field-mapping templates / per-connection defaults (K6) -----------------
+
+TEMPLATE_NAME_MAX_LEN = 160
+
+
+class FieldMappingTemplateSave(BaseModel):
+    """Body for saving the current mapping as a named template/default (K6).
+
+    Captures the field map + constants the UI is editing under ``name``. Set
+    ``is_default`` to make it the connection's auto-applied default. Upserts by
+    ``(connection, name)`` — re-saving a name replaces its snapshot.
+    """
+
+    name: str = Field(min_length=1, max_length=TEMPLATE_NAME_MAX_LEN)
+    target_object: str = Field(min_length=1, max_length=TARGET_OBJECT_MAX_LEN)
+    field_map: dict[str, str] = Field(default_factory=dict)
+    constants: dict[str, object] = Field(default_factory=dict)
+    is_default: bool = False
+
+
+class FieldMappingTemplateOut(BaseModel):
+    """A saved field-mapping template (K6)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    connection_id: UUID
+    name: str
+    target_object: str
+    field_map: dict[str, object]
+    constants: dict[str, object]
+    is_default: bool
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm_template(cls, template: FieldMappingTemplate) -> FieldMappingTemplateOut:
+        return cls.model_validate(template)
+
+
+class FieldMappingTemplateList(BaseModel):
+    """GET .../field-mapping-templates response — a connection's templates (K6)."""
+
+    data: list[FieldMappingTemplateOut]
 
 
 # --- Push a signal / pipeline-item (K2) -------------------------------------

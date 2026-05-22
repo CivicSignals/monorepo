@@ -12,6 +12,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { FieldMappingTemplates } from "@/components/integrations/field-mapping-templates";
 import {
   useConnectHubspot,
   useConnections,
@@ -333,6 +334,14 @@ function FieldMappingEditor({
           </span>
         ) : null}
       </div>
+
+      <FieldMappingTemplates
+        workspaceId={workspaceId}
+        connectionId={connectionId}
+        targetObject={targetObject}
+        currentMap={map}
+        onApplied={(mapping) => setMap(mapping.field_map)}
+      />
     </div>
   );
 }

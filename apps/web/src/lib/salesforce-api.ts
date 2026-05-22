@@ -102,6 +102,27 @@ export interface FieldMappingInput {
   constants?: Record<string, unknown>;
 }
 
+// K6: a saved, named field-mapping template (per-connection default/blueprint).
+export interface FieldMappingTemplate {
+  id: string;
+  connection_id: string;
+  name: string;
+  target_object: string;
+  field_map: Record<string, string>;
+  constants: Record<string, unknown>;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FieldMappingTemplateInput {
+  name: string;
+  target_object: string;
+  field_map: Record<string, string>;
+  constants?: Record<string, unknown>;
+  is_default?: boolean;
+}
+
 export interface PushInput {
   source: Record<string, unknown>;
   target?: string;
@@ -268,6 +289,61 @@ export function deleteFieldMapping(
 ): Promise<void> {
   return request<void>(
     `/integrations/connections/${connectionId}/field-mappings/${encodeURIComponent(targetObject)}`,
+    { method: "DELETE", token, workspaceId },
+  );
+}
+
+// ---- Field-mapping templates / per-connection defaults (K6) ----
+
+export async function listFieldMappingTemplates(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+): Promise<FieldMappingTemplate[]> {
+  const body = await request<{ data: FieldMappingTemplate[] }>(
+    `/integrations/connections/${connectionId}/field-mapping-templates`,
+    { token, workspaceId },
+  );
+  return body.data;
+}
+
+export function saveFieldMappingTemplate(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+  input: FieldMappingTemplateInput,
+): Promise<FieldMappingTemplate> {
+  return request<FieldMappingTemplate>(
+    `/integrations/connections/${connectionId}/field-mapping-templates`,
+    {
+      method: "POST",
+      body: JSON.stringify(input),
+      token,
+      workspaceId,
+    },
+  );
+}
+
+export function applyFieldMappingTemplate(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+  templateId: string,
+): Promise<FieldMapping> {
+  return request<FieldMapping>(
+    `/integrations/connections/${connectionId}/field-mapping-templates/${templateId}/apply`,
+    { method: "POST", token, workspaceId },
+  );
+}
+
+export function deleteFieldMappingTemplate(
+  token: string,
+  workspaceId: string,
+  connectionId: string,
+  templateId: string,
+): Promise<void> {
+  return request<void>(
+    `/integrations/connections/${connectionId}/field-mapping-templates/${templateId}`,
     { method: "DELETE", token, workspaceId },
   );
 }

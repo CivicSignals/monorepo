@@ -90,6 +90,9 @@ function setupFetchMocks(
         ],
       });
     }
+    if (path.endsWith("/field-mapping-templates")) {
+      return jsonResponse({ data: [] });
+    }
     if (path.endsWith("/field-mappings") && method === "PUT") {
       return jsonResponse(
         opts.saveResponse ?? {

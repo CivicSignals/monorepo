@@ -65,6 +65,7 @@ from .models import (
     Connection,
     ConnectionStatus,
     FieldMapping,
+    FieldMappingTemplate,
     IntegrationProviderKind,
     PushErrorCode,
     PushIdempotency,
@@ -687,6 +688,168 @@ async def delete_field_mapping(session: AsyncSession, mapping: FieldMapping) -> 
 
 
 # ---------------------------------------------------------------------------
+# Field-mapping templates / per-connection defaults (K6)
+# ---------------------------------------------------------------------------
+# K6 lets an admin save the *current* mapping as a named, reusable template per
+# connection (optionally the connection default), list a connection's templates,
+# and apply one back onto a target's live FieldMapping. All workspace-scoped (B5)
+# and connection-scoped so a caller can never reach another tenant's template.
+
+
+class TemplateNotFoundError(IntegrationError):
+    """A template lookup/apply targeted a template not in this workspace (K6)."""
+
+
+async def list_field_mapping_templates(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID
+) -> list[FieldMappingTemplate]:
+    """List a connection's saved field-mapping templates (workspace-scoped, K6).
+
+    Defaults are surfaced first, then alphabetically by name, so the UI can show
+    the connection default at the top of the apply menu.
+    """
+    result = await session.execute(
+        select(FieldMappingTemplate)
+        .where(
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+        )
+        .order_by(
+            FieldMappingTemplate.is_default.desc(),
+            FieldMappingTemplate.name.asc(),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def get_field_mapping_template(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID, template_id: UUID
+) -> FieldMappingTemplate | None:
+    """Return one template scoped to (workspace, connection), or ``None`` (K6).
+
+    Scoping by workspace **and** connection (not just id) is the isolation guard:
+    a guessed template id from another tenant/connection never resolves.
+    """
+    result = await session.execute(
+        select(FieldMappingTemplate).where(
+            FieldMappingTemplate.id == template_id,
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_default_field_mapping_template(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID
+) -> FieldMappingTemplate | None:
+    """Return the connection's default template, or ``None`` (K6)."""
+    result = await session.execute(
+        select(FieldMappingTemplate).where(
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+            FieldMappingTemplate.is_default.is_(True),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_template_by_name(
+    session: AsyncSession, *, workspace_id: UUID, connection_id: UUID, name: str
+) -> FieldMappingTemplate | None:
+    result = await session.execute(
+        select(FieldMappingTemplate).where(
+            FieldMappingTemplate.workspace_id == workspace_id,
+            FieldMappingTemplate.connection_id == connection_id,
+            FieldMappingTemplate.name == name,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def save_field_mapping_template(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    name: str,
+    target_object: str,
+    field_map: dict[str, object],
+    constants: dict[str, object] | None = None,
+    is_default: bool = False,
+) -> FieldMappingTemplate:
+    """Save the current mapping as a named template for a connection (K6). Caller commits.
+
+    Upserts by ``(connection, name)`` — re-saving the same name replaces its
+    snapshot. When ``is_default`` is requested, any *other* default template for
+    the connection is cleared first so the "at most one default per connection"
+    invariant holds (mirrored by the partial unique index for safety).
+    """
+    if is_default:
+        # Clear any existing default on this connection before flagging this one,
+        # so the partial unique index never trips on the same flush.
+        existing_default = await get_default_field_mapping_template(
+            session, workspace_id=workspace_id, connection_id=connection_id
+        )
+        if existing_default is not None and existing_default.name != name:
+            existing_default.is_default = False
+            await session.flush()
+
+    template = await _get_template_by_name(
+        session, workspace_id=workspace_id, connection_id=connection_id, name=name
+    )
+    if template is None:
+        template = FieldMappingTemplate(
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            name=name,
+            target_object=target_object,
+            field_map=dict(field_map),
+            constants=dict(constants or {}),
+            is_default=is_default,
+        )
+        session.add(template)
+    else:
+        template.target_object = target_object
+        template.field_map = dict(field_map)
+        template.constants = dict(constants or {})
+        template.is_default = is_default
+    await session.flush()
+    return template
+
+
+async def apply_field_mapping_template(
+    session: AsyncSession,
+    *,
+    workspace_id: UUID,
+    connection_id: UUID,
+    template: FieldMappingTemplate,
+) -> FieldMapping:
+    """Apply a template onto the connection's live mapping for its target (K6). Caller commits.
+
+    Copies the template's ``field_map``/``constants`` onto the per-target
+    :class:`FieldMapping` (upserting by ``target_object``) so the next push uses
+    the saved blueprint. Returns the resulting live mapping.
+    """
+    return await upsert_field_mapping(
+        session,
+        workspace_id=workspace_id,
+        connection_id=connection_id,
+        target_object=template.target_object,
+        field_map=dict(template.field_map),
+        constants=dict(template.constants),
+    )
+
+
+async def delete_field_mapping_template(
+    session: AsyncSession, template: FieldMappingTemplate
+) -> None:
+    """Delete a saved template. Caller commits (K6)."""
+    await session.delete(template)
+    await session.flush()
+
+
+# ---------------------------------------------------------------------------
 # Apply a field mapping to a source object → provider payload (K2)
 # ---------------------------------------------------------------------------
 
@@ -978,6 +1141,23 @@ async def push_source(
         connection_id=connection.id,
         target_object=object_name,
     )
+    # K6: if no per-target mapping is configured yet, fall back to the
+    # connection's default template (when it targets this object) so a saved
+    # default auto-applies without the caller first materialising a mapping.
+    if mapping is None and field_map_override is None:
+        default_template = await get_default_field_mapping_template(
+            session,
+            workspace_id=connection.workspace_id,
+            connection_id=connection.id,
+        )
+        if default_template is not None and default_template.target_object == object_name:
+            mapping = FieldMapping(
+                workspace_id=connection.workspace_id,
+                connection_id=connection.id,
+                target_object=object_name,
+                field_map=dict(default_template.field_map),
+                constants=dict(default_template.constants),
+            )
     if field_map_override is not None:
         # An inline override is applied on top of the saved mapping (or alone).
         override = FieldMapping(
