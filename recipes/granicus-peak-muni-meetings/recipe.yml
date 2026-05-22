@@ -1,0 +1,53 @@
+# Platform mega-recipe — Granicus PEAK municipal/agency meetings
+# (doc 16 §14 recipe #2; doc 18 §5 wave 2 #7). ONE recipe pattern covers the
+# 7,000+ government orgs on Granicus PEAK: a contributor clones this directory,
+# swaps `entity` + `connector_config.granicus_peak` (subdomain + view_id, or a
+# full base_url), and reuses the selector chain. Public agendas/minutes; static
+# HTML; scrapable public records (doc 16 §16, Tier 1).
+recipe_id: granicus-peak-muni-meetings
+connector: granicus_peak
+version: 1
+
+entity:
+  name: TEMPLATE — clone per org (set name/state/kind + connector_config)
+  state: WA
+  kind: city
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  granicus_peak:
+    # Per-tenant: set `subdomain` (+ optional `view_id`) or a full base_url.
+    subdomain: template-city
+    view_id: 1
+
+fields:
+  title:
+    selectors:
+      - "h1.meeting-name"
+      - ".meeting-header h1"
+      - "main h1:first-of-type"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-when time"
+      - "span.when time"
+      - "time[datetime]"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".agenda-abstract"
+      - "div.abstract"
+    required: false
+
+signal_types:
+  - board_decision
+  - rfp_posted
+  - budget

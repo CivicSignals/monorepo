@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Expanded Learning Opportunities Program Grant",
+    "agency": "California Department of Education",
+    "funding_amount": "5000000",
+    "due_date": "2025-10-01T17:00:00.000"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "news_mention"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "School board approves $40M bond measure for new facilities",
+    "source_url": "https://example-tribune.com/2025/06/school-bond-measure",
+    "source_domain": "example-tribune.com",
+    "seen_date": "20250612T093000Z"
+  }
+}

@@ -1,0 +1,52 @@
+# Community-college wedge — Foothill-De Anza Community College District bids via
+# IonWave (doc 16 §14 recipes #41-60 community-college procurement pages; doc 15
+# §3 wedge 2). Instantiates the multi-tenant `ionwave` connector (TODO D8) for
+# one CA community-college district's public bid portal. Public listings only
+# (doc 16 §18). Fields read the connector's JSON->HTML <dl> projection.
+recipe_id: foothill-deanza-ccd-bids
+connector: ionwave
+version: 1
+
+entity:
+  entity_id: ipeds:112561
+  name: Foothill-De Anza Community College District
+  state: CA
+  kind: community_college
+
+schedule:
+  cron: "0 9 * * *" # daily
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  ionwave:
+    portal_url: https://fhda.ionwave.net
+    listing_path: /Bids/Public/List
+    items_path: bids
+    page_size: 50
+    max_pages: 10
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='title']"
+    required: true
+  bid_number:
+    selectors:
+      - "dd[data-key='bid_number']"
+    required: false
+  due_date:
+    selectors:
+      - "dd[data-key='close_date']"
+    required: false
+  department:
+    selectors:
+      - "dd[data-key='department']"
+    required: false
+
+signal_types:
+  - rfp_posted

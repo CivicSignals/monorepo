@@ -1,0 +1,54 @@
+# News — GovTech.com SLED news via RSS (doc 16 §14 recipes #116-125 news RSS
+# aggregation; doc 18 §1 cat. B). Instantiates the generic `rss` connector
+# (TODO D6): discover() parses the feed and emits one pointer per item, then the
+# runner fetches each linked article and extracts the fields below from the
+# article page. Public news; static HTML (doc 16 §16, Tier 1).
+recipe_id: govtech-news-rss
+connector: rss
+version: 1
+
+entity:
+  name: GovTech (e.Republic) — government technology news
+  state: CA
+  kind: news_source
+
+schedule:
+  cron: "0 */4 * * *" # every 4 hours
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: classifier
+
+connector_config:
+  rss:
+    feed_url: https://www.govtech.com/rss
+    max_items: 50
+    fetch_item_body: true
+
+# Ordered selectors over each fetched article page (primary -> fallbacks).
+fields:
+  title:
+    selectors:
+      - "h1.article-title"
+      - "article h1"
+      - "main h1:first-of-type"
+    required: true
+  published_date:
+    attr: datetime
+    selectors:
+      - "time.published"
+      - "article time[datetime]"
+      - "time[datetime]"
+    required: false
+  source_url:
+    attr: href
+    selectors:
+      - "link[rel='canonical']"
+      - "a.article-permalink"
+    required: false
+
+signal_types:
+  - news_mention

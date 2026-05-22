@@ -1,0 +1,12 @@
+{
+  "signal_types": [
+    "news_mention"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Washington launches statewide broadband equity grant program",
+    "published_date": "2025-06-09",
+    "source_url": "https://statescoop.com/washington-broadband-equity-grant-2025/"
+  }
+}

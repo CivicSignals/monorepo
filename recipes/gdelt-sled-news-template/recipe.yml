@@ -1,0 +1,50 @@
+# Platform mega-recipe — GDELT 2.0 DOC SLED news mentions (template)
+# (doc 16 §14 recipes #116-125 news; doc 18 §5 wave 3 #15). ONE recipe pattern
+# covers news monitoring for any SLED entity: clone per entity, swap `entity` +
+# `connector_config.gdelt.query` (the entity name / aliases as a GDELT boolean
+# expression), and reuse the field selectors. Free, keyless news-search API;
+# open data; no auth.
+recipe_id: gdelt-sled-news-template
+connector: gdelt
+version: 1
+
+entity:
+  name: TEMPLATE — clone per entity (set name/state/kind + gdelt.query)
+  state: WA
+  kind: school_district
+
+schedule:
+  cron: "0 */6 * * *" # every 6 hours
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  gdelt:
+    query: '"Template School District" sourcecountry:US'
+    timespan: "1d"
+    max_records: 75
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='title']"
+    required: true
+  source_url:
+    selectors:
+      - "dd[data-key='url']"
+    required: true
+  source_domain:
+    selectors:
+      - "dd[data-key='domain']"
+    required: false
+  seen_date:
+    selectors:
+      - "dd[data-key='seendate']"
+    required: false
+
+signal_types:
+  - news_mention

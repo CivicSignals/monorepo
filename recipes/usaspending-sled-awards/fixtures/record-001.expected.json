@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "contract_award",
+    "budget"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "21st Century Community Learning Centers grant award",
+    "vendor": "Example Independent School District",
+    "award_amount": "3200000",
+    "award_date": "2025-03-28"
+  }
+}

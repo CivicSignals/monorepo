@@ -1,0 +1,59 @@
+# Platform mega-recipe — BoardDocs (Diligent) K-12 / community-college boards
+# (doc 16 §14 recipe #1; doc 18 §5 wave 2 #6). ONE recipe pattern covers the
+# ~10,000 K-12 and community-college boards hosted on BoardDocs: a contributor
+# clones this directory, swaps `entity` + `connector_config.boarddocs`
+# (state + subdomain, or a full base_url), and reuses the selector chain
+# verbatim. The selectors below are the platform-wide defaults; per-tenant
+# theming is absorbed by the ordered fallbacks (doc 18 §3.4). Public
+# agendas/minutes; static HTML; scrapable public records (doc 16 §16, Tier 1).
+recipe_id: boarddocs-k12-meetings
+connector: boarddocs
+version: 1
+
+entity:
+  name: TEMPLATE — clone per district (set name/state/kind + connector_config)
+  state: WA
+  kind: k12_district
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+# Public records; honor robots.txt strictly with a polite window (doc 16 §18).
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  boarddocs:
+    # Per-tenant: set `state` + `subdomain` (e.g. wa/spsk12) or a full base_url.
+    state: wa
+    subdomain: template-district
+
+# Platform-wide ordered selectors over a BoardDocs meeting detail page
+# (primary -> fallbacks, doc 18 §3.4). The fallbacks cover the common
+# tenant theme variants so the one pattern works across most boards.
+fields:
+  title:
+    selectors:
+      - "h1.meeting-title"
+      - ".agenda-header h2"
+      - "main h1:first-of-type"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-date time"
+      - "span.date time"
+      - "time[datetime]"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".agenda-summary"
+      - "div.summary"
+    required: false
+
+signal_types:
+  - board_decision
+  - budget
+  - rfp_posted

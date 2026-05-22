@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "rfp_posted",
+    "budget"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "City Council Regular Meeting — June 17, 2025",
+    "meeting_date": "2025-06-17T18:00:00",
+    "agenda_summary": "Council awarded the downtown street resurfacing contract and approved the FY2026 capital budget."
+  }
+}

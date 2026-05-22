@@ -1,0 +1,51 @@
+# County wedge — Miami-Dade County, FL commission meetings via Granicus Legistar
+# (doc 16 §14 recipes #61-100 top TX/FL/IL cities + counties >100k; doc 15 §3
+# wedge 3). Miami-Dade runs its legislative calendar on Legistar (Granicus host
+# family), so this instantiates the `granicus_peak` connector (TODO D7) with a
+# Legistar base_url. Public legislative records; static HTML (doc 16 §16,
+# Tier 1).
+recipe_id: miamidade-fl-legistar
+connector: granicus_peak
+version: 1
+
+entity:
+  entity_id: fips:12086
+  name: Miami-Dade County
+  state: FL
+  kind: county
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+connector_config:
+  granicus_peak:
+    base_url: https://miamidade.legistar.com
+    meeting_path: Calendar.aspx
+
+fields:
+  title:
+    selectors:
+      - "h1.legislation-title"
+      - "#ctl00_ContentPlaceHolder1_lblTitle"
+    required: true
+  meeting_date:
+    attr: datetime
+    selectors:
+      - ".meeting-date time"
+      - "span.date time"
+    required: false
+  agenda_summary:
+    selectors:
+      - ".legislation-summary"
+      - "div.summary"
+    required: false
+
+signal_types:
+  - board_decision
+  - rfp_posted
+  - budget

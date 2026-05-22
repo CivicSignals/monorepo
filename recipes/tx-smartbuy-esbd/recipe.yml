@@ -1,0 +1,45 @@
+# State portal — Texas SmartBuy / Electronic State Business Daily (ESBD)
+# (doc 16 §14 recipe #15-17 "TX SmartBuy"; doc 18 §5 wave 1). Instantiates the
+# generic `http_static` connector (TODO D6) for the ESBD solicitation detail
+# page. Public listings only; static HTML (doc 16 §17.1, §18).
+recipe_id: tx-smartbuy-esbd
+connector: http_static
+version: 1
+
+entity:
+  name: Texas Comptroller of Public Accounts — Statewide Procurement Division
+  state: TX
+  kind: state_agency
+
+schedule:
+  cron: "0 */2 * * *" # every 2 hours
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: assume_relevant
+
+fields:
+  title:
+    selectors:
+      - "h1.solicitation-title"
+      - ".esbd-header h2"
+      - "main h1:first-of-type"
+    required: true
+  due_date:
+    attr: datetime
+    selectors:
+      - ".response-due time"
+      - "td.due-date time"
+    required: false
+  agency:
+    selectors:
+      - ".agency-name"
+      - "td.agency"
+    required: false
+
+signal_types:
+  - rfp_posted
+  - contract_award

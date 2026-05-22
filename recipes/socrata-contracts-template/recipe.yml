@@ -1,0 +1,63 @@
+# Platform mega-recipe — Socrata SODA open-data contracts/awards (template)
+# (doc 16 §14 recipes #11-17 state portals; doc 18 §5 wave 2 #9). ONE recipe
+# pattern covers the hundreds of city/state Socrata portals that publish a
+# contracts/awards dataset: clone per portal, swap `entity` +
+# `connector_config.socrata` (domain + dataset_id), and adapt the column
+# data-keys. Public open-data; app_token optional (lifts the anon rate limit).
+recipe_id: socrata-contracts-template
+connector: socrata
+version: 1
+
+entity:
+  name: TEMPLATE — clone per portal (set name/state/kind + connector_config)
+  state: CA
+  kind: state_agency
+
+schedule:
+  cron: "0 6 * * *" # daily
+
+# Open-data API access is by app token, not robots-gated; politeness still
+# applies between the runner's per-record fetches (local, post-discover).
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+# Pre-vetted open-data feed: skip the Stage-2 relevance classifier (doc 19 §3).
+prefilter: assume_relevant
+
+connector_config:
+  socrata:
+    domain: data.example.gov
+    dataset_id: aaaa-1111
+    order: ":id"
+    page_size: 100
+    max_pages: 20
+
+# The connector projects each SODA row into an HTML <dl>; fields select the
+# column by data-key (doc 18 §3.4 ordered selectors: primary -> fallbacks).
+fields:
+  title:
+    selectors:
+      - "dd[data-key='title']"
+      - "dd[data-key='contract_title']"
+      - "dd[data-key='solicitation_title']"
+    required: true
+  vendor:
+    selectors:
+      - "dd[data-key='vendor']"
+      - "dd[data-key='supplier_name']"
+    required: false
+  award_amount:
+    selectors:
+      - "dd[data-key='award_amount']"
+      - "dd[data-key='contract_amount']"
+    required: false
+  award_date:
+    selectors:
+      - "dd[data-key='award_date']"
+      - "dd[data-key='posted_date']"
+    required: false
+
+signal_types:
+  - contract_award
+  - rfp_posted

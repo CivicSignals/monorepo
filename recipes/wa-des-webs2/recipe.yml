@@ -1,0 +1,46 @@
+# State portal — Washington State WEBS2 procurement (doc 16 §14 recipe #12;
+# doc 18 §5 wave 1). Instantiates the generic `http_static` connector (TODO D6)
+# for the WA Dept. of Enterprise Services solicitation detail page. Public
+# listings only; static HTML; no anti-bot measures (doc 16 §17.1, §18). Sibling
+# of the reference `wa-state-webs` recipe, covering the WEBS2 detail layout.
+recipe_id: wa-des-webs2
+connector: http_static
+version: 1
+
+entity:
+  name: Washington State Department of Enterprise Services
+  state: WA
+  kind: state_agency
+
+schedule:
+  cron: "0 */2 * * *" # every 2 hours
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: assume_relevant
+
+fields:
+  title:
+    selectors:
+      - "h1.solicitation-title"
+      - ".bid-header > h2"
+      - "main h1:first-of-type"
+    required: true
+  due_date:
+    attr: datetime
+    selectors:
+      - ".bid-closing-date time"
+      - "td.due-date time"
+    required: false
+  agency:
+    selectors:
+      - ".issuing-agency"
+      - "td.agency"
+    required: false
+
+signal_types:
+  - rfp_posted
+  - contract_award

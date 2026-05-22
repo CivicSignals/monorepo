@@ -1,0 +1,12 @@
+{
+  "signal_types": [
+    "news_mention"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "State CIOs Prioritize AI Governance in 2025",
+    "published_date": "2025-06-11",
+    "source_url": "https://www.govtech.com/artificial-intelligence/state-cios-prioritize-ai-governance-2025"
+  }
+}

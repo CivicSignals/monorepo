@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Campus Network Infrastructure Upgrade",
+    "bid_number": "B2025-19",
+    "due_date": "2025-08-15T14:00:00",
+    "department": "Facilities & Operations"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "rfp_posted",
+    "contract_award"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "RFP 304-25-0931 — Statewide Student Information System",
+    "due_date": "2025-08-29",
+    "agency": "Texas Education Agency"
+  }
+}

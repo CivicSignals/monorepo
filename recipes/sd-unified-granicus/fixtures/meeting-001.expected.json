@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Board of Education Regular Meeting — June 24, 2025",
+    "meeting_date": "2025-06-24T17:00:00",
+    "agenda_summary": "Board approved the 2025-26 adopted budget and a contract award for school bus electrification."
+  }
+}

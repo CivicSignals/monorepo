@@ -1,0 +1,13 @@
+{
+  "signal_types": [
+    "rfp_posted",
+    "contract_award"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "RFP DGS-2025-0457 — Statewide Cloud Hosting Services",
+    "due_date": "2025-09-18",
+    "agency": "Department of Technology"
+  }
+}

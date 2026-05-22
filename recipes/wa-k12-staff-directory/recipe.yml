@@ -1,0 +1,53 @@
+# Staff directory — WA K-12 district staff directory via http_static
+# (doc 16 §14 recipes #126-170 .gov/.k12.xx.us staff-directory recipes;
+# doc 16 §11, §18). Instantiates the generic `http_static` connector (TODO D6)
+# over a public district staff-directory page. SOURCE POLICY (doc 16 §18): only
+# `.gov` / `.edu` / `.k12.xx.us` staff directories are scraped for contacts —
+# NEVER LinkedIn. Public records; static HTML (doc 16 §16, Tier 1).
+recipe_id: wa-k12-staff-directory
+connector: http_static
+version: 1
+
+entity:
+  entity_id: nces:5307710
+  name: Seattle Public Schools — Staff Directory
+  state: WA
+  kind: k12_district
+
+schedule:
+  cron: "0 3 * * 0" # weekly (directories change slowly)
+
+fetch:
+  respect_robots_txt: true
+  politeness_seconds: 10
+  jitter_seconds: 2
+
+prefilter: assume_relevant
+
+# Each staff-card detail page exposes name / title / department / email.
+fields:
+  name:
+    selectors:
+      - "h1.staff-name"
+      - ".directory-card h2"
+      - "main h1:first-of-type"
+    required: true
+  title:
+    selectors:
+      - ".staff-title"
+      - "span.role"
+    required: false
+  department:
+    selectors:
+      - ".staff-department"
+      - "span.dept"
+    required: false
+  email:
+    attr: href
+    selectors:
+      - "a.staff-email"
+      - "a[href^='mailto:']"
+    required: false
+
+signal_types:
+  - contact

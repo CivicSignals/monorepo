@@ -1,0 +1,53 @@
+# Platform mega-recipe — USAspending.gov federal awards to SLED recipients
+# (doc 16 §14 recipe #8; doc 18 §5 wave 3 #14). ONE recipe pattern covers
+# federal award history flowing to state/local/education recipients: clone per
+# scope, swap `entity` + `connector_config.usaspending.query_params` (recipient,
+# award-type, agency filters), and reuse the field selectors. The free, keyless
+# award-search API; public domain; no auth.
+recipe_id: usaspending-sled-awards
+connector: usaspending
+version: 1
+
+entity:
+  name: TEMPLATE — clone per scope (set name/state/kind + query_params)
+  state: DC
+  kind: federal_agency
+
+schedule:
+  cron: "0 5 * * *" # daily
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  usaspending:
+    base_url: https://api.usaspending.gov
+    endpoint: /api/v2/search/spending_by_award/
+    page_size: 100
+    max_pages: 10
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='description']"
+      - "dd[data-key='award_id']"
+    required: true
+  vendor:
+    selectors:
+      - "dd[data-key='recipient_name']"
+    required: false
+  award_amount:
+    selectors:
+      - "dd[data-key='award_amount']"
+    required: false
+  award_date:
+    selectors:
+      - "dd[data-key='action_date']"
+    required: false
+
+signal_types:
+  - contract_award
+  - budget

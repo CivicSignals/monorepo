@@ -1,0 +1,57 @@
+# Platform mega-recipe — ArcGIS REST capital-projects layer (template)
+# (doc 16 §14 recipes #61-100 cities/counties; doc 18 §5 wave 2 #11). ONE recipe
+# pattern covers the many Esri-hosted FeatureServer layers municipalities
+# publish for capital projects / CIP: clone per layer, swap `entity` +
+# `connector_config.arcgis_rest` (layer_url), and adapt the attribute
+# data-keys. Public open-data; token optional (secured services only).
+recipe_id: arcgis-capital-projects-template
+connector: arcgis_rest
+version: 1
+
+entity:
+  name: TEMPLATE — clone per layer (set name/state/kind + connector_config)
+  state: TX
+  kind: city
+
+schedule:
+  cron: "0 8 * * 1" # weekly (capital-project layers change slowly)
+
+fetch:
+  respect_robots_txt: false
+  politeness_seconds: 0
+
+prefilter: assume_relevant
+
+connector_config:
+  arcgis_rest:
+    layer_url: https://services.arcgis.com/example/arcgis/rest/services/CapitalProjects/FeatureServer/0
+    where: "STATUS <> 'Cancelled'"
+    out_fields: "*"
+    page_size: 100
+    max_pages: 20
+
+fields:
+  title:
+    selectors:
+      - "dd[data-key='PROJECT_NAME']"
+      - "dd[data-key='project_name']"
+      - "dd[data-key='NAME']"
+    required: true
+  budget:
+    selectors:
+      - "dd[data-key='PROJECT_BUDGET']"
+      - "dd[data-key='BUDGET']"
+    required: false
+  status:
+    selectors:
+      - "dd[data-key='STATUS']"
+    required: false
+  department:
+    selectors:
+      - "dd[data-key='DEPARTMENT']"
+      - "dd[data-key='DEPT']"
+    required: false
+
+signal_types:
+  - budget
+  - board_decision

@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Board of Education Regular Meeting — May 2025",
+    "meeting_date": "2025-05-27",
+    "agenda_summary": "Board adopted the proposed 2025-26 budget and approved a contract award for student laptop refresh."
+  }
+}

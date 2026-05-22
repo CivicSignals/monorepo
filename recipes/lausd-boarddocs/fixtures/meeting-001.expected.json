@@ -1,0 +1,14 @@
+{
+  "signal_types": [
+    "board_decision",
+    "budget",
+    "rfp_posted"
+  ],
+  "extraction_method": "primary",
+  "degraded": false,
+  "fields": {
+    "title": "Regular Board of Education Meeting — June 2025",
+    "meeting_date": "2025-06-10",
+    "agenda_summary": "Board approved the final 2025-26 budget and authorized an RFP for districtwide instructional technology."
+  }
+}
