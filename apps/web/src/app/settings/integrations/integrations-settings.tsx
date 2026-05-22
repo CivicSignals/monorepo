@@ -2,14 +2,16 @@
 
 import { useSearchParams } from "next/navigation";
 import { HubspotSettings } from "@/components/integrations/hubspot-settings";
+import { PushRecovery } from "@/components/integrations/push-recovery";
 import { SalesforceSettings } from "@/components/integrations/salesforce-settings";
 import { SlackSettings } from "@/components/integrations/slack-settings";
 import { useActiveWorkspace, useWorkspaces } from "@/hooks/use-workspaces";
 
-// Integrations settings island (K2 + K3 + L1). Renders the Salesforce and
-// HubSpot connection + field-mapping UIs and the Slack notification channel
-// selector for the active workspace. The OAuth callback redirects back here with
-// ?integration=connected|error so we can surface the outcome.
+// Integrations settings island (K2 + K3 + L1 + K5). Renders the Salesforce and
+// HubSpot connection + field-mapping UIs, the Slack notification channel
+// selector, and the push-failure recovery surface for the active workspace. The
+// OAuth callback redirects back here with ?integration=connected|error so we can
+// surface the outcome.
 export function IntegrationsSettings() {
   const { data: workspaces } = useWorkspaces();
   const active = useActiveWorkspace(workspaces);
@@ -48,6 +50,13 @@ export function IntegrationsSettings() {
           Slack
         </h2>
         <SlackSettings workspaceId={active?.id} />
+      </section>
+
+      <section aria-labelledby="recovery-heading">
+        <h2 id="recovery-heading" className="mb-4 text-xl font-semibold">
+          Push failures
+        </h2>
+        <PushRecovery workspaceId={active?.id} />
       </section>
     </div>
   );

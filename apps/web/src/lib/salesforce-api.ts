@@ -81,6 +81,21 @@ export interface PushLogEntry {
   created_at: string;
 }
 
+// K5: a failed push-log row plus its inline diagnosis (human-readable cause +
+// CTA flags) so the recovery UI can branch reconnect-vs-retry without re-deriving
+// the error category client-side.
+export interface PushDiagnosis {
+  code: string;
+  cause: string;
+  recommended_action: string;
+  retryable: boolean;
+  needs_reauth: boolean;
+}
+
+export interface PushFailureEntry extends PushLogEntry {
+  diagnosis: PushDiagnosis | null;
+}
+
 export interface FieldMappingInput {
   target_object: string;
   field_map: Record<string, string>;
@@ -273,6 +288,40 @@ export async function pushSignal(
       token,
       workspaceId,
     },
+  );
+  return body.push_log;
+}
+
+// ---- Push-failure recovery (K5) ----
+
+// List recent failed/dead-letter pushes for the workspace, each with an inline
+// diagnosis. Optionally narrowed to one connection. (RequireMember on the API.)
+export async function listPushFailures(
+  token: string,
+  workspaceId: string,
+  connectionId?: string,
+): Promise<PushFailureEntry[]> {
+  const qs = connectionId
+    ? `?connection_id=${encodeURIComponent(connectionId)}`
+    : "";
+  const body = await request<{ data: PushFailureEntry[] }>(
+    `/integrations/push-log/failures${qs}`,
+    { token, workspaceId },
+  );
+  return body.data;
+}
+
+// Retry a failed push by its push-log id. Routes through the K4 idempotent path
+// server-side, so a retry of a push that already succeeded won't duplicate the
+// CRM object. Resolves with the fresh push-log row recording the new attempt.
+export async function retryPush(
+  token: string,
+  workspaceId: string,
+  pushLogId: string,
+): Promise<PushLogEntry> {
+  const body = await request<{ push_log: PushLogEntry }>(
+    `/integrations/push-log/${pushLogId}/retry`,
+    { method: "POST", token, workspaceId },
   );
   return body.push_log;
 }

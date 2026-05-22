@@ -131,6 +131,61 @@ class PushLogPageOut(BaseModel):
     next_cursor: str | None = None
 
 
+# --- Push-failure recovery (K5) ---------------------------------------------
+
+
+class PushDiagnosisOut(BaseModel):
+    """A human-readable diagnosis of a failed push (K5 recovery UI).
+
+    Derived from the row's scope-aware error code: ``cause`` is the inline
+    explanation, ``recommended_action`` the suggested next step, and the booleans
+    drive the recovery UI's CTA (reconnect vs retry).
+    """
+
+    code: PushErrorCode
+    cause: str
+    recommended_action: str
+    retryable: bool
+    needs_reauth: bool
+
+
+class PushFailureOut(PushLogOut):
+    """A failed push-log row plus its inline diagnosis (K5).
+
+    Extends :class:`PushLogOut` with a derived ``diagnosis`` so the recovery UI
+    can render a human-readable cause + CTA without re-deriving the error
+    branching client-side. ``diagnosis`` is ``None`` only for rows with no typed
+    error (which the failure list never returns, but the type stays optional).
+    """
+
+    diagnosis: PushDiagnosisOut | None = None
+
+    @classmethod
+    def from_orm_log_with_diagnosis(cls, log: PushLog) -> PushFailureOut:
+        # Local import avoids a schemas → services import cycle at module load.
+        from .services import diagnose_push_error
+
+        base = PushLogOut.from_orm_log(log)
+        diag = diagnose_push_error(log.error_code)
+        diagnosis: PushDiagnosisOut | None = None
+        if diag is not None:
+            diagnosis = PushDiagnosisOut(
+                code=diag.code,
+                cause=diag.cause,
+                recommended_action=diag.recommended_action,
+                retryable=diag.retryable,
+                needs_reauth=diag.needs_reauth,
+            )
+        return cls(**base.model_dump(), diagnosis=diagnosis)
+
+
+class PushFailurePageOut(BaseModel):
+    """Cursor-paginated page of failed pushes with inline diagnosis (K5)."""
+
+    data: list[PushFailureOut]
+    next_cursor: str | None = None
+
+
 # --- Object/field discovery (K2 field-mapping UI) ---------------------------
 
 
