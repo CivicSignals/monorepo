@@ -6,6 +6,11 @@
 #   docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
 #   docker compose -f infra/docker-compose.yml --env-file infra/.env run --rm init
 #
+# UPGRADE (see docs/self-host/upgrade.md for full procedure):
+#   docker compose -f infra/docker-compose.yml --env-file infra/.env pull
+#   docker compose -f infra/docker-compose.yml --env-file infra/.env run --rm migrate
+#   docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
+#
 # Images published by .github/workflows/release-images.yml (task O1):
 #   ghcr.io/civicsignals/api:<CIVIC_VERSION>
 #   ghcr.io/civicsignals/web:<CIVIC_VERSION>
@@ -34,6 +39,8 @@ x-api-defaults: &api-defaults
   networks:
     - internal
   depends_on:
+    migrate:
+      condition: service_completed_successfully
     pgbouncer:
       condition: service_healthy
     redis:
@@ -154,6 +161,41 @@ services:
         mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD
         mc mb --ignore-existing local/$$S3_RAW_BUCKET
         echo "minio-init: bucket '$$S3_RAW_BUCKET' is ready"
+
+  # ---------------------------------------------------------------------------
+  # One-shot migrate: runs `alembic upgrade head` against the direct Postgres
+  # connection (DATABASE_DIRECT_URL, port 5432 — bypasses PgBouncer transaction
+  # mode which is incompatible with DDL; see doc 06 §4).
+  #
+  # All long-running app services (api, workers, scheduler) declare
+  # `depends_on: migrate: condition: service_completed_successfully` so they
+  # never start against a schema that is behind the current code revision.
+  #
+  # `alembic upgrade head` is a no-op when the schema is already current, so
+  # this container is safe to run on every `docker compose up` and on upgrades.
+  #
+  # To run migrations explicitly (e.g. during an upgrade before restarting
+  # services):
+  #   docker compose -f infra/docker-compose.yml --env-file infra/.env \
+  #     run --rm migrate
+  # ---------------------------------------------------------------------------
+  migrate:
+    image: ghcr.io/civicsignals/api:${CIVIC_VERSION:-latest}
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    command: ["migrate"]
+    env_file:
+      - .env
+    restart: "no"
+    networks:
+      - internal
+    # Migrations bypass PgBouncer and go straight to Postgres on port 5432
+    # (DATABASE_DIRECT_URL). Only postgres needs to be healthy; pgbouncer and
+    # minio are not required.
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # One-shot init container: Alembic migrations + admin seed.
