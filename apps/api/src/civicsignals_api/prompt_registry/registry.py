@@ -28,9 +28,9 @@ block**::
     You are a classifier ... {cleaned_text} ...
 
 The body is the template; ``{variable}`` placeholders are filled by
-:meth:`PromptRegistry.render`. A ``system:`` key in the frontmatter (or a
-separate ``system`` block) provides the system prompt. Everything is validated
-at load time so malformed prompts fail fast.
+:meth:`PromptRegistry.render`. An optional ``system:`` key in the frontmatter
+provides the system prompt (itself templated). Everything is validated at load
+time so malformed prompts fail fast.
 """
 
 from __future__ import annotations
@@ -70,9 +70,10 @@ class _StrictFormatter(string.Formatter):
     """A ``str.format`` variant that only allows simple named ``{var}`` fields.
 
     Rejects positional fields (``{}``/``{0}``), attribute/index access
-    (``{a.b}``/``{a[0]}``) and conversions/format-specs, so a prompt template
-    can never reach into a passed object or silently drop a value. Missing keys
-    raise (surfaced as :class:`PromptRenderError`).
+    (``{a.b}``/``{a[0]}``), conversions (``{x!r}``) and format specs
+    (``{x:>10}``, ``{x:{width}}``) so a prompt template can never reach into a
+    passed object, pull in undeclared spec variables, or silently reformat a
+    value. Missing keys raise (surfaced as :class:`PromptRenderError`).
     """
 
     def get_field(self, field_name: str, args: Any, kwargs: Any) -> tuple[Any, str]:
@@ -83,6 +84,22 @@ class _StrictFormatter(string.Formatter):
             )
         result: tuple[Any, str] = super().get_field(field_name, args, kwargs)
         return result
+
+    def convert_field(self, value: Any, conversion: str | None) -> Any:
+        if conversion is not None:
+            raise PromptRenderError(
+                f"unsupported conversion {conversion!r}: only simple "
+                "{name} placeholders are allowed (no !r/!s/!a)"
+            )
+        return super().convert_field(value, conversion)
+
+    def format_field(self, value: Any, format_spec: str) -> Any:
+        if format_spec:
+            raise PromptRenderError(
+                f"unsupported format spec {format_spec!r}: only simple "
+                "{name} placeholders are allowed"
+            )
+        return super().format_field(value, format_spec)
 
 
 _FORMATTER = _StrictFormatter()
@@ -157,12 +174,25 @@ def _extract_placeholders(text: str) -> set[str]:
     """
     names: set[str] = set()
     try:
-        for _literal, field_name, _spec, _conv in string.Formatter().parse(text):
+        for _literal, field_name, format_spec, conversion in string.Formatter().parse(text):
             if field_name is None:
                 continue
             if not field_name.isidentifier():
                 raise PromptLoadError(
                     f"unsupported template field {field_name!r}: only simple "
+                    "{name} placeholders are allowed"
+                )
+            # Reject conversions ({x!r}) and format specs ({x:>10}, {x:{w}}) so a
+            # nested spec variable (``w``) can't slip past the declared-variable
+            # check and rendering stays plain substitution.
+            if conversion:
+                raise PromptLoadError(
+                    f"unsupported conversion {field_name}!{conversion}: only simple "
+                    "{name} placeholders are allowed"
+                )
+            if format_spec:
+                raise PromptLoadError(
+                    f"unsupported format spec on {field_name!r}: only simple "
                     "{name} placeholders are allowed"
                 )
             names.add(field_name)
@@ -298,10 +328,10 @@ class PromptRegistry:
             raise PromptNotFoundError(f"no prompt named {name!r}")
         return [p.version for p in sorted(versions.values(), key=lambda p: p.version_number)]
 
-    def get(self, name: str, version: str | None = None) -> Prompt:
+    def get(self, name: str, version: str | int | None = None) -> Prompt:
         """Resolve a prompt by name and version.
 
-        ``version`` accepts ``"v3"`` or ``"3"`` or ``3``. When omitted (or
+        ``version`` accepts ``"v3"``, ``"3"``, or the int ``3``. When omitted (or
         ``"latest"``), the highest version number wins. Unknown name/version
         raises :class:`PromptNotFoundError`.
         """
@@ -319,8 +349,8 @@ class PromptRegistry:
             ) from None
 
     @staticmethod
-    def _normalize_version(name: str, version: str) -> str:
-        text = version.strip()
+    def _normalize_version(name: str, version: str | int) -> str:
+        text = str(version).strip()
         digits = text[1:] if text[:1] in {"v", "V"} else text
         if not digits.isdigit() or int(digits) < 1:
             raise PromptNotFoundError(
@@ -334,7 +364,7 @@ class PromptRegistry:
     def render(
         self,
         name: str,
-        version: str | None = None,
+        version: str | int | None = None,
         variables: dict[str, str] | None = None,
     ) -> Prompt:
         """Resolve a prompt and validate that ``variables`` cover its placeholders.

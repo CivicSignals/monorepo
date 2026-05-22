@@ -200,13 +200,14 @@ class LLMGateway:
         rendered = resolved.render(prompt_vars)
         rendered_system = system if system is not None else resolved.render_system(prompt_vars)
 
-        # The prompt's declared task drives model routing only when the caller
-        # left task at the default and gave no explicit provider/model — an
-        # explicit caller choice always wins (doc 19 §5.1 escalation). Routing
-        # then flows through TaskModelPolicy, so a self-hoster's settings
-        # overrides still govern which provider/model actually runs. The prompt's
-        # ``model_hint`` stays advisory (exposed on the Prompt) and never bypasses
-        # the policy — applying it here would override a self-host Ollama config.
+        # Adopt the prompt's declared task only when the caller left ``task`` at
+        # its default — an explicit ``task=`` from the caller always wins. Task
+        # then routes through TaskModelPolicy, so a self-hoster's settings
+        # overrides still govern which provider/model actually runs; an explicit
+        # ``provider``/``model`` (doc 19 §5.1 escalation) overrides that model
+        # independently of the task. The prompt's ``model_hint`` stays advisory
+        # (exposed on the Prompt) and never bypasses the policy — applying it here
+        # would override a self-host Ollama config.
         if task == TASK_CLASSIFY and resolved.task is not None:
             task = resolved.task
 

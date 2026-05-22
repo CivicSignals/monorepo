@@ -108,6 +108,20 @@ def test_positional_field_rejected_at_load(tmp_path: Path) -> None:
         PromptRegistry(tmp_path)
 
 
+def test_conversion_field_rejected_at_load(tmp_path: Path) -> None:
+    # {x!r} is a conversion — rejected so rendering stays plain substitution.
+    _write(tmp_path, "bad/v1.md", _prompt(body="convert {x!r}"))
+    with pytest.raises(PromptLoadError, match="conversion"):
+        PromptRegistry(tmp_path)
+
+
+def test_format_spec_rejected_at_load(tmp_path: Path) -> None:
+    # A nested format-spec variable ({x:{w}}) would otherwise smuggle in `w`.
+    _write(tmp_path, "bad/v1.md", _prompt(body="spec {x:{w}}"))
+    with pytest.raises(PromptLoadError, match="format spec"):
+        PromptRegistry(tmp_path)
+
+
 def test_file_outside_name_dir_fails(tmp_path: Path) -> None:
     # A v<N>.md sitting directly in the prompts root has no name.
     _write(tmp_path, "v1.md", _prompt())
@@ -141,6 +155,8 @@ def test_get_accepts_various_version_spellings(tmp_path: Path) -> None:
     reg = PromptRegistry(tmp_path)
     assert reg.get("p", "v3").version == "v3"
     assert reg.get("p", "3").version == "v3"
+    # An int version is accepted too (matches the documented contract).
+    assert reg.get("p", 3).version == "v3"
 
 
 def test_unknown_name_raises(tmp_path: Path) -> None:
