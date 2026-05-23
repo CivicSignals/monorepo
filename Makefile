@@ -3,6 +3,10 @@
 
 COMPOSE := docker compose -f infra/docker-compose.dev.yml --env-file .env
 
+# Full-stack e2e overlay: dev stack + LLM_BACKEND=fake + a `seed-e2e` one-shot
+# (no vendor key, deterministic fixture gateway). Used by `make e2e-stack`.
+COMPOSE_E2E := docker compose -f infra/docker-compose.dev.yml -f infra/docker-compose.e2e.yml --env-file .env
+
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -43,6 +47,28 @@ migrate: env ## Apply Alembic migrations (one-shot container; `make dev` already
 .PHONY: seed
 seed: env ## Seed a demo workspace with synthetic signals (idempotent; TODO A2)
 	$(COMPOSE) run --rm api seed
+
+.PHONY: seed-e2e
+seed-e2e: env ## Migrate, then seed the deterministic e2e routing scenarios (real pipeline, fake LLM; QA-C)
+	$(COMPOSE_E2E) run --rm migrate
+	$(COMPOSE_E2E) run --rm seed-e2e
+
+.PHONY: e2e-stack
+e2e-stack: env ## Bring up the stack (LLM_BACKEND=fake), seed e2e scenarios, run the @fullstack Playwright specs (QA-C)
+	# Local convenience target for the full-stack feed e2e. Brings up the dev
+	# stack with the fake LLM backend (no vendor key), seeds the deterministic
+	# routing scenarios, then runs the externally-started @fullstack project.
+	#
+	# Needs: docker compose (stack), Node 22 + pnpm 9 with `pnpm install` done,
+	# and Playwright's Chromium installed (`pnpm --filter @civicsignals/web exec
+	# playwright install chromium`). The web service publishes :3000 and the API
+	# :8000 — PLAYWRIGHT_BASE_URL points at the running web app and
+	# PLAYWRIGHT_NO_WEBSERVER stops Playwright from booting its own `next dev`.
+	# Best-effort/local: the canonical run is .github/workflows/e2e-full-stack.yml.
+	$(COMPOSE_E2E) up --build -d
+	$(COMPOSE_E2E) run --rm seed-e2e
+	PLAYWRIGHT_NO_WEBSERVER=1 PLAYWRIGHT_BASE_URL=http://localhost:3000 \
+		pnpm --filter @civicsignals/web run e2e:fullstack
 
 .PHONY: lint
 lint: ## Lint everything via Turborepo

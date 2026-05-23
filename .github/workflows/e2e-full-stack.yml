@@ -1,0 +1,220 @@
+# QA-C — Full-stack feed e2e (Playwright @fullstack project).
+#
+# Runs the REAL api + web (no vendor keys, fake LLM backend) against a seeded
+# database and exercises the per-workspace signal-routing invariant
+# (apps/web/e2e/feed-routing.spec.ts → apps/api/tests/e2e_fixtures/scenarios.yaml).
+#
+# Lightweight, no docker image builds (mirrors the test + e2e-smoke jobs in
+# ci.yml): Postgres+pgvector and Redis come from service containers; the API is
+# uvicorn started in the background, the web app is `next start` with
+# NEXT_PUBLIC_API_BASE_URL pointing at that API. The deterministic fixture LLM
+# gateway (LLM_BACKEND=fake) means no API key is needed and the seed/pipeline
+# are reproducible. The seed uses an in-memory content store, so NO S3/MinIO.
+#
+# NON-BLOCKING: continue-on-error: true — like e2e-smoke this is a heavier job
+# (web build + browser install + a real backend) and is meant to stabilise
+# before becoming a required check. Real PR gating stays on the unit/contract
+# jobs; the nightly schedule + on-demand dispatch give the integration view.
+#
+# Triggers: nightly schedule, manual dispatch, and PRs that touch the pipeline
+# modules / seeder / fixtures / feed+signals UI / e2e specs (path-filtered).
+name: E2E full-stack
+
+on:
+  schedule:
+    # 03:00 UTC daily (after the e2e-nightly full suite at 02:00).
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/api/src/civicsignals_api/modules/ingestion/**"
+      - "apps/api/src/civicsignals_api/modules/recipes/**"
+      - "apps/api/src/civicsignals_api/modules/extraction/**"
+      - "apps/api/src/civicsignals_api/modules/signals/**"
+      - "apps/api/src/civicsignals_api/modules/icp/**"
+      - "apps/api/src/civicsignals_api/scripts/seed_e2e.py"
+      - "apps/api/tests/e2e_fixtures/**"
+      - "apps/web/src/app/feed/**"
+      - "apps/web/src/app/signals/**"
+      - "apps/web/e2e/**"
+      - ".github/workflows/e2e-full-stack.yml"
+
+# Cancel superseded runs for the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: e2e-full-stack-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TURBO_TELEMETRY_DISABLED: "1"
+  DO_NOT_TRACK: "1"
+
+jobs:
+  e2e-full-stack:
+    name: E2E full-stack (Chromium)
+    runs-on: ubuntu-latest
+    # NON-BLOCKING while it stabilises (matches e2e-smoke). Do NOT make this a
+    # required check until the job completes consistently.
+    continue-on-error: true
+    timeout-minutes: 30
+
+    services:
+      # Postgres + pgvector — the API connects directly (no PgBouncer in CI),
+      # same as the unit `test` job in ci.yml.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: civic
+          POSTGRES_PASSWORD: civic
+          POSTGRES_DB: civicsignals_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U civic"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      # Redis — Celery broker/result backend. The seed runs inline (no Celery),
+      # but the API imports the broker config at startup, so keep it available.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      # NB: no MinIO/S3 — seed_e2e uses an in-memory content store and the feed
+      # specs read signals via the API, so object storage is never touched.
+
+    env:
+      # API connects directly to the service Postgres (no PgBouncer in CI).
+      DATABASE_URL: postgresql+asyncpg://civic:civic@localhost:5432/civicsignals_e2e
+      DATABASE_DIRECT_URL: postgresql+asyncpg://civic:civic@localhost:5432/civicsignals_e2e
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      # No vendor key needed: the fixture-backed gateway scripts every LLM call.
+      LLM_BACKEND: fake
+      ENVIRONMENT: development
+      # Build-time-inlined: the web client reads this at `next build`, so it must
+      # be set before the build step (NEXT_PUBLIC_* is baked into the bundle).
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node + pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Set up uv (Python)
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      - name: Install API deps
+        working-directory: apps/api
+        run: uv sync --frozen
+
+      # Bring the schema to head against the direct Postgres URL (alembic/env.py
+      # uses DATABASE_DIRECT_URL, falling back to DATABASE_URL).
+      - name: Apply migrations
+        working-directory: apps/api
+        run: uv run alembic upgrade head
+
+      # Start the API (uvicorn) in the background and wait for /healthz. The
+      # fixture LLM gateway means no API key is required.
+      - name: Start API
+        working-directory: apps/api
+        run: |
+          uv run uvicorn civicsignals_api.main:app --host 0.0.0.0 --port 8000 \
+            > "${RUNNER_TEMP}/api.log" 2>&1 &
+          echo "API_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/healthz >/dev/null 2>&1; then
+              echo "api healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::API did not become healthy in time" >&2
+          cat "${RUNNER_TEMP}/api.log" || true
+          exit 1
+
+      # Seed the deterministic routing scenarios via the REAL extraction pipeline
+      # (no network, no Celery, in-memory storage). Idempotent.
+      - name: Seed e2e scenarios
+        working-directory: apps/api
+        run: uv run python -m civicsignals_api.scripts.seed_e2e
+
+      # Build the production web bundle. NEXT_PUBLIC_API_BASE_URL (set above) is
+      # inlined here so the client talks to the local API.
+      - name: Build web app
+        run: pnpm --filter @civicsignals/web build
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            playwright-chromium-${{ runner.os }}-
+
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Start the web app (`next start` serves the production bundle and its
+      # static assets without the standalone static-copy step) in the background
+      # and wait for it to answer.
+      - name: Start web app
+        run: |
+          pnpm --filter @civicsignals/web start \
+            > "${RUNNER_TEMP}/web.log" 2>&1 &
+          echo "WEB_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3000 >/dev/null 2>&1; then
+              echo "web up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::web app did not come up in time" >&2
+          cat "${RUNNER_TEMP}/web.log" || true
+          exit 1
+
+      # Run the @fullstack project against the externally-started, seeded stack.
+      # PLAYWRIGHT_NO_WEBSERVER disables the config's auto-start `next dev`;
+      # PLAYWRIGHT_BASE_URL points Playwright at the running web app.
+      - name: Run full-stack Playwright specs
+        working-directory: apps/web
+        env:
+          CI: "true"
+          PLAYWRIGHT_NO_WEBSERVER: "1"
+          PLAYWRIGHT_BASE_URL: http://localhost:3000
+        run: pnpm exec playwright test --project=full-stack
+
+      # Stop the background servers (best-effort) so the runner tears down cleanly.
+      - name: Stop background servers
+        if: always()
+        run: |
+          [ -n "${WEB_PID:-}" ] && kill "${WEB_PID}" 2>/dev/null || true
+          [ -n "${API_PID:-}" ] && kill "${API_PID}" 2>/dev/null || true
+
+      # Upload traces/screenshots + the captured server logs on failure for
+      # post-mortem from the GH Actions run page.
+      - name: Upload Playwright report + server logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-fullstack-report-${{ github.run_id }}
+          path: |
+            apps/web/playwright-report/
+            ${{ runner.temp }}/api.log
+            ${{ runner.temp }}/web.log
+          retention-days: 14
