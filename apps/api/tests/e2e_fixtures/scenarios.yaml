@@ -78,7 +78,7 @@ scenarios:
 # The two e2e users. Stable emails make the seeder idempotent (get-or-create).
 users:
   - key: alice
-    email: alice.e2e@civicsignals.test
+    email: alice.e2e@example.com
     name: "Alice (TX RFP hunter)"
     password: "e2e-password-alice"
     workspace_name: "Alice TX Workspace"
@@ -95,7 +95,7 @@ users:
     expects_scenarios: ["tx_school_rfp"]
 
   - key: bob
-    email: bob.e2e@civicsignals.test
+    email: bob.e2e@example.com
     name: "Bob (CA news watcher)"
     password: "e2e-password-bob"
     workspace_name: "Bob CA Workspace"

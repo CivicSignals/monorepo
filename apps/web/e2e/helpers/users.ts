@@ -33,7 +33,7 @@ export interface SeededUser {
 // Alice → TX / school_district / rfp_posted. Sees the TX school RFP.
 export const ALICE: SeededUser = {
   key: "alice",
-  email: "alice.e2e@civicsignals.test",
+  email: "alice.e2e@example.com",
   password: "e2e-password-alice",
   workspaceName: "Alice TX Workspace",
   // tx_school_rfp/expected-signal.json `title`.
@@ -44,7 +44,7 @@ export const ALICE: SeededUser = {
 // Bob → CA / news_mention. Sees the CA county news.
 export const BOB: SeededUser = {
   key: "bob",
-  email: "bob.e2e@civicsignals.test",
+  email: "bob.e2e@example.com",
   password: "e2e-password-bob",
   workspaceName: "Bob CA Workspace",
   // ca_county_news/expected-signal.json `title`.

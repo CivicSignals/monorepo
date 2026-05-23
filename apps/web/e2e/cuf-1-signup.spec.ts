@@ -23,7 +23,7 @@ import { test, expect } from "@playwright/test";
 function freshSignup() {
   const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
   return {
-    email: `cuf1+${stamp}@civicsignals.test`,
+    email: `cuf1+${stamp}@example.com`,
     password: "Sup3rSecret-cuf1!",
     name: "CUF-1 New User",
     workspaceName: `CUF-1 Org ${stamp}`,
