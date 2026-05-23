@@ -249,11 +249,17 @@ class _FreeRunLockClient:
 
 
 def _record_crawl(ran: list[str], records: list[str]) -> object:
-    """A stub ``crawl_recipe_with_connector`` that records the call + returns records."""
+    """A stub for the raw-doc-collecting crawl seam that records the call.
 
-    def _crawl(recipe_id: str, seed_urls: object) -> list[str]:
+    Returns ``(records, [])`` — no raw docs — so the task's persistence branch
+    (``store_crawled_raw_documents``) is skipped, keeping this a broker-free unit
+    test of the run-lock + record-count behaviour (D4 raw-doc storage is exercised
+    end-to-end in ``extraction/tests/test_pipeline_chain_e2e.py``).
+    """
+
+    def _crawl(recipe_id: str, seed_urls: object) -> tuple[list[str], list[object]]:
         ran.append(recipe_id)
-        return records
+        return records, []
 
     return _crawl
 
@@ -262,7 +268,8 @@ def test_crawl_recipe_skips_when_run_lock_held(monkeypatch: pytest.MonkeyPatch) 
     ran: list[str] = []
     monkeypatch.setattr(locks_module, "get_redis_client", lambda: _HeldRunLockClient())
     monkeypatch.setattr(
-        "civicsignals_api.modules.ingestion.services.crawl_recipe_with_connector",
+        "civicsignals_api.modules.ingestion.services."
+        "crawl_recipe_with_connector_collecting_raw_documents",
         _record_crawl(ran, []),
     )
     # Lock held -> the crawl body must not run; returns 0.
@@ -274,7 +281,8 @@ def test_crawl_recipe_runs_when_run_lock_free(monkeypatch: pytest.MonkeyPatch) -
     ran: list[str] = []
     monkeypatch.setattr(locks_module, "get_redis_client", lambda: _FreeRunLockClient())
     monkeypatch.setattr(
-        "civicsignals_api.modules.ingestion.services.crawl_recipe_with_connector",
+        "civicsignals_api.modules.ingestion.services."
+        "crawl_recipe_with_connector_collecting_raw_documents",
         _record_crawl(ran, ["rec-1", "rec-2"]),
     )
     # Lock free -> the crawl runs and returns the record count.

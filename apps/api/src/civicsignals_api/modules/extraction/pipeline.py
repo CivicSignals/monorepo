@@ -112,13 +112,16 @@ class PipelineResult:
     ``relevant`` is the gate verdict; ``candidates`` are the stored records (empty
     when the doc was dropped at the gate or no signal was found). ``skipped`` is
     True when the relevance gate dropped the document (a *success*, not a failure —
-    doc 19 §3.2).
+    doc 19 §3.2). ``signal_ids`` are the ids of the ``signals_signal`` rows the
+    promoted candidates landed in (deduped, first-seen order) — the F3 scoring
+    trigger reads these to enqueue per-signal scoring after the job commits.
     """
 
     raw_document_id: uuid.UUID
     relevant: bool
     skipped: bool
     candidates: list[CandidateRecord]
+    signal_ids: list[uuid.UUID]
 
 
 # ---------------------------------------------------------------------------
@@ -991,6 +994,7 @@ async def run_extraction_pipeline(
             relevant=verdict.relevant,
             skipped=True,
             candidates=[],
+            signal_ids=[],
         )
 
     raw_candidates = await extract_candidates(
@@ -1025,4 +1029,5 @@ async def run_extraction_pipeline(
         relevant=True,
         skipped=False,
         candidates=survivors,
+        signal_ids=signal_ids,
     )

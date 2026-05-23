@@ -129,12 +129,39 @@ async def _process_document_async(
         await services.mark_job_done(session, job_id, stage=STAGE_STORE, skipped=result.skipped)
         await session.commit()
 
+    # F3 scoring trigger (doc 14 §4.1, §6): the candidates committed above produced
+    # global ``signals_signal`` rows but nothing has scored them per workspace yet.
+    # The in-process ``signal.created`` event bus has no subscriber in this
+    # ``worker_extract`` process (only the FastAPI app factory registers the scoring
+    # listener), so we enqueue ``signals.score_signal`` per new signal onto the
+    # ``score`` queue — the fan-out runs in ``worker_score`` (doc 18 §6.2). Enqueue
+    # *after commit* so the signal row is visible when the score task reads it; the
+    # score task's upsert is idempotent on re-delivery. This is the sole trigger —
+    # we do not also publish ``signal.created`` here, so each signal is scored once.
+    _enqueue_scoring(result.signal_ids)
+
     return {
         "job_id": str(job_id),
         "skipped": result.skipped,
         "relevant": result.relevant,
         "candidates": len(result.candidates),
+        "signals_scored": len(result.signal_ids),
     }
+
+
+def _enqueue_scoring(signal_ids: list[uuid.UUID]) -> None:
+    """Enqueue one ``signals.score_signal`` task per newly-promoted signal (F3).
+
+    Lazy import of the signals task so the extraction tasks module stays importable
+    without pulling the signals task graph at import time, and so the cross-module
+    dependency is a Celery enqueue (the ``score`` queue) rather than a direct call.
+    """
+    if not signal_ids:
+        return
+    from civicsignals_api.modules.signals.tasks import score_signal
+
+    for signal_id in signal_ids:
+        score_signal.delay(str(signal_id))
 
 
 async def _dead_letter_async(job_id: uuid.UUID, *, error: str) -> None:

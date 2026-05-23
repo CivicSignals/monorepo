@@ -37,6 +37,9 @@ from civicsignals_api.modules.recipes.services import (
     RunOutcome,
     load_recipe,
 )
+from civicsignals_api.modules.recipes.services import (
+    RawDocument as RecipeRawDocument,
+)
 
 from . import storage as storage_module
 from .connectors import connector_for
@@ -97,6 +100,77 @@ def crawl_recipe_with_connector(
         close = getattr(fetcher, "close", None)
         if callable(close):
             close()
+
+
+def crawl_recipe_with_connector_collecting_raw_documents(
+    recipe_id: str,
+    seed_urls: Sequence[str],
+    *,
+    clock: Clock | None = None,
+    llm_extractor: LLMFieldExtractor | None = None,
+    fetcher: Fetcher | None = None,
+) -> tuple[list[CanonicalRecord], list[RecipeRawDocument]]:
+    """Crawl like :func:`crawl_recipe_with_connector` but also return fetched raw docs.
+
+    The records-and-raw-docs variant the crawl Celery task (D4) uses so it can
+    persist each fetched document via :func:`store_raw_document` (D3) — closing the
+    gap where the crawl loop discarded the fetched bytes and the extraction beat task
+    therefore found nothing (doc 18 §2.2, §3.6). It runs the connector's source-type
+    ``discover`` and drives ``fetch -> extract -> normalize`` through the runner's
+    raw-doc-collecting path, so robots.txt + politeness + version pinning + the
+    extract fallback chain still apply uniformly. This stays a *pure*, DB-free
+    function (no S3, no session): the task layer owns persistence, mirroring how the
+    runner never touches the database. ``fetcher`` overrides the connector's built
+    fetcher — a test seam to inject a static in-memory fetcher (no network); when
+    ``None`` the connector builds (and we close) its own.
+    """
+    recipe = load_recipe(recipe_id)
+    connector = connector_for(recipe, clock=clock)
+    own_fetcher = fetcher is None
+    active_fetcher = connector.build_fetcher() if fetcher is None else fetcher
+    try:
+        pointers = connector.discover(seed_urls)
+        return recipes_services.run_pointers_collecting_raw_documents(
+            recipe, active_fetcher, pointers, clock=clock, llm_extractor=llm_extractor
+        )
+    finally:
+        if own_fetcher:
+            close = getattr(active_fetcher, "close", None)
+            if callable(close):
+                close()
+
+
+async def store_crawled_raw_documents(
+    session: AsyncSession,
+    storage: RawDocumentStorage,
+    raw_docs: Sequence[RecipeRawDocument],
+) -> list[StoredRawDocument]:
+    """Persist a crawl run's fetched raw documents (D3/D4; doc 18 §2.2, §3.6).
+
+    The crawl loop's missing persistence step: each :class:`RawDocument` the runner
+    fetched is written through :func:`store_raw_document` (content-addressed S3 key +
+    idempotent ``ingestion_raw_document`` row, deduped on ``(recipe_id, content_hash)``)
+    so the extraction beat task (E1) discovers it via :func:`list_raw_document_refs`.
+    The runner carries ``content`` as decoded text; we re-encode it to UTF-8 bytes for
+    the byte-addressed store. The caller owns the transaction (this does not commit).
+    Returns the stored rows (``deduped`` flag set per document).
+    """
+    stored: list[StoredRawDocument] = []
+    for raw in raw_docs:
+        stored.append(
+            await store_raw_document(
+                session,
+                storage,
+                content=raw.content.encode("utf-8"),
+                recipe_id=raw.recipe_id,
+                connector=raw.connector,
+                source_url=raw.url,
+                recipe_version=raw.recipe_version,
+                content_type=raw.headers.get("content-type", "text/html; charset=utf-8"),
+                http_status=raw.status_code,
+            )
+        )
+    return stored
 
 
 async def crawl_recipe_recording_drift(
@@ -440,11 +514,13 @@ __all__ = [
     "crawl_recipe",
     "crawl_recipe_recording_drift",
     "crawl_recipe_with_connector",
+    "crawl_recipe_with_connector_collecting_raw_documents",
     "get_or_create_recipe_schedule",
     "get_raw_document",
     "list_raw_document_refs",
     "list_recipe_schedules",
     "mark_recipe_dispatched",
     "set_recipe_paused",
+    "store_crawled_raw_documents",
     "store_raw_document",
 ]

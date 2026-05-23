@@ -34,22 +34,57 @@ def crawl_recipe(recipe_id: str, recipe_version: int | None = None) -> int:
     was scheduled against, doc 18 §3.5); the runner re-reads the on-disk version.
 
     Connector selection + the full lifecycle live in
-    ``services.crawl_recipe_with_connector`` (D6); seed URLs are connector-derived
-    (most connectors read them from ``connector_config`` — doc 18 §2.1), so the
-    scheduler doesn't pass any. Returns the number of canonical records produced
-    (0 when the run lock was already held). Raw-document persistence + crawl-run
-    bookkeeping layer on top in the storage seam (D3).
+    ``services.crawl_recipe_with_connector_collecting_raw_documents`` (D6); seed URLs
+    are connector-derived (most connectors read them from ``connector_config`` —
+    doc 18 §2.1), so the scheduler doesn't pass any. Returns the number of canonical
+    records produced (0 when the run lock was already held).
+
+    **Raw-document persistence (D3/D4):** the crawl previously discarded the fetched
+    bytes, so ``ingestion_raw_document`` was never populated and the extraction beat
+    task (``extraction.run_pending_documents``) found nothing to process. We now run
+    the runner's raw-doc-collecting path and persist each fetched document via
+    :func:`services.store_crawled_raw_documents` (content-addressed S3 + idempotent
+    row) inside an async session — the snapshots the extraction funnel discovers and
+    replays against (doc 18 §2.2, §3.6).
     """
     from .locks import get_redis_client, recipe_run_lock
-    from .services import crawl_recipe_with_connector
 
     with recipe_run_lock(get_redis_client(), recipe_id) as acquired:
         if not acquired:
             # A prior run is still in flight; skip rather than crawl concurrently.
             log.info("ingestion.crawl_recipe.skip_locked", recipe_id=recipe_id)
             return 0
-        records = crawl_recipe_with_connector(recipe_id, seed_urls=[])
-        return len(records)
+        return asyncio.run(_crawl_recipe_async(recipe_id))
+
+
+async def _crawl_recipe_async(recipe_id: str) -> int:
+    """Crawl one recipe and persist its fetched raw documents (D4 body).
+
+    Extracted so the crawl + raw-doc persistence is directly testable without a real
+    Celery broker. Runs the connector lifecycle collecting the fetched
+    :class:`RawDocument`s (a pure, DB-free call), then stores them through the D3
+    content-addressable storage in one transaction. Returns the canonical-record count.
+    """
+    from civicsignals_api.db import SessionLocal
+
+    from . import services
+    from .storage import RawDocumentStorage
+
+    records, raw_docs = services.crawl_recipe_with_connector_collecting_raw_documents(
+        recipe_id, seed_urls=[]
+    )
+    if raw_docs:
+        storage = RawDocumentStorage.from_settings()
+        async with SessionLocal() as session:
+            stored = await services.store_crawled_raw_documents(session, storage, raw_docs)
+            await session.commit()
+        log.info(
+            "ingestion.crawl_recipe.stored_raw_documents",
+            recipe_id=recipe_id,
+            fetched=len(raw_docs),
+            stored=len(stored),
+        )
+    return len(records)
 
 
 @celery_app.task(name="ingestion.dispatch_due_recipes")

@@ -839,6 +839,28 @@ class RecipeRunner:
             records.extend(self.normalize(extracted, pointer.url))
         return records, extractions
 
+    def run_pointers_collecting_raw_documents(
+        self, pointers: Sequence[SourcePointer]
+    ) -> tuple[list[CanonicalRecord], list[RawDocument]]:
+        """Like :meth:`run_pointers` but also returns each fetched :class:`RawDocument`.
+
+        Additive sibling of :meth:`run_pointers` (it does *not* change the lifecycle
+        or any fetch/extract/normalize behavior): it threads the raw bytes produced by
+        the ``fetch`` step out to the caller so the ingestion crawl path can persist
+        each document via ``ingestion.services.store_raw_document`` (doc 18 §2.2, §3.6;
+        D3/D4) — the raw snapshot the extraction beat task then discovers and replays
+        against. Only this method retains the raw docs; :meth:`run_pointers` stays
+        records-only so its existing callers keep their memory profile.
+        """
+        records: list[CanonicalRecord] = []
+        raw_docs: list[RawDocument] = []
+        for pointer in pointers:
+            raw = self.fetch(pointer)
+            raw_docs.append(raw)
+            extracted = self.extract(raw)
+            records.extend(self.normalize(extracted, pointer.url))
+        return records, raw_docs
+
     def extract_html(self, html: str, source_url: str = "fixture://local") -> ExtractedDocument:
         """Extract straight from an HTML string (used by golden-fixture replay).
 

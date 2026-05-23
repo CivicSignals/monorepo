@@ -37,6 +37,45 @@ def dedupe_recent() -> None:
     """
 
 
+@celery_app.task(name="signals.score_signal")
+def score_signal(signal_id: str) -> int:
+    """Fan a newly-created signal out to every matching workspace (F3, doc 14 §6).
+
+    The production scoring trigger for the live matcher path (doc 14 §4.1). The
+    extraction store step (E1/E4) promotes candidates into ``signals_signal`` rows in
+    the ``worker_extract`` process; that process does **not** run the FastAPI app
+    factory, so the in-process ``signal.created`` event bus has no subscriber there.
+    Instead of publishing the event, the extraction task enqueues *this* task per
+    newly-promoted signal so the fan-out runs in ``worker_score`` (the ``signals.*``
+    prefix routes here, ``celery_app`` task routing), where scoring belongs (doc 18
+    §6.2 per-queue separation). This is the **single** scoring trigger for new
+    signals — we deliberately do not also publish ``signal.created`` from the worker,
+    so a signal is scored exactly once per creation (no double-scoring).
+
+    Idempotent: ``score_signal_for_all_workspaces`` sparse-upserts each
+    ``signals_workspace_score`` row (ON CONFLICT, doc 14 §6.2/§7.3), so a Celery
+    re-delivery re-scores to the same rows. Returns the number of score rows written.
+    """
+    return asyncio.run(_score_signal_async(signal_id))
+
+
+async def _score_signal_async(signal_id_str: str) -> int:
+    """Async body of :func:`score_signal` (testable without a Celery broker)."""
+    from . import services
+
+    try:
+        sig_id = uuid.UUID(signal_id_str)
+    except (ValueError, AttributeError):
+        log.warning("signals.score_signal.bad_signal_id", signal_id=signal_id_str)
+        return 0
+
+    async with SessionLocal() as session:
+        written = await services.score_signal_for_all_workspaces(session, signal_id=sig_id)
+        await session.commit()
+    log.info("signals.score_signal.done", signal_id=signal_id_str, written=written)
+    return written
+
+
 @celery_app.task(name="signals.rescore_workspace")
 def rescore_workspace(workspace_id: str) -> int:
     """Re-score a workspace's historical signal window after an ICP change (F6).
