@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -216,6 +216,39 @@ class Settings(BaseSettings):
     embedding_dim: int = 1536
 
     api_v1_prefix: str = Field(default="/api/v1")
+
+    # --- CORS (browser → API) ------------------------------------------------
+    # The web app issues *client-side* fetches from the browser to the API on a
+    # different origin (web on :3000, api on :8000), so the browser enforces CORS:
+    # without an ``Access-Control-Allow-Origin`` matching the page origin, every
+    # authed request (incl. login) is blocked. There is no Next rewrite/proxy, so
+    # the API must answer CORS itself. ``main.py`` wires ``CORSMiddleware`` with
+    # these origins, ``allow_credentials=True``, and all methods/headers (so the
+    # ``Authorization`` + ``X-Workspace-Id`` scoping headers are accepted on
+    # preflight). Defaults to the local dev web origin; override in
+    # staging/production via ``CORS_ALLOW_ORIGINS`` (comma-separated or a JSON
+    # array). An empty value disables cross-origin requests entirely.
+    cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+
+    @field_validator("cors_allow_origins", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, value: object) -> object:
+        """Accept either a JSON array or a comma-separated string for CORS origins.
+
+        Pydantic-settings parses ``list`` env vars as JSON by default, which makes a
+        plain comma-separated value (the most natural thing to put in a ``.env`` /
+        compose env) a parse error. Coerce a non-JSON string into a list here so both
+        ``CORS_ALLOW_ORIGINS=http://a,http://b`` and ``["http://a","http://b"]`` work.
+        """
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                # Leave a JSON array for pydantic's own JSON decoding.
+                return value
+            return [origin.strip() for origin in stripped.split(",") if origin.strip()]
+        return value
 
     # ---------------------------------------------------------------------------
     # Outbound integrations framework (K1).  The generic OAuth2 + push-log seam

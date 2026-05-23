@@ -138,6 +138,16 @@ async def session() -> AsyncIterator[AsyncSession]:
         async with engine.begin() as conn:
             await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
             await conn.execute(text("CREATE SCHEMA public"))
+            # Recreate the extensions the root conftest (``_ensure_pg_extensions``)
+            # installs once per session. ``DROP SCHEMA public CASCADE`` also drops
+            # any extension owned by the schema, so without this teardown leaves the
+            # DB with no ``vector`` / ``citext`` / ``pg_trgm`` types — breaking every
+            # downstream suite that ``create_all``s an unfiltered ``Base.metadata``
+            # in the same CI process (e.g. the icp suite's "type vector does not
+            # exist" errors).
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS citext"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await engine.dispose()
 
 

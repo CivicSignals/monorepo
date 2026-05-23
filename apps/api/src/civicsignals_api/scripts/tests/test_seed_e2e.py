@@ -64,6 +64,13 @@ async def session() -> AsyncIterator[AsyncSession]:
         async with engine.begin() as conn:
             await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
             await conn.execute(text("CREATE SCHEMA public"))
+            # ``DROP SCHEMA public CASCADE`` drops the extensions too; recreate them
+            # (mirroring the root conftest ``_ensure_pg_extensions``) so a later suite
+            # in the same CI process still finds the ``vector`` / ``citext`` /
+            # ``pg_trgm`` types its ``create_all`` needs.
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS citext"))
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await engine.dispose()
 
 
