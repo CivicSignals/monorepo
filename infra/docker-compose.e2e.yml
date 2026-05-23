@@ -1,0 +1,57 @@
+# Full-stack e2e overlay (QA-C). Layer on top of docker-compose.dev.yml:
+#
+#   docker compose -f infra/docker-compose.dev.yml -f infra/docker-compose.e2e.yml ...
+#
+# (the Makefile's `make e2e-stack` / `make seed-e2e` use exactly this pair).
+#
+# It does two things:
+#   1. Forces LLM_BACKEND=fake on every API process so the stack boots WITHOUT
+#      any vendor API key and every LLM call is served by the deterministic
+#      fixture gateway (matches the CI workflow .github/workflows/e2e-full-stack.yml).
+#      `environment:` overrides the value from the dev stack's `../.env`.
+#   2. Adds a one-shot `seed-e2e` process (docker-entrypoint.sh `seed-e2e` case)
+#      that runs the REAL extraction pipeline against the in-memory content store
+#      (no S3/MinIO) and creates the e2e users/workspaces/ICPs. Idempotent.
+#
+# NB: this is a thin overlay — it does NOT redeclare service images, volumes, or
+# depends_on; those come from the dev compose it extends.
+
+name: civicsignals-dev
+
+services:
+  # Force the fake LLM backend on every long-running API process so the feed
+  # the @fullstack specs read is produced deterministically with no vendor key.
+  api:
+    environment:
+      LLM_BACKEND: fake
+  worker_ingest:
+    environment:
+      LLM_BACKEND: fake
+  worker_extract:
+    environment:
+      LLM_BACKEND: fake
+  worker_score:
+    environment:
+      LLM_BACKEND: fake
+  worker_notify:
+    environment:
+      LLM_BACKEND: fake
+  scheduler:
+    environment:
+      LLM_BACKEND: fake
+
+  # One-shot e2e seeder. Reuses the API image + backing-service deps from the
+  # dev compose (the `api` service already declares the image build context and
+  # the migrate/pgbouncer/redis/minio depends_on; we extend it here). Runs the
+  # `seed-e2e` entrypoint, which idempotently seeds the routing scenarios.
+  seed-e2e:
+    extends:
+      file: docker-compose.dev.yml
+      service: api
+    command: ["seed-e2e"]
+    environment:
+      LLM_BACKEND: fake
+    ports: !reset []
+    healthcheck:
+      disable: true
+    restart: "no"

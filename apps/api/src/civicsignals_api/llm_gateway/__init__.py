@@ -24,6 +24,7 @@ from .backends import (
     AnthropicBackend,
     FakeBackend,
     FakeEmbeddingBackend,
+    FixtureBackend,
     OllamaBackend,
     OpenAIBackend,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "EmbeddingResult",
     "FakeBackend",
     "FakeEmbeddingBackend",
+    "FixtureBackend",
     "InMemoryTokenAccountant",
     "LLMBackend",
     "LLMEmbeddingBackend",
@@ -119,15 +121,87 @@ def _embedding_choice_from_settings(settings: Settings) -> ModelChoice:
     return ModelChoice(provider=settings.embedding_provider, model=raw)
 
 
+_FAKE_PROVIDER = "fake"
+
+
+def _load_fake_script(path: str) -> dict[str, dict[str, object]]:
+    """Load the merged scenario→responses script for the fixture backend.
+
+    The file is the e2e manifest's per-scenario ``llm-responses.json`` files merged
+    into one mapping (``seed_e2e`` writes it / passes the path). A missing or
+    unreadable file degrades to an empty script — the :class:`FixtureBackend` then
+    falls back to its safe defaults rather than crashing process boot.
+    """
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Keep only the well-formed ``marker -> {kind: response}`` entries.
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def build_fake_gateway(settings: Settings) -> LLMGateway:
+    """Construct a deterministic, network-free gateway (``LLM_BACKEND=fake``).
+
+    Every completion task routes to a single deterministic backend registered under
+    the ``fake`` provider — a :class:`FixtureBackend` replaying the scripted
+    per-scenario / per-task responses at ``settings.llm_fake_fixtures`` when set, or a
+    bare :class:`FakeBackend` (prompt echo) otherwise. The policy maps **all** known
+    completion tasks to ``(fake, <task's default model id>)`` so a caller's
+    task→model expectations (and the recorded ``result.model``) stay realistic while
+    the actual generation is local. Embeddings use the deterministic
+    :class:`FakeEmbeddingBackend` so the I1 embed step needs no embeddings API key.
+
+    This is what lets a running api/worker — and ``seed_e2e`` — boot with no API key
+    and produce reproducible signals (doc 06 §7: all LLM access goes through here).
+    """
+    completion_backend: LLMBackend
+    if settings.llm_fake_fixtures:
+        completion_backend = FixtureBackend(
+            script=_load_fake_script(settings.llm_fake_fixtures), provider=_FAKE_PROVIDER
+        )
+    else:
+        completion_backend = FakeBackend(provider=_FAKE_PROVIDER)
+
+    # Route every task to the fake provider, preserving each task's default model id
+    # so the per-task model the policy reports is still meaningful in logs/tests.
+    overrides = {
+        task: ModelChoice(provider=_FAKE_PROVIDER, model=choice.model)
+        for task, choice in DEFAULT_TASK_MODELS.items()
+    }
+    policy = TaskModelPolicy(
+        overrides=overrides,
+        default_choice=ModelChoice(provider=_FAKE_PROVIDER, model="fake-model"),
+    )
+    fake_embed = FakeEmbeddingBackend(provider=_FAKE_PROVIDER, dim=settings.embedding_dim)
+    return LLMGateway(
+        {_FAKE_PROVIDER: completion_backend},
+        policy=policy,
+        accountant=InMemoryTokenAccountant(),
+        max_attempts=settings.llm_max_attempts,
+        embedding_backends={_FAKE_PROVIDER: fake_embed},
+        embedding_choice=ModelChoice(provider=_FAKE_PROVIDER, model="fake-embed-model"),
+    )
+
+
 def build_gateway(settings: Settings | None = None) -> LLMGateway:
     """Construct an :class:`LLMGateway` wired from settings.
 
-    Backends are always registered; their vendor SDKs are imported lazily on
-    first use, so registering an Anthropic/OpenAI backend in the api image
-    (which lacks the ``extraction`` extra) is harmless until it is actually
-    called.
+    When ``settings.llm_backend == "fake"`` a deterministic, network-free gateway is
+    built (:func:`build_fake_gateway`) so the e2e stack / seed boots without API keys.
+    Otherwise (the default) the real provider backends are registered; their vendor
+    SDKs are imported lazily on first use, so registering an Anthropic/OpenAI backend
+    in the api image (which lacks the ``extraction`` extra) is harmless until it is
+    actually called.
     """
     settings = settings or get_settings()
+    if settings.llm_backend == "fake":
+        return build_fake_gateway(settings)
     openai_backend = OpenAIBackend(
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,

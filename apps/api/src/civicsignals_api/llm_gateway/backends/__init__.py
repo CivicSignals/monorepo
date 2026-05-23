@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .anthropic import AnthropicBackend
 from .fake import FakeBackend, FakeEmbeddingBackend
+from .fixture import FixtureBackend
 from .ollama import OllamaBackend
 from .openai import OpenAIBackend
 
@@ -17,6 +18,7 @@ __all__ = [
     "AnthropicBackend",
     "FakeBackend",
     "FakeEmbeddingBackend",
+    "FixtureBackend",
     "OllamaBackend",
     "OpenAIBackend",
 ]

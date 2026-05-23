@@ -1,0 +1,13 @@
+{
+  "signal_type": "rfp_posted",
+  "title": "RFP 2026-014: District-wide ERP Modernization",
+  "summary": "Lone Star ISD seeks vendors for a district-wide ERP system covering finance, HR, payroll, and procurement.",
+  "entity_state": "TX",
+  "entity_type": "school_district",
+  "details": {
+    "due_at": "2026-06-30T19:00:00Z",
+    "rfp_number": "2026-014",
+    "amount_cents": 480000000,
+    "posting_agency": "Lone Star Independent School District"
+  }
+}

@@ -26,6 +26,13 @@ case "$PROC" in
     # One-shot: idempotently seed a demo workspace + synthetic signals. TODO A2.
     exec python -m civicsignals_api.scripts.seed_demo
     ;;
+  seed-e2e)
+    # One-shot: idempotently seed the e2e routing scenarios by running the REAL
+    # extraction pipeline (no network, no Celery) with the deterministic fake LLM
+    # backend, then create the e2e users/workspaces/ICPs and score every signal.
+    # Set LLM_BACKEND=fake so the api/workers boot without any API key.
+    exec python -m civicsignals_api.scripts.seed_e2e
+    ;;
   worker_ingest)
     exec celery -A "$CELERY_APP" worker -Q ingest -n ingest@%h
     ;;

@@ -7,6 +7,7 @@ Run as the ``api`` process:
 from __future__ import annotations
 
 from fastapi import FastAPI
+from starlette.middleware.cors import CORSMiddleware
 from starlette_prometheus import PrometheusMiddleware, metrics
 
 from civicsignals_api.api.v1 import api_router
@@ -56,6 +57,26 @@ def create_app() -> FastAPI:
     # last on the way out. We want request_id bound before anything else logs.
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(PrometheusMiddleware)
+
+    # CORS (browser → API). The web app fetches the API cross-origin from the
+    # browser (web :3000 → api :8000), so without these response headers the
+    # browser blocks every authed call (incl. login). Added LAST so it is the
+    # OUTERMOST middleware: it must answer the preflight ``OPTIONS`` and stamp the
+    # ``Access-Control-Allow-*`` headers on the way out even for error responses
+    # produced by the inner stack. ``allow_credentials`` is required for the
+    # bearer + cookie flows; ``allow_methods``/``allow_headers="*"`` lets the
+    # ``Authorization`` and ``X-Workspace-Id`` (workspace-scoping) headers through
+    # preflight. ``X-Request-Id`` (echoed by RequestContextMiddleware) is exposed
+    # so browser code can read it for support/debugging.
+    if settings.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_allow_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["X-Request-Id"],
+        )
 
     # Prometheus /metrics endpoint (A6). Scraped by the observability stack;
     # excluded from OpenAPI schema to keep it clean.

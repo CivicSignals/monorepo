@@ -1,0 +1,37 @@
+{
+  "relevance": {
+    "relevant": true,
+    "categories": ["procurement"],
+    "confidence": 0.82,
+    "reason": "News article about a county weighing an IT modernization and possible RFP."
+  },
+  "entity": {
+    "organizations": [
+      {"name": "Sierra County", "confidence": 0.9, "source_offset": null}
+    ],
+    "persons": [],
+    "monetary_amounts": [],
+    "dates": [],
+    "products_categories": ["IT modernization", "permitting", "finance", "records"],
+    "vendors_mentioned": [],
+    "contract_terms_mentions": [],
+    "raw_keywords": ["modernization", "RFP", "technology"],
+    "extraction_confidence": 0.8,
+    "extraction_warnings": []
+  },
+  "signal": {
+    "candidates": [
+      {
+        "signal_type": "news_mention",
+        "confidence": 0.85,
+        "fields": {
+          "title": "Sierra County weighs IT modernization push",
+          "summary": "Sierra County officials are studying a replacement of legacy permitting, finance, and records systems; an RFP could follow this year.",
+          "publication": "Sierra Valley Dispatch",
+          "article_url": "https://news.example.com/sierra-county-it-modernization",
+          "published_at": "2026-05-10"
+        }
+      }
+    ]
+  }
+}
