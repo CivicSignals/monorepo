@@ -1,0 +1,36 @@
+{
+  "relevance": {
+    "relevant": true,
+    "categories": [],
+    "confidence": 0.65,
+    "reason": "Faint, incidental technology reference; relevant enough to pass the grey-zone floor but weak."
+  },
+  "entity": {
+    "organizations": [
+      {"name": "Green Mountain Regional Library", "confidence": 0.7, "source_offset": null}
+    ],
+    "persons": [],
+    "monetary_amounts": [],
+    "dates": [],
+    "products_categories": ["catalog software"],
+    "vendors_mentioned": [],
+    "contract_terms_mentions": [],
+    "raw_keywords": ["library", "software"],
+    "extraction_confidence": 0.5,
+    "extraction_warnings": ["only an incidental technology reference"]
+  },
+  "signal": {
+    "candidates": [
+      {
+        "signal_type": "news_mention",
+        "confidence": 0.6,
+        "fields": {
+          "title": "Green Mountain library renames its reading room",
+          "summary": "A Vermont regional library renamed a reading room and noted, only in passing, that it still uses the same catalog software.",
+          "publication": "Vermont community correspondent",
+          "published_at": "2026-05-12"
+        }
+      }
+    ]
+  }
+}

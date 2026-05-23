@@ -1,0 +1,9 @@
+{
+  "signal_type": "news_mention",
+  "title": "Green Mountain library renames its reading room",
+  "summary": "A Vermont regional library renamed a reading room and noted, only in passing, that it still uses the same catalog software.",
+  "entity_state": "VT",
+  "entity_type": "library_system",
+  "comment": "Stored as a global signal, but its VT/library_system entity matches neither Alice's (TX/school_district/rfp_posted) nor Bob's (CA/news_mention) ICP, so it produces NO workspace_score row above any threshold — the threshold/pre-filter gate proof.",
+  "expect_no_workspace_score": true
+}

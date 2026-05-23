@@ -1,0 +1,12 @@
+{
+  "signal_type": "news_mention",
+  "title": "Sierra County weighs IT modernization push",
+  "summary": "Sierra County officials are studying a replacement of legacy permitting, finance, and records systems; an RFP could follow this year.",
+  "entity_state": "CA",
+  "entity_type": "county",
+  "details": {
+    "publication": "Sierra Valley Dispatch",
+    "article_url": "https://news.example.com/sierra-county-it-modernization",
+    "published_at": "2026-05-10"
+  }
+}

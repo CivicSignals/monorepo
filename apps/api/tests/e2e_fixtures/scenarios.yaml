@@ -1,0 +1,110 @@
+# E2E scenario manifest (testing foundation).
+#
+# Drives ``civicsignals_api.scripts.seed_e2e``: for each scenario the seeder stores
+# the mocked ``source.html`` as a raw document, runs the REAL extraction pipeline
+# (``extraction.pipeline.run_extraction_pipeline``) with the deterministic fake/
+# fixture LLM gateway + an in-memory storage, producing real ``signals_signal`` rows;
+# then it creates the users + workspaces + ICPs below and scores every signal for
+# every workspace (``signals.services.score_signal_for_all_workspaces``).
+#
+# Each scenario's ``marker`` is a unique token embedded in its ``source.html`` so the
+# FixtureBackend can route the scripted ``llm-responses.json`` (relevance / entity /
+# signal) to the right scenario regardless of processing order.
+#
+# The two users + ICPs encode the routing invariant the verifying test asserts:
+#   - Alice (TX / k12_district / rfp_posted)  -> sees the TX school RFP, NOT the CA news.
+#   - Bob   (CA / news_mention)               -> sees the CA county news, NOT the TX RFP.
+#   - The weak_match signal must score BELOW Alice's strict threshold (no score row).
+
+version: 1
+
+scenarios:
+  - id: tx_school_rfp
+    dir: tx_school_rfp
+    marker: "E2E-MARKER-TX-SCHOOL-RFP"
+    recipe_id: e2e_tx_school_rfp
+    connector: http_static
+    source_url: "https://procurement.txed.example.gov/rfp/erp-2026"
+    content_type: "text/html"
+    # Entity the RFP is about — resolved up-front by the seeder so the signal links
+    # to it and the ICP geo/kind dimensions match.
+    entity:
+      nces_leaid: "4800001"
+      # ``school_district`` is the canonical k12-district kind in the entities
+      # taxonomy (entities.models.ENTITY_TYPES); the ICP matches it via
+      # ``entity_kinds`` below. (The task brief's informal "k12_district" maps to
+      # this constrained value.)
+      type: school_district
+      name: "Lone Star Independent School District"
+      country: US
+      state: TX
+      enrollment: 52000
+    expected_signal_type: rfp_posted
+
+  - id: ca_county_news
+    dir: ca_county_news
+    marker: "E2E-MARKER-CA-COUNTY-NEWS"
+    recipe_id: e2e_ca_county_news
+    connector: http_static
+    source_url: "https://news.example.com/sierra-county-it-modernization"
+    content_type: "text/html"
+    entity:
+      census_gid: "0600100"
+      type: county
+      name: "Sierra County"
+      country: US
+      state: CA
+      population: 310000
+    expected_signal_type: news_mention
+
+  - id: weak_match
+    dir: weak_match
+    marker: "E2E-MARKER-WEAK-MATCH"
+    recipe_id: e2e_weak_match
+    connector: http_static
+    source_url: "https://news.example.com/vermont-library-story"
+    content_type: "text/html"
+    # An out-of-ICP entity (VT, library_system) so the signal matches neither
+    # Alice's nor Bob's geo, and the news_mention type + low confidence keep it
+    # below Alice's strict threshold even on the type axis.
+    entity:
+      census_gid: "5000200"
+      type: library_system
+      name: "Green Mountain Regional Library"
+      country: US
+      state: VT
+    expected_signal_type: news_mention
+
+# The two e2e users. Stable emails make the seeder idempotent (get-or-create).
+users:
+  - key: alice
+    email: alice.e2e@civicsignals.test
+    name: "Alice (TX RFP hunter)"
+    password: "e2e-password-alice"
+    workspace_name: "Alice TX Workspace"
+    workspace_slug: e2e-alice-tx
+    icp:
+      name: "TX k12 RFPs"
+      countries: ["US"]
+      states: ["TX"]
+      entity_kinds: ["school_district"]
+      signal_types: ["rfp_posted"]
+      # Strict threshold: the weak_match signal must land below this so it produces
+      # no score row for Alice (proving the threshold gate).
+      threshold: 60
+    expects_scenarios: ["tx_school_rfp"]
+
+  - key: bob
+    email: bob.e2e@civicsignals.test
+    name: "Bob (CA news watcher)"
+    password: "e2e-password-bob"
+    workspace_name: "Bob CA Workspace"
+    workspace_slug: e2e-bob-ca
+    icp:
+      name: "CA news mentions"
+      countries: ["US"]
+      states: ["CA"]
+      entity_kinds: []
+      signal_types: ["news_mention"]
+      threshold: 40
+    expects_scenarios: ["ca_county_news"]

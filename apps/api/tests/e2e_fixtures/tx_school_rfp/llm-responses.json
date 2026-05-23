@@ -1,0 +1,46 @@
+{
+  "relevance": {
+    "relevant": true,
+    "categories": ["procurement"],
+    "confidence": 0.95,
+    "reason": "Formal RFP for a district-wide ERP system."
+  },
+  "entity": {
+    "organizations": [
+      {"name": "Lone Star Independent School District", "confidence": 0.95, "source_offset": null}
+    ],
+    "persons": [
+      {"name": "Dana Reyes", "role": "Director of Procurement", "confidence": 0.8}
+    ],
+    "monetary_amounts": [
+      {"amount_cents": 480000000, "currency": "USD", "confidence": 0.9}
+    ],
+    "dates": [
+      {"value": "2026-06-30", "kind": "due", "confidence": 0.9}
+    ],
+    "products_categories": ["ERP", "finance", "human resources", "procurement"],
+    "vendors_mentioned": [],
+    "contract_terms_mentions": [],
+    "raw_keywords": ["RFP", "ERP", "modernization"],
+    "extraction_confidence": 0.9,
+    "extraction_warnings": []
+  },
+  "signal": {
+    "candidates": [
+      {
+        "signal_type": "rfp_posted",
+        "confidence": 0.92,
+        "fields": {
+          "title": "RFP 2026-014: District-wide ERP Modernization",
+          "summary": "Lone Star ISD seeks vendors for a district-wide ERP system covering finance, HR, payroll, and procurement.",
+          "due_at": "2026-06-30T19:00:00Z",
+          "rfp_number": "2026-014",
+          "amount_cents": 480000000,
+          "posting_agency": "Lone Star Independent School District",
+          "contact_name": "Dana Reyes",
+          "submission_url": "https://procurement.txed.example.gov/rfp/erp-2026/submit"
+        }
+      }
+    ]
+  }
+}

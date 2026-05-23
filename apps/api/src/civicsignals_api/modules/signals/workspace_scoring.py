@@ -522,7 +522,16 @@ def semantic_similarity(
     treating "no embedding" as a 0 similarity. Cosine in [-1, 1] is mapped to [0, 1]
     via ``(cos + 1) / 2`` so an orthogonal pair lands at the neutral 0.5.
     """
-    if not signal_vector or not icp_vector or len(signal_vector) != len(icp_vector):
+    # ``is None`` / ``len`` rather than truthiness: a stored ``signal_vector`` read
+    # back from pgvector is a NumPy array, and ``not array`` raises "truth value of
+    # an array is ambiguous". An empty or mismatched-length vector is also a no-op.
+    if (
+        signal_vector is None
+        or icp_vector is None
+        or len(signal_vector) == 0
+        or len(icp_vector) == 0
+        or len(signal_vector) != len(icp_vector)
+    ):
         return None
     dot = sum(a * b for a, b in zip(signal_vector, icp_vector, strict=True))
     na = math.sqrt(sum(a * a for a in signal_vector))

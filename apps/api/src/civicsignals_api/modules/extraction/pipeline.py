@@ -274,9 +274,7 @@ def _run_ocr(
     except Exception as exc:
         # Best-effort: OCR failure must not lose the document (doc 19 §2.2 §12.1).
         # Include the stack trace so operators can diagnose backend issues.
-        log.warning(
-            "extraction.parse.ocr_failed", doc_id=doc_id, error=str(exc), exc_info=True
-        )
+        log.warning("extraction.parse.ocr_failed", doc_id=doc_id, error=str(exc), exc_info=True)
         return fallback_text, True, False
 
 
@@ -816,7 +814,14 @@ async def store_candidates(
     for candidate, row in zip(candidates, rows, strict=True):
         candidate_input = CandidateInput(
             signal_type=candidate.signal_type,
-            fields=dict(candidate.fields),
+            # ``entity_name`` is a *convenience* key the extract stage injects into
+            # fields (doc 19 §4.3) for downstream compatibility — it is lifted onto
+            # ``CandidateInput.entity_name`` below. The strict per-type payload
+            # schemas (E4) declare no ``entity_name`` field and ``forbid`` extras, so
+            # it must not reach the validator, or a resolved-entity candidate would be
+            # spuriously rejected. Strip it here (the only place it would otherwise
+            # flow into the hard gate).
+            fields=_fields_for_payload(candidate.fields),
             recipe_id=recipe_id,
             raw_document_id=raw_document_id,
             content_hash=_candidate_content_hash(candidate),
@@ -876,6 +881,17 @@ async def embed_signals(
     return await signals_services.embed_signals(
         session, signal_ids, gateway=gateway, workspace_id=workspace_id
     )
+
+
+def _fields_for_payload(fields: dict[str, object]) -> dict[str, object]:
+    """Return a copy of ``fields`` safe to feed the strict per-type schema gate (E4).
+
+    Drops the ``entity_name`` convenience key the extract stage injects (doc 19 §4.3):
+    it is lifted onto ``CandidateInput.entity_name`` separately, and no typed payload
+    declares it while every payload ``forbid``\\s extras — so leaving it in would make
+    the hard gate reject an otherwise-valid candidate whenever an entity resolved.
+    """
+    return {k: v for k, v in fields.items() if k != "entity_name"}
 
 
 def _candidate_entity_name(candidate: CandidateRecord) -> str | None:

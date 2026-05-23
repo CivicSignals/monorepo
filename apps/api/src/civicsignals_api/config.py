@@ -118,6 +118,25 @@ class Settings(BaseSettings):
 
     # LLM gateway (doc 06 §7, doc 18 §6.6). Vendor SDKs are imported lazily by
     # the backends; only the keys/base URLs configured here are needed.
+    #
+    # ``llm_backend`` selects how completions are produced:
+    #   - "vendor" (default) — the real provider backends (Anthropic/OpenAI/Ollama),
+    #     routed per task by ``llm_task_models`` + ``llm_default_provider``. This
+    #     preserves today's production behavior exactly.
+    #   - "fake" — a deterministic, network-free backend used by the e2e test stack
+    #     (and by ``seed_e2e``): the api/workers boot without any API key and produce
+    #     scripted, reproducible output. When ``llm_fake_fixtures`` points at a JSON
+    #     file, a :class:`FixtureBackend` replays per-scenario / per-task responses
+    #     (relevance / entity-extraction / signal-extraction); otherwise a bare
+    #     :class:`FakeBackend` echoes the prompt. Embeddings always use the
+    #     deterministic ``FakeEmbeddingBackend`` in this mode (no embeddings API key).
+    # Env-var: LLM_BACKEND.
+    llm_backend: Literal["vendor", "fake"] = "vendor"
+    # Optional path to the scripted-response JSON the ``fake`` backend replays
+    # (the e2e fixture manifest's ``llm-responses.json`` files, merged into one
+    # script keyed by scenario marker + task). Unset → the bare echo FakeBackend.
+    # Env-var: LLM_FAKE_FIXTURES.
+    llm_fake_fixtures: str | None = None
     llm_default_provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
     anthropic_api_key: str | None = None
     anthropic_base_url: str | None = None
