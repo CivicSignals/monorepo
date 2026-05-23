@@ -160,8 +160,16 @@ def _enqueue_scoring(signal_ids: list[uuid.UUID]) -> None:
         return
     from civicsignals_api.modules.signals.tasks import score_signal
 
+    # Best-effort: the signals are already committed, so a broker blip here must
+    # NOT escape and trigger a full extraction retry (which would re-run the LLM
+    # and dead-letter a job whose signals exist). A missed enqueue leaves the
+    # signal unscored until the next ICP-change backfill or a manual re-score;
+    # we log it loudly so it's observable.
     for signal_id in signal_ids:
-        score_signal.delay(str(signal_id))
+        try:
+            score_signal.delay(str(signal_id))
+        except Exception:  # enqueue must not undo already-committed signal work
+            log.warning("extraction.score_enqueue_failed", signal_id=str(signal_id))
 
 
 async def _dead_letter_async(job_id: uuid.UUID, *, error: str) -> None:
