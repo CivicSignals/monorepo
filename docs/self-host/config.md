@@ -299,7 +299,9 @@ before exposing the stack to the internet:**
 | `CIVICSIGNALS_ADMIN_PASSWORD` | (must be set) | First admin account |
 | `SMTP_USER` / `SMTP_PASSWORD` | empty | Required for authenticated SMTP in production |
 
-See the [quickstart](quickstart.md) for the full first-boot checklist.
+See the [quickstart](quickstart.md) for the full first-boot checklist, and the
+[production prerequisites checklist](production-checklist.md) for what you MUST
+configure (LLM key, entity data, secrets) before real users get real signals.
 
 ---
 

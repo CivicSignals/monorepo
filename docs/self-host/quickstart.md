@@ -138,6 +138,7 @@ docker compose -f infra/docker-compose.yml config
 
 <!-- TODO Q4: link to full self-host docs once Q4 is done -->
 
+- **Production prerequisites:** [`production-checklist.md`](production-checklist.md) — what you MUST configure (LLM key, entity data, secrets) before real users get real signals
 - **Configuration reference:** `docs/self-host/config.md` (task O4)
 - **Upgrade guide:** `docs/self-host/upgrade.md` (task O5)
 - **Backup and DR:** `docs/self-host/backup.md` (task LC-8)
