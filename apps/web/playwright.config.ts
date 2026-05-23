@@ -22,6 +22,14 @@ import { defineConfig, devices } from "@playwright/test";
 // process or a remotely deployed staging URL without touching this file.
 const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000";
 
+// QA-C: full-stack e2e specs are tagged @fullstack. They need a SEEDED, running
+// stack (web + api + DB + workers), so they must NOT run in the smoke / full /
+// browser projects below (those start only `next dev` and have no backend) —
+// every non-fullstack project carries this grepInvert. The dedicated
+// `full-stack` project (grep: /@fullstack/) runs them against an
+// externally-started, seeded stack and is the ONLY project that runs them.
+const FULLSTACK_TAG = /@fullstack/;
+
 export default defineConfig({
   testDir: "./e2e",
   // Match only .spec.ts files in the e2e directory.
@@ -66,32 +74,42 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+      // @fullstack specs need a seeded backend — they only run in `full-stack`.
+      grepInvert: FULLSTACK_TAG,
     },
     {
       name: "chromium-smoke",
       use: { ...devices["Desktop Chrome"] },
-      // Only smoke-tagged tests run in this project (tag: @smoke).
+      // Only smoke-tagged tests run in this project (tag: @smoke). @smoke and
+      // @fullstack are disjoint, so smoke can never pick up a full-stack spec,
+      // but the grepInvert makes that invariant explicit and future-proof.
       grep: /@smoke/,
+      grepInvert: FULLSTACK_TAG,
     },
     {
       name: "chromium-full",
       use: { ...devices["Desktop Chrome"] },
-      // Full project runs all tests; fixme tests are auto-skipped by Playwright.
+      // Full project runs all non-fullstack tests; fixme tests are auto-skipped
+      // by Playwright. @fullstack is excluded — it has no backend here.
+      grepInvert: FULLSTACK_TAG,
     },
 
     // ---- Firefox (Desktop Firefox) -----------------------------------------
     {
       name: "firefox",
       use: { ...devices["Desktop Firefox"] },
+      grepInvert: FULLSTACK_TAG,
     },
     {
       name: "firefox-smoke",
       use: { ...devices["Desktop Firefox"] },
       grep: /@smoke/,
+      grepInvert: FULLSTACK_TAG,
     },
     {
       name: "firefox-full",
       use: { ...devices["Desktop Firefox"] },
+      grepInvert: FULLSTACK_TAG,
     },
 
     // ---- WebKit / Safari engine (Desktop Safari) ---------------------------
@@ -102,15 +120,32 @@ export default defineConfig({
     {
       name: "webkit",
       use: { ...devices["Desktop Safari"] },
+      grepInvert: FULLSTACK_TAG,
     },
     {
       name: "webkit-smoke",
       use: { ...devices["Desktop Safari"] },
       grep: /@smoke/,
+      grepInvert: FULLSTACK_TAG,
     },
     {
       name: "webkit-full",
       use: { ...devices["Desktop Safari"] },
+      grepInvert: FULLSTACK_TAG,
+    },
+
+    // ---- Full-stack (seeded backend required) ------------------------------
+    // The ONLY project that runs @fullstack specs (feed-routing, CUF-1). It
+    // expects an externally-started, seeded stack: run with
+    // PLAYWRIGHT_NO_WEBSERVER=1 and PLAYWRIGHT_BASE_URL pointing at the running
+    // web app (the `webServer` block below is disabled by NO_WEBSERVER). CI
+    // brings the stack up + seeds it (`seed_e2e`) before invoking this project.
+    // Single engine (Chromium) — these assert backend/data behaviour, not
+    // cross-browser rendering, so the matrix would only add cost.
+    {
+      name: "full-stack",
+      use: { ...devices["Desktop Chrome"] },
+      grep: FULLSTACK_TAG,
     },
   ],
 

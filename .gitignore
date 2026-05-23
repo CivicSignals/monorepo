@@ -76,6 +76,9 @@ htmlcov/
 *.sqlite3
 playwright-report/
 test-results/
+# Per-run Playwright storageState cache (full-stack e2e auth helper) — holds
+# bearer tokens; must never be committed.
+apps/web/e2e/.auth/
 
 # =============================================================================
 # Editors / OS

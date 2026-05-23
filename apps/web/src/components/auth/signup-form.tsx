@@ -62,7 +62,12 @@ export function SignupForm() {
       : signup.error?.message;
 
   return (
-    <form onSubmit={onSubmit} noValidate className="w-full max-w-sm space-y-4">
+    <form
+      onSubmit={onSubmit}
+      noValidate
+      className="w-full max-w-sm space-y-4"
+      data-testid="signup-form"
+    >
       <div className="space-y-1 text-center">
         <h1 className="text-2xl font-bold tracking-tight">
           Create your account
@@ -89,6 +94,7 @@ export function SignupForm() {
           id="name"
           type="text"
           autoComplete="name"
+          data-testid="signup-name"
           className="w-full rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
           {...register("name")}
         />
@@ -102,6 +108,7 @@ export function SignupForm() {
           id="email"
           type="email"
           autoComplete="email"
+          data-testid="signup-email"
           aria-invalid={errors.email ? "true" : undefined}
           aria-describedby={errors.email ? "email-error" : undefined}
           className="w-full rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
@@ -122,6 +129,7 @@ export function SignupForm() {
           id="password"
           type="password"
           autoComplete="new-password"
+          data-testid="signup-password"
           aria-invalid={errors.password ? "true" : undefined}
           aria-describedby={errors.password ? "password-error" : undefined}
           className="w-full rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
@@ -141,6 +149,7 @@ export function SignupForm() {
       <button
         type="submit"
         disabled={isSubmitting}
+        data-testid="signup-submit"
         className="w-full rounded-md bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:opacity-60"
       >
         {isSubmitting ? "Creating account…" : "Create account"}

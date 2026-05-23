@@ -28,6 +28,7 @@ export function LoginForm() {
       <div
         className="w-full max-w-sm space-y-3 text-center"
         data-testid="login-success"
+        data-signed-in-email={signedInEmail}
       >
         <h1 className="text-2xl font-bold tracking-tight">Signed in</h1>
         <p className="text-sm text-muted-foreground">
@@ -43,7 +44,12 @@ export function LoginForm() {
       : login.error?.message;
 
   return (
-    <form onSubmit={onSubmit} noValidate className="w-full max-w-sm space-y-4">
+    <form
+      onSubmit={onSubmit}
+      noValidate
+      className="w-full max-w-sm space-y-4"
+      data-testid="login-form"
+    >
       <div className="space-y-1 text-center">
         <h1 className="text-2xl font-bold tracking-tight">Sign in</h1>
         <p className="text-sm text-muted-foreground">
@@ -68,6 +74,7 @@ export function LoginForm() {
           id="email"
           type="email"
           autoComplete="email"
+          data-testid="login-email"
           aria-invalid={errors.email ? "true" : undefined}
           aria-describedby={errors.email ? "email-error" : undefined}
           className="w-full rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
@@ -88,6 +95,7 @@ export function LoginForm() {
           id="password"
           type="password"
           autoComplete="current-password"
+          data-testid="login-password"
           aria-invalid={errors.password ? "true" : undefined}
           aria-describedby={errors.password ? "password-error" : undefined}
           className="w-full rounded-md border bg-background px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
@@ -107,6 +115,7 @@ export function LoginForm() {
       <button
         type="submit"
         disabled={isSubmitting}
+        data-testid="login-submit"
         className="w-full rounded-md bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:opacity-60"
       >
         {isSubmitting ? "Signing in…" : "Sign in"}
