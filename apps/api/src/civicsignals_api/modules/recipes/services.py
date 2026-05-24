@@ -85,6 +85,7 @@ from .schemas import (
     FixtureReplayResult,
     PreviewRequest,
     PreviewResult,
+    RawDocument,
     Recipe,
     RecipeScorecardOut,
     RollingMetrics,
@@ -153,6 +154,26 @@ def run_pointers(
     """
     runner = RecipeRunner(recipe, fetcher, clock=clock, llm_extractor=llm_extractor)
     return runner.run_pointers(pointers)
+
+
+def run_pointers_collecting_raw_documents(
+    recipe: Recipe,
+    fetcher: Fetcher,
+    pointers: Sequence[SourcePointer],
+    *,
+    clock: Clock | None = None,
+    llm_extractor: LLMFieldExtractor | None = None,
+) -> tuple[list[CanonicalRecord], list[RawDocument]]:
+    """Run pointers and also return each fetched :class:`RawDocument` (D3/D4 seam).
+
+    The raw-document persistence seam the ingestion crawl path uses (doc 18 §2.2,
+    §3.6): runs the same lifecycle as :func:`run_pointers` but threads the raw bytes
+    from the ``fetch`` step back to the caller so ingestion can persist them via
+    ``ingestion.services.store_raw_document`` — without the recipes module importing
+    ingestion (doc 06 §3). The normal records-only :func:`run_pointers` is unchanged.
+    """
+    runner = RecipeRunner(recipe, fetcher, clock=clock, llm_extractor=llm_extractor)
+    return runner.run_pointers_collecting_raw_documents(pointers)
 
 
 def run_pointers_with_outcome(
@@ -365,6 +386,7 @@ __all__ = [
     "NoopGitHubClient",
     "PreviewRequest",
     "PreviewResult",
+    "RawDocument",
     "RealClock",
     "Recipe",
     "RecipeError",
@@ -414,6 +436,7 @@ __all__ = [
     "replay_recipe",
     "rollup_metrics",
     "run_pointers",
+    "run_pointers_collecting_raw_documents",
     "run_pointers_with_outcome",
     "run_recipe",
     "run_recipe_file",

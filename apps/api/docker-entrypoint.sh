@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Selects the process type for the shared API image (doc 18 §6.1).
-# Usage: docker-entrypoint.sh <api|worker_ingest|worker_extract|worker_score|worker_notify|scheduler|migrate|seed|init>
+# Usage: docker-entrypoint.sh <api|worker_ingest|worker_extract|worker_score|worker_notify|scheduler|migrate|seed|seed-e2e|load-entities|init>
 #
 # In the production container image the venv Python is on PATH (/app/.venv/bin).
 # Executables are invoked directly (uvicorn, celery) rather than via `uv run`
@@ -32,6 +32,19 @@ case "$PROC" in
     # backend, then create the e2e users/workspaces/ICPs and score every signal.
     # Set LLM_BACKEND=fake so the api/workers boot without any API key.
     exec python -m civicsignals_api.scripts.seed_e2e
+    ;;
+  load-entities)
+    # One-shot: load the entity directory (the account universe) from the
+    # foundational public-domain datasets — NCES CCD, IPEDS HD, Census of
+    # Governments (C1; doc 16 §4/§5/§6). Idempotent (UPSERT on natural key).
+    # Extra args after the process type are forwarded to the loader CLI, e.g.
+    #   docker compose run --rm api load-entities --source all
+    #   docker compose run --rm api load-entities --source nces --path-or-url /data/ccd_lea.csv
+    # With no --path-or-url it loads the committed sample fixtures (offline-safe).
+    # Run the REAL datasets in production so the directory / ICP matching isn't
+    # near-empty (see docs/self-host/production-checklist.md).
+    shift || true
+    exec python -m civicsignals_api.scripts.load_entities "$@"
     ;;
   worker_ingest)
     exec celery -A "$CELERY_APP" worker -Q ingest -n ingest@%h

@@ -37,7 +37,10 @@ _DSN = (
 )
 pytestmark = pytest.mark.skipif(_DSN is None, reason="no Postgres DSN configured")
 
-NOW = datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC)
+# Anchored to real "now" (not a fixed calendar date) so the seeded runs always
+# fall inside the drift task's rolling 24h/7d window — otherwise the test rots
+# and fails once the wall clock moves past the window from a hardcoded date.
+NOW = datetime.now(UTC)
 
 _TABLES = [
     Base.metadata.tables[RunMetric.__tablename__],
