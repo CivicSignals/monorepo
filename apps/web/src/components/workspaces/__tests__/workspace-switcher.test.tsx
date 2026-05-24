@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// B5 — Render + switch + create test for the workspace switcher.
+// B5 — Render + switch + create test for the workspace switcher dropdown.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -52,6 +52,12 @@ function pathOf(input: RequestInfo | URL): string {
   return new URL(String(input), "http://localhost").pathname;
 }
 
+// Open the dropdown by clicking the trigger.
+async function openMenu(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByTestId("workspace-trigger"));
+  return screen.getByRole("menu", { name: /workspaces/i });
+}
+
 beforeEach(() => {
   localStorage.clear();
   useSessionStore.setState({ accessToken: "jwt-access", user: null });
@@ -66,7 +72,7 @@ afterEach(() => {
 });
 
 describe("WorkspaceSwitcher", () => {
-  it("renders the workspaces the user belongs to", async () => {
+  it("lists the workspaces the user belongs to in the menu", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse({
         items: [
@@ -77,16 +83,27 @@ describe("WorkspaceSwitcher", () => {
       }),
     );
 
+    const user = userEvent.setup();
     render(<WorkspaceSwitcher />, { wrapper });
 
-    const select = await screen.findByRole("combobox", {
-      name: /active workspace/i,
-    });
-    const options = within(select).getAllByRole("option");
-    expect(options.map((o) => o.textContent)).toEqual([
+    const menu = await openMenu(user);
+    const items = within(menu).getAllByRole("menuitemradio");
+    expect(items.map((i) => i.textContent?.trim())).toEqual([
       "Acme SLED",
       "Beta Team",
     ]);
+  });
+
+  it("explains what a workspace is", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ items: [makeWorkspace({ id: "ws-1" })], next_cursor: null }),
+    );
+
+    const user = userEvent.setup();
+    render(<WorkspaceSwitcher />, { wrapper });
+
+    const menu = await openMenu(user);
+    expect(within(menu).getByText(/separate space for one team or client/i)).toBeTruthy();
   });
 
   it("switches the active workspace via the switch endpoint", async () => {
@@ -112,10 +129,8 @@ describe("WorkspaceSwitcher", () => {
     const user = userEvent.setup();
     render(<WorkspaceSwitcher />, { wrapper });
 
-    const select = await screen.findByRole("combobox", {
-      name: /active workspace/i,
-    });
-    await user.selectOptions(select, "ws-2");
+    const menu = await openMenu(user);
+    await user.click(within(menu).getByRole("menuitemradio", { name: "Beta Team" }));
 
     await waitFor(() =>
       expect(useUiStore.getState().activeWorkspaceId).toBe("ws-2"),
@@ -144,11 +159,9 @@ describe("WorkspaceSwitcher", () => {
     const user = userEvent.setup();
     render(<WorkspaceSwitcher />, { wrapper });
 
-    await user.click(
-      await screen.findByRole("button", { name: /new workspace/i }),
-    );
+    await openMenu(user);
     await user.type(screen.getByLabelText(/new workspace name/i), "Fresh WS");
-    await user.click(screen.getByRole("button", { name: /^create$/i }));
+    await user.click(screen.getByRole("button", { name: /create new/i }));
 
     await waitFor(() =>
       expect(useUiStore.getState().activeWorkspaceId).toBe("ws-new"),
@@ -158,5 +171,19 @@ describe("WorkspaceSwitcher", () => {
     );
     expect(createCall).toBeDefined();
     expect(String(createCall?.[1]?.body)).toContain("Fresh WS");
+  });
+
+  it("shows an empty-state prompt when the user has no workspaces", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ items: [], next_cursor: null }),
+    );
+
+    const user = userEvent.setup();
+    render(<WorkspaceSwitcher />, { wrapper });
+
+    const menu = await openMenu(user);
+    expect(within(menu).getByText(/no workspace yet/i)).toBeTruthy();
+    // The create field is still reachable — the empty state is not a dead end.
+    expect(within(menu).getByLabelText(/new workspace name/i)).toBeTruthy();
   });
 });

@@ -238,6 +238,9 @@ services:
       # Overridable so the web can be exposed publicly (e.g. via Tailscale Funnel):
       # set NEXT_PUBLIC_API_BASE_URL in .env to the public same-origin API URL.
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
+      # Subpath prefix when served behind a shared proxy (e.g. /civic); empty = root.
+      # Must match the /civic carried by NEXT_PUBLIC_API_BASE_URL and the proxy route.
+      NEXT_PUBLIC_BASE_PATH: ${NEXT_PUBLIC_BASE_PATH:-}
     ports:
       - "3000:3000"
     volumes:

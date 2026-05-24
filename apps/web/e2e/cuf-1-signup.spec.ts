@@ -69,14 +69,12 @@ test.describe("@fullstack CUF-1: Signup → first signal seen", () => {
     await page.goto("/feed");
     const switcher = page.getByTestId("workspace-switcher");
     await expect(switcher).toBeVisible();
-    await switcher.getByRole("button", { name: /New workspace/i }).click();
-    await switcher.getByPlaceholder("Workspace name").fill(user.workspaceName);
-    await switcher.getByRole("button", { name: /^Create$/i }).click();
+    await switcher.getByTestId("workspace-trigger").click();
+    await switcher.getByPlaceholder("New workspace name").fill(user.workspaceName);
+    await switcher.getByRole("button", { name: /Create New/i }).click();
 
     // The newly-created workspace becomes active (useCreateWorkspace sets the
-    // active id) and appears as the selected option in the switcher.
-    const select = switcher.getByLabel("Active workspace");
-    await expect(select).toBeVisible();
+    // active id) and the dropdown trigger now shows its name.
     await expect(switcher).toContainText(user.workspaceName);
   });
 
@@ -93,9 +91,9 @@ test.describe("@fullstack CUF-1: Signup → first signal seen", () => {
 
     await page.goto("/feed");
     const switcher = page.getByTestId("workspace-switcher");
-    await switcher.getByRole("button", { name: /New workspace/i }).click();
-    await switcher.getByPlaceholder("Workspace name").fill(user.workspaceName);
-    await switcher.getByRole("button", { name: /^Create$/i }).click();
+    await switcher.getByTestId("workspace-trigger").click();
+    await switcher.getByPlaceholder("New workspace name").fill(user.workspaceName);
+    await switcher.getByRole("button", { name: /Create New/i }).click();
     await expect(switcher).toContainText(user.workspaceName);
 
     // A brand-new workspace has no scored signals → the feed's "no signals yet"

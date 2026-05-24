@@ -105,11 +105,11 @@ export async function ensureWorkspaceActive(
   const switcher = page.getByTestId("workspace-switcher");
   await expect(switcher).toBeVisible();
 
-  const select = switcher.getByLabel("Active workspace");
-  await expect(select).toBeVisible();
-  await select.selectOption({ label: expectedName });
-  // The selected value is a real workspace id (UUID), never the empty string.
-  await expect(select).toHaveValue(/.+/);
+  // Open the dropdown and pick the workspace by name.
+  await switcher.getByTestId("workspace-trigger").click();
+  await switcher.getByRole("menuitemradio", { name: expectedName }).click();
+  // The trigger now reflects the active workspace (menu closes on select).
+  await expect(switcher).toContainText(expectedName);
 
   return expectedName;
 }
