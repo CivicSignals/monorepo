@@ -600,3 +600,66 @@ def test_get_webhook_not_found_404(client: TestClient) -> None:
     resp = client.get(f"{WEBHOOKS}/{uuid.uuid4()}", headers=_hdr(token, ws["id"]))
     assert resp.status_code == 404, resp.text
     assert resp.json()["type"].endswith("/not_found")
+
+
+def test_retry_task_commits_per_delivery_to_release_pool_connections(
+    monkeypatch: Any,
+) -> None:
+    """The retry sweep runs each delivery in its own short transaction.
+
+    Under PgBouncer transaction-mode pooling an open transaction pins a pooled
+    server connection (doc 06 §4), so holding one across a whole batch of
+    network-bound deliveries can exhaust the pool and hang every DB-backed
+    request. The task commits after the initial read and after each delivery;
+    this pins that behaviour so a refactor can't regress to one batch-wide
+    transaction held across all the HTTP calls.
+    """
+    from civicsignals_api.modules.integrations import tasks as webhook_tasks
+
+    class _Delivery:
+        def __init__(self) -> None:
+            self.subscription_id = uuid.uuid4()
+
+    deliveries = [_Delivery(), _Delivery(), _Delivery()]
+
+    class _Session:
+        def __init__(self) -> None:
+            self.commits = 0
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    session = _Session()
+
+    class _Http:
+        async def aclose(self) -> None:
+            pass
+
+    async def _return(value: Any) -> Any:
+        return value
+
+    async def _noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr("civicsignals_api.db.SessionLocal", lambda: session)
+    monkeypatch.setattr(
+        services, "due_failed_webhook_deliveries", lambda _s: _return(deliveries)
+    )
+    monkeypatch.setattr(
+        services, "get_webhook_subscription_unscoped", lambda _s, _id: _return(object())
+    )
+    monkeypatch.setattr(services, "execute_webhook_delivery", _noop)
+    monkeypatch.setattr(services, "default_http_client", lambda: _Http())
+
+    attempted = asyncio.run(webhook_tasks._retry_failed_webhook_deliveries_async())
+
+    assert attempted == 3
+    # 1 commit to release the read txn + 1 per delivery == 4. The point is it is
+    # > 1: not a single batch-wide transaction spanning every HTTP round-trip.
+    assert session.commits == 4

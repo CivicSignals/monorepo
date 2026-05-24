@@ -100,6 +100,16 @@ async def _retry_failed_webhook_deliveries_async() -> int:
     attempted = 0
     async with SessionLocal() as session:
         due = await services.due_failed_webhook_deliveries(session)
+        # Release the read transaction before the network-bound retry loop. Under
+        # PgBouncer transaction-mode pooling (doc 06 §4) an open transaction pins a
+        # pooled server connection, so holding one across every delivery's HTTP call
+        # keeps the connection checked out for the whole batch — and batch after
+        # batch that exhausts the pool, hanging every DB-backed request. Commit now
+        # (the read has nothing to lose) and again after each delivery, so each runs
+        # in its own short transaction that frees the connection before the next HTTP
+        # round-trip. Per-delivery commits also stop one failure from rolling back
+        # already-delivered rows.
+        await session.commit()
         http = services.default_http_client()
         try:
             for delivery in due:
@@ -115,8 +125,8 @@ async def _retry_failed_webhook_deliveries_async() -> int:
                     http_client=http,
                     settings=settings,
                 )
+                await session.commit()
                 attempted += 1
-            await session.commit()
         finally:
             await http.aclose()
 
