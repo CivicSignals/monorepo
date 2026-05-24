@@ -24,7 +24,7 @@ prefilter: classifier
 
 connector_config:
   rss:
-    feed_url: https://www.govtech.com/rss
+    feed_url: https://www.govtech.com/rss.rss
     max_items: 50
     fetch_item_body: true
 

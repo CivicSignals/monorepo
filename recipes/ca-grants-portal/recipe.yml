@@ -1,11 +1,12 @@
 # State portal — California Grants Portal (grants.ca.gov open-data feed)
 # (doc 16 §14 recipes #18-22 grant/accountability portals; doc 18 §5 wave 2 #9).
-# The California Grants Portal publishes its open grant opportunities as a
-# Socrata dataset, so this instantiates the multi-tenant `socrata` connector
-# (TODO D7). Public open-data; app_token optional. Fields read the connector's
-# JSON->HTML <dl> projection by data-key.
+# data.ca.gov is a CKAN catalog (not Socrata), so this instantiates the
+# multi-tenant `ckan` connector (TODO D7) against the "California Grants Portal"
+# datastore resource. Public open-data; no key required. Fields read the
+# connector's JSON->HTML <dl> projection by data-key (the CKAN column names,
+# which are CamelCase: Title, AgencyDept, …).
 recipe_id: ca-grants-portal
-connector: socrata
+connector: ckan
 version: 1
 
 entity:
@@ -23,33 +24,31 @@ fetch:
 prefilter: assume_relevant
 
 connector_config:
-  socrata:
+  ckan:
     domain: data.ca.gov
-    dataset_id: 35rd-tg9m
-    order: ":id"
+    # "California Grants Portal — Updated Daily" datastore resource (open grant
+    # opportunities). Verified live against data.ca.gov CKAN datastore_search.
+    resource_id: 111c8c88-21f6-453c-ae2c-b4785a0624f5
     page_size: 100
     max_pages: 20
 
 fields:
   title:
     selectors:
-      - "dd[data-key='title']"
-      - "dd[data-key='grant_title']"
+      - "dd[data-key='Title']"
     required: true
   agency:
     selectors:
-      - "dd[data-key='agencydept']"
-      - "dd[data-key='agency']"
+      - "dd[data-key='AgencyDept']"
     required: false
   funding_amount:
     selectors:
-      - "dd[data-key='estamounts']"
-      - "dd[data-key='total_estimated_available_funding']"
+      - "dd[data-key='EstAvailFunds']"
+      - "dd[data-key='EstAmounts']"
     required: false
   due_date:
     selectors:
-      - "dd[data-key='applicationdeadline']"
-      - "dd[data-key='close_date']"
+      - "dd[data-key='ApplicationDeadline']"
     required: false
 
 signal_types:
