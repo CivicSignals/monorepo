@@ -1,11 +1,13 @@
 {
-  "signal_types": ["contract_award"],
+  "signal_types": [
+    "contract_award"
+  ],
   "extraction_method": "primary",
   "degraded": false,
   "fields": {
-    "title": "Contract Award — Fleet Vehicle Maintenance",
-    "vendor": "Metro Fleet Services LLC",
-    "award_amount": "1250000",
-    "award_date": "2025-04-30T00:00:00.000"
+    "title": "NYPD FIRE SUPPRESSION SYSTEM INSTALLATIONS AT EXISTING FACILITIES",
+    "vendor": "GEMSTAR CONSTRUCTION CORP",
+    "award_amount": "2798960.00",
+    "contract_id": "8502013PD0002C"
   }
 }
