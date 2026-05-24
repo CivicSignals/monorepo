@@ -3,8 +3,9 @@
 These are pure validation tests — no DB, no I/O — covering:
 
 - the hard gate: a valid candidate parses into its typed payload; a candidate
-  missing a required field, of an unknown type, or with an extra/unknown field is
-  rejected with a :class:`SignalValidationError` that surfaces the error;
+  missing a required field or of an unknown type is rejected with a
+  :class:`SignalValidationError` that surfaces the error, while an extra/unknown
+  field is silently dropped (``extra="ignore"``) rather than rejected;
 - every MVP signal type has a schema with the documented required fields.
 """
 
@@ -79,11 +80,23 @@ def test_none_signal_type_rejected() -> None:
     assert "no signal_type" in exc.value.errors[0]
 
 
-def test_extra_field_rejected() -> None:
-    """extra='forbid' makes a drifting prompt's unknown key a hard error (§13.2)."""
-    with pytest.raises(SignalValidationError) as exc:
-        parse_signal_payload("news_mention", {**_COMMON, "totally_unexpected_field": "x"})
-    assert any("totally_unexpected_field" in e for e in exc.value.errors)
+def test_extra_field_is_dropped_not_rejected() -> None:
+    """extra='ignore' silently drops a drifting prompt's unknown key (doc 19 §6.1).
+
+    The extraction LLM commonly returns superfluous fields (e.g. ``amount_cents`` /
+    ``due_at`` on a ``news_mention``); rather than dead-lettering an otherwise-valid
+    signal over them, the schema now parses cleanly and the unknown key is absent
+    from the validated payload. Required fields + types are still validated strictly
+    (covered by the other tests); prompt drift is caught by E7/QA-7, not here.
+    """
+    payload = parse_signal_payload(
+        "news_mention",
+        {**_COMMON, "totally_unexpected_field": "x", "amount_cents": 999},
+    )
+    assert payload.signal_type is SignalType.NEWS_MENTION
+    dumped = payload.model_dump()
+    assert "totally_unexpected_field" not in dumped
+    assert "amount_cents" not in dumped  # news_mention has no such field → dropped
 
 
 def test_negative_amount_rejected() -> None:
