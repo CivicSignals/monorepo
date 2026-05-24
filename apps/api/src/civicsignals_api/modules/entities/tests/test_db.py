@@ -296,6 +296,56 @@ async def test_geo_hierarchy_and_kind_taxonomy(session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_load_nces_real_format_fixture(session: AsyncSession) -> None:
+    """``load_nces`` parses the REAL CCD directory layout (doc 16 §4), not just the sample.
+
+    The real-format fixture uses the actual CCD header (``ST`` state column,
+    free-text ``UPDATED_STATUS_TEXT``, ~no enrollment/county) — distinct from the
+    original sample fixture's STABBR/TOTAL_STUDENTS. This asserts the loader maps
+    that layout onto entities correctly (state via ST, status mapping, FIPS
+    derivation) and stays idempotent.
+    """
+    fixture = seeding.FIXTURES_DIR / "nces_ccd_real_format_sample.csv"
+    async with session.begin():
+        await seeding.load_kinds(session)
+        count = await seeding.load_nces(session, fixture)
+    assert count == 4
+
+    # State resolved from the real ``ST`` column.
+    enumclaw = await services.resolve_entity_by_identifier(session, "nces_leaid", "5300001")
+    assert enumclaw is not None
+    assert enumclaw.name == "Enumclaw School District"
+    assert enumclaw.type == "school_district"
+    assert enumclaw.state == "WA"
+    assert enumclaw.status == "active"
+    # FIPS state captured from the real FIPST column.
+    assert enumclaw.attributes.get("fips_state") == "53"
+    assert enumclaw.attributes.get("source") == "nces_ccd"
+    # No enrollment column in the directory file -> None, not a crash.
+    assert enumclaw.enrollment is None
+
+    # Closed agency maps to the ``dissolved`` taxonomy status.
+    vader = await services.resolve_entity_by_identifier(session, "nces_leaid", "5399000")
+    assert vader is not None and vader.status == "dissolved"
+    # Close the implicit read transaction before the next write transaction.
+    await session.rollback()
+
+    # Idempotent: a 2nd parse of the same fixture does not duplicate rows.
+    async with session.begin():
+        again = await seeding.load_nces(session, fixture)
+    assert again == 4
+    total = (
+        await session.execute(
+            select(func.count())
+            .select_from(Entity)
+            .where(Entity.attributes["source"].astext == "nces_ccd")
+        )
+    ).scalar_one()
+    await session.rollback()
+    assert int(total) == 4
+
+
+@pytest.mark.asyncio
 async def test_public_routes_list_get_children(session: AsyncSession) -> None:
     """The public read endpoints serve the directory without X-Workspace-Id (C1 req 5).
 
