@@ -29,6 +29,7 @@ scoring via the wiring under test rather than a manual fan-out call.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -42,6 +43,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from civicsignals_api import db as db_module
 from civicsignals_api.db import Base
 from civicsignals_api.llm_gateway import (
     TASK_CLASSIFY,
@@ -351,9 +353,24 @@ async def test_full_pipeline_chain_crawl_to_feed(
     # === Fix #2: drive scoring via the REAL trigger (the score-worker task body) ==
     # NOT a direct score_signal_for_all_workspaces call — this is exactly what the
     # extraction task enqueues onto the `score` queue (signals.score_signal).
+    #
+    # Run the **real** Celery task body (``signals.score_signal``), not a hand-written
+    # shortcut. That body wraps ``_score_signal_async`` in ``asyncio.run`` — exactly
+    # how ``worker_score`` executes it. ``asyncio.run`` can't run inside pytest-asyncio's
+    # already-running loop, and the task opens its session via the app's *global*
+    # ``SessionLocal``/engine (db.py), which would otherwise get pinned to whatever loop
+    # first touched it and then poison the next DB-backed test ("got Future attached to a
+    # different loop" → "Event loop is closed"). So drive it on a clean, dedicated loop in
+    # a worker thread (``asyncio.to_thread`` → fresh ``asyncio.run`` there), then dispose
+    # the global engine so no pooled connection bound to that throwaway loop survives.
+    # Our own assertions below keep using this test's per-fixture ``session`` engine.
     assert result.signal_ids == [signal_id]
-    written = await signals_tasks._score_signal_async(str(signal_id))
+    written = await asyncio.to_thread(signals_tasks.score_signal, str(signal_id))
     assert written == 1, "scoring via the wiring must write one (matching) workspace row"
+
+    # Tear down the global engine the task body opened on its throwaway loop, so the
+    # next DB-backed test's fixture is unaffected (no cross-loop pool reuse).
+    await db_module.engine.dispose()
 
     # === Assert the workspace_score row + feed visibility =========================
     match_scores = (
