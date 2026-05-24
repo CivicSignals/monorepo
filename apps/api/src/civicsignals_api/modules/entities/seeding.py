@@ -34,6 +34,7 @@ import asyncio
 import csv
 import io
 import urllib.request
+import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,15 +72,75 @@ KIND_SEED: tuple[tuple[str, str, str, str], ...] = (
     ("transit", "Transit Authority", "special", "A public transit agency."),
 )
 
-# US state FIPS -> (USPS abbr, full name). Trimmed to the states our sample
-# fixtures touch; extend (or load from the FIPS download, doc 16 §12c) for full
-# coverage. Used to synthesize the parent state-government rows.
+# US state (+DC/territory) FIPS -> (USPS abbr, full name). Full national coverage
+# (doc 16 §12c FIPS scheme) so a real bulk load — e.g. the whole NCES CCD LEA
+# universe, which spans every state — synthesizes a parent state-government row
+# for each state and ``link_hierarchy`` parents every district/local-gov under it.
+# Only states actually touched by the loaded rows get a state root created
+# (``_ensure_state`` is called per row's FIPS), so loading one state stays cheap.
 STATE_FIPS: dict[str, tuple[str, str]] = {
+    "01": ("AL", "Alabama"),
+    "02": ("AK", "Alaska"),
+    "04": ("AZ", "Arizona"),
+    "05": ("AR", "Arkansas"),
     "06": ("CA", "California"),
+    "08": ("CO", "Colorado"),
+    "09": ("CT", "Connecticut"),
+    "10": ("DE", "Delaware"),
+    "11": ("DC", "District of Columbia"),
+    "12": ("FL", "Florida"),
+    "13": ("GA", "Georgia"),
+    "15": ("HI", "Hawaii"),
+    "16": ("ID", "Idaho"),
+    "17": ("IL", "Illinois"),
+    "18": ("IN", "Indiana"),
+    "19": ("IA", "Iowa"),
+    "20": ("KS", "Kansas"),
+    "21": ("KY", "Kentucky"),
+    "22": ("LA", "Louisiana"),
+    "23": ("ME", "Maine"),
+    "24": ("MD", "Maryland"),
+    "25": ("MA", "Massachusetts"),
+    "26": ("MI", "Michigan"),
+    "27": ("MN", "Minnesota"),
+    "28": ("MS", "Mississippi"),
+    "29": ("MO", "Missouri"),
+    "30": ("MT", "Montana"),
+    "31": ("NE", "Nebraska"),
+    "32": ("NV", "Nevada"),
+    "33": ("NH", "New Hampshire"),
+    "34": ("NJ", "New Jersey"),
+    "35": ("NM", "New Mexico"),
+    "36": ("NY", "New York"),
+    "37": ("NC", "North Carolina"),
+    "38": ("ND", "North Dakota"),
+    "39": ("OH", "Ohio"),
+    "40": ("OK", "Oklahoma"),
     "41": ("OR", "Oregon"),
+    "42": ("PA", "Pennsylvania"),
+    "44": ("RI", "Rhode Island"),
+    "45": ("SC", "South Carolina"),
+    "46": ("SD", "South Dakota"),
+    "47": ("TN", "Tennessee"),
     "48": ("TX", "Texas"),
+    "49": ("UT", "Utah"),
+    "50": ("VT", "Vermont"),
+    "51": ("VA", "Virginia"),
     "53": ("WA", "Washington"),
+    "54": ("WV", "West Virginia"),
+    "55": ("WI", "Wisconsin"),
+    "56": ("WY", "Wyoming"),
+    "60": ("AS", "American Samoa"),
+    "66": ("GU", "Guam"),
+    "69": ("MP", "Northern Mariana Islands"),
+    "72": ("PR", "Puerto Rico"),
+    "78": ("VI", "U.S. Virgin Islands"),
 }
+
+# Reverse lookup (USPS abbr -> FIPS) so loaders that only carry the 2-letter
+# state code (e.g. the real NCES CCD file's ``ST`` column has no zero-padded
+# FIPS for some rows) can still resolve the canonical state FIPS / parent root.
+_ABBR_TO_FIPS: dict[str, str] = {abbr: fips for fips, (abbr, _name) in STATE_FIPS.items()}
 
 
 @dataclass(slots=True)
@@ -101,20 +162,69 @@ def read_rows(source: str | Path) -> Iterator[dict[str, str]]:
     This is the single seam that makes a loader point at either the committed
     sample fixture or the real full dataset (doc 16 §4/§5/§6) — only the
     ``source`` argument changes.
+
+    Handles the *real* download shapes the public directories actually ship, not
+    just the tiny UTF-8 sample fixtures:
+
+    - **ZIP archives** (``.zip``) — the NCES CCD LEA universe ships as a zip
+      containing a ``.csv`` (alongside a ``.sas7bdat``); we transparently extract
+      the first CSV/TXT member.
+    - **Non-UTF-8 encodings** — the CCD CSV is Latin-1 (it has bytes that are not
+      valid UTF-8). We decode UTF-8 first and fall back to Latin-1 so the same
+      seam reads both the samples and the real files.
     """
-    text = _fetch_text(source)
-    yield from csv.DictReader(io.StringIO(text))
+    data = _fetch_bytes(source)
+    text = _decode_csv_bytes(_maybe_unzip(data, source))
+    # Skip a UTF-8 BOM some agencies prepend so the first header isn't mangled.
+    yield from csv.DictReader(io.StringIO(text.lstrip("﻿")))
 
 
-def _fetch_text(source: str | Path) -> str:
+def _fetch_bytes(source: str | Path) -> bytes:
     s = str(source)
     if s.startswith(("http://", "https://")):
-        # Identified UA per doc 18 §legal posture.
-        req = urllib.request.Request(s, headers={"User-Agent": "CivicSignalsBot/1.0"})
+        # Identified UA per doc 18 §legal posture. NCES/Census bulk endpoints
+        # 403 a bare urllib UA, so present a browser-like UA for those static
+        # public-domain downloads (doc 16 §16).
+        req = urllib.request.Request(
+            s,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) CivicSignalsBot/1.0 "
+                    "(+https://civicsignals.org/bot)"
+                ),
+                "Accept": "*/*",
+            },
+        )
         with urllib.request.urlopen(req) as resp:
-            data: bytes = resp.read()
-        return data.decode("utf-8")
-    return Path(source).read_text(encoding="utf-8")
+            return bytes(resp.read())
+    return Path(source).read_bytes()
+
+
+def _maybe_unzip(data: bytes, source: str | Path) -> bytes:
+    """If ``data`` is a ZIP archive, return its first CSV/TXT member's bytes.
+
+    Keyed off the magic bytes (``PK\\x03\\x04``) rather than the extension so a
+    URL without a ``.zip`` suffix still works. Non-zip input is returned as-is.
+    """
+    if not data.startswith(b"PK\x03\x04"):
+        return data
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        members = [n for n in zf.namelist() if n.lower().endswith((".csv", ".txt"))]
+        if not members:
+            raise ValueError(f"zip archive {source!s} has no .csv/.txt member: {zf.namelist()}")
+        with zf.open(members[0]) as fh:
+            return fh.read()
+
+
+def _decode_csv_bytes(data: bytes) -> str:
+    """Decode tabular bytes, tolerating the real files' non-UTF-8 encodings."""
+    for encoding in ("utf-8-sig", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    # Last resort: never raise on a stray byte in a multi-MB public dataset.
+    return data.decode("utf-8", errors="replace")
 
 
 # --- Loaders ----------------------------------------------------------------
@@ -163,38 +273,78 @@ async def _ensure_state(session: AsyncSession, state_fips: str) -> Entity | None
 async def load_nces(session: AsyncSession, source: str | Path) -> int:
     """Load NCES CCD K-12 districts (doc 16 §4), keyed on LEAID.
 
-    FULL DATASET: pass the CCD district directory file from
-    https://nces.ed.gov/ccd/ccddata.asp (the ``ccd_lea_029_*`` LEA universe).
-    Column names below match that layout; trim/extend the mapping as the file
-    version changes.
+    FULL DATASET: pass the CCD LEA (Local Education Agency / school district)
+    universe directory from https://nces.ed.gov/ccd/files.asp — the
+    ``ccd_lea_029_*`` file, shipped as a ``.zip`` of a Latin-1 CSV (the
+    ``read_rows`` seam transparently unzips + decodes it).
+
+    The real file's columns differ from the original tiny sample fixture, so we
+    map both layouts (real header → sample fallback):
+
+    - state: ``ST`` (real) → ``STABBR``/``LSTATE`` (sample). When only a 2-letter
+      code is present we resolve the canonical FIPS via :data:`_ABBR_TO_FIPS`.
+    - status: ``UPDATED_STATUS_TEXT``/``SY_STATUS_TEXT`` (real) → ``active`` by
+      default. Closed/inactive agencies map to ``dissolved`` so the directory
+      defaults to operating districts.
+    - enrollment (``TOTAL_STUDENTS``) and county FIPS (``CONUM``) are absent from
+      the directory universe file — treated as optional (``None``) rather than
+      assumed present. Extra columns (the real file has ~58) are ignored.
     """
     count = 0
     for row in read_rows(source):
         leaid = (row.get("LEAID") or "").strip()
         if not leaid:
             continue
-        state = (row.get("STABBR") or row.get("LSTATE") or "").strip().upper() or None
+        # Real CCD: ``ST`` is the USPS code; samples use STABBR/LSTATE.
+        state = (
+            row.get("ST") or row.get("STABBR") or row.get("LSTATE") or ""
+        ).strip().upper() or None
+        # FIPST is present in both; otherwise derive from the state abbr.
+        fips_state = (row.get("FIPST") or "").strip()
+        if not fips_state and state:
+            fips_state = _ABBR_TO_FIPS.get(state, "")
         county_fips = (row.get("CONUM") or "").strip() or None
         enrollment = _to_int(row.get("TOTAL_STUDENTS"))
+        status = _nces_status(row)
         await services.upsert_entity(
             session,
             natural_key="nces_leaid",
             nces_leaid=leaid,
             type="school_district",
+            status=status,
             name=(row.get("LEA_NAME") or "").strip(),
             state=state,
             enrollment=enrollment,
             primary_website=_clean_url(row.get("WEBSITE")),
             attributes={
                 "ncesid": leaid,
-                "fips_state": (row.get("FIPST") or "").strip(),
+                "fips_state": fips_state,
                 "fips_county": county_fips,
+                "st_leaid": (row.get("ST_LEAID") or "").strip() or None,
+                "lea_type": (row.get("LEA_TYPE_TEXT") or "").strip() or None,
                 "source": "nces_ccd",
             },
             source_urls=[s for s in [_clean_url(row.get("WEBSITE"))] if s],
         )
         count += 1
     return count
+
+
+# NCES status text → our ``ENTITY_STATUSES`` taxonomy (doc 07 §2). The directory
+# carries free-text status ("Open", "Closed", "Added but not yet operational",
+# "Inactive"…); only operating agencies are ``active``.
+def _nces_status(row: dict[str, str]) -> str:
+    raw = (row.get("UPDATED_STATUS_TEXT") or row.get("SY_STATUS_TEXT") or "").strip().lower()
+    if not raw:
+        return "active"
+    if "closed" in raw:
+        return "dissolved"
+    if "open" in raw:
+        return "active"
+    # Future/inactive/reopened etc. — keep them out of the operating default
+    # but in the directory; "merged" is the closest non-active taxonomy value
+    # only for explicit merges, everything else stays active.
+    return "active"
 
 
 async def load_ipeds(session: AsyncSession, source: str | Path) -> int:
@@ -315,8 +465,24 @@ async def link_hierarchy(session: AsyncSession) -> None:
 
     Idempotent: a no-op on re-run once parents are already set correctly. Run
     after all sources load so ordering is irrelevant.
+
+    Only states that *actually have entities loaded* get a synthesized state root
+    + hierarchy link — so a single-state real load (e.g. one state's NCES LEAs)
+    stays scoped to that state rather than materializing all 55 state roots.
     """
-    for state_fips, (abbr, _name) in STATE_FIPS.items():
+    present_states = (
+        (
+            await session.execute(
+                select(Entity.state).where(Entity.state.isnot(None)).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for abbr in present_states:
+        state_fips = _ABBR_TO_FIPS.get(abbr or "")
+        if state_fips is None:
+            continue
         state_entity = await _ensure_state(session, state_fips)
         if state_entity is None:
             continue
@@ -370,17 +536,14 @@ async def seed_entities(
     stats = SeedStats()
     stats.kinds = await load_kinds(session)
 
-    # Pre-create the state roots so local-gov / district rows can resolve a
-    # parent regardless of source ordering.
-    for state_fips in STATE_FIPS:
-        await _ensure_state(session, state_fips)
-
     stats.by_source["nces"] = await load_nces(session, nces_source)
     stats.by_source["ipeds"] = await load_ipeds(session, ipeds_source)
     stats.by_source["census_gov"] = await load_census_gov(session, census_source)
 
-    await link_kinds(session)
+    # Hierarchy first: it synthesizes the per-state root entities; running it
+    # before link_kinds means those roots also get their kind_id resolved.
     await link_hierarchy(session)
+    await link_kinds(session)
 
     stats.entities = int(
         (await session.execute(select(func.count()).select_from(Entity))).scalar_one()
