@@ -602,17 +602,18 @@ def test_get_webhook_not_found_404(client: TestClient) -> None:
     assert resp.json()["type"].endswith("/not_found")
 
 
-def test_retry_task_commits_per_delivery_to_release_pool_connections(
+def test_retry_task_commits_before_each_delivery_http(
     monkeypatch: Any,
 ) -> None:
-    """The retry sweep runs each delivery in its own short transaction.
+    """A commit must precede every delivery's HTTP POST.
 
     Under PgBouncer transaction-mode pooling an open transaction pins a pooled
-    server connection (doc 06 §4), so holding one across a whole batch of
-    network-bound deliveries can exhaust the pool and hang every DB-backed
-    request. The task commits after the initial read and after each delivery;
-    this pins that behaviour so a refactor can't regress to one batch-wide
-    transaction held across all the HTTP calls.
+    server connection (doc 06 §4). The subscription read opens a transaction, so
+    the sweep must commit (release the connection) *before* calling the delivery
+    helper that performs the network POST — not just once at the end of the batch.
+    We instrument the (stubbed) delivery to record the commit count at the moment
+    it is invoked and assert a commit preceded every attempt, which would fail if
+    the read transaction were held idle across the HTTP call.
     """
     from civicsignals_api.modules.integrations import tasks as webhook_tasks
 
@@ -644,8 +645,12 @@ def test_retry_task_commits_per_delivery_to_release_pool_connections(
     async def _return(value: Any) -> Any:
         return value
 
-    async def _noop(*_a: Any, **_k: Any) -> None:
-        return None
+    # Record the session's commit count at the instant each delivery's HTTP call
+    # would run, so we can assert the read transaction was already released.
+    commits_at_delivery: list[int] = []
+
+    async def _record_delivery(_session: Any, **_kwargs: Any) -> None:
+        commits_at_delivery.append(session.commits)
 
     monkeypatch.setattr("civicsignals_api.db.SessionLocal", lambda: session)
     monkeypatch.setattr(
@@ -654,12 +659,17 @@ def test_retry_task_commits_per_delivery_to_release_pool_connections(
     monkeypatch.setattr(
         services, "get_webhook_subscription_unscoped", lambda _s, _id: _return(object())
     )
-    monkeypatch.setattr(services, "execute_webhook_delivery", _noop)
+    monkeypatch.setattr(services, "execute_webhook_delivery", _record_delivery)
     monkeypatch.setattr(services, "default_http_client", lambda: _Http())
 
     attempted = asyncio.run(webhook_tasks._retry_failed_webhook_deliveries_async())
 
     assert attempted == 3
-    # 1 commit to release the read txn + 1 per delivery == 4. The point is it is
-    # > 1: not a single batch-wide transaction spanning every HTTP round-trip.
-    assert session.commits == 4
+    assert len(commits_at_delivery) == 3
+    # A commit released the connection before the first HTTP call ...
+    assert commits_at_delivery[0] >= 1
+    # ... and before every subsequent one — strictly increasing (non-decreasing
+    # and all distinct), i.e. not a single batch-wide transaction held open across
+    # all the network round-trips.
+    assert commits_at_delivery == sorted(commits_at_delivery)
+    assert len(set(commits_at_delivery)) == len(commits_at_delivery)
