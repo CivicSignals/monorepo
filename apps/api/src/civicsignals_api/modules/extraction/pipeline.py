@@ -366,6 +366,16 @@ def _normalize_whitespace(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _document_ref(parsed: ParsedDocument) -> DocumentRef:
+    """Build the E8 relevance :class:`DocumentRef` from a parsed document."""
+    return DocumentRef(
+        raw_document_id=str(parsed.raw_document_id),
+        recipe_id=parsed.recipe_id,
+        source=parsed.source_url,
+        text=parsed.text,
+    )
+
+
 async def run_relevance_gate(
     classifier: RelevanceClassifier,
     parsed: ParsedDocument,
@@ -379,17 +389,33 @@ async def run_relevance_gate(
     Thin adapter: builds the E8 :class:`DocumentRef` from the parsed document and
     delegates to the injected classifier, which persists the decision when a
     ``session`` is given. The caller decides whether the verdict passes the funnel
-    (see :func:`verdict_passes`).
+    (see :func:`verdict_passes`). The pipeline passes ``session=None`` here so the
+    relevance LLM call holds no open transaction, then records the decision via
+    :func:`record_relevance_decision` alongside the candidate writes.
     """
-    ref = DocumentRef(
-        raw_document_id=str(parsed.raw_document_id),
-        recipe_id=parsed.recipe_id,
-        source=parsed.source_url,
-        text=parsed.text,
-    )
     return await classifier.classify(
-        ref, prefilter=prefilter, workspace_id=workspace_id, session=session
+        _document_ref(parsed),
+        prefilter=prefilter,
+        workspace_id=workspace_id,
+        session=session,
     )
+
+
+async def record_relevance_decision(
+    classifier: RelevanceClassifier,
+    parsed: ParsedDocument,
+    verdict: RelevanceVerdict,
+    *,
+    session: AsyncSession,
+) -> None:
+    """Persist a relevance verdict computed earlier with no DB session (E8).
+
+    :func:`run_extraction_pipeline` runs the relevance LLM with ``session=None`` so
+    the network call holds no transaction (PgBouncer transaction-mode pooling — doc
+    06 §4), then records the decision here inside the same transaction that stores
+    the candidates, so a retried run never half-writes or double-records it.
+    """
+    await classifier.record_decision(session, _document_ref(parsed), verdict)
 
 
 def verdict_passes(verdict: RelevanceVerdict) -> bool:
@@ -474,6 +500,14 @@ async def extract_candidates(
             error=str(exc),
             exc_info=True,
         )
+
+    # Release the entity-linking reads before the (network-bound) signal-type LLM
+    # call: under PgBouncer transaction-mode pooling an open transaction pins a
+    # pooled connection for the whole call (doc 06 §4). The linking above is
+    # read-only, so committing here loses nothing. No-op when called session-less
+    # (e.g. the stage unit tests, which pass no session and skip entity linking).
+    if session is not None:
+        await session.commit()
 
     # --- Stage 4: signal-type detection (signal_extraction prompt) -----------
     document_text, _truncated = _truncate(parsed.text, MAX_EXTRACT_CHARS)
@@ -955,10 +989,14 @@ async def run_extraction_pipeline(
     """Run the full funnel for one document (doc 19 §1; E1).
 
     fetch -> parse -> relevance gate -> extract -> score -> dedupe -> store -> embed.
-    The caller (the Celery task) owns the transaction *and* the job-status bookkeeping
-    + retry/dead-letter; this function just runs the stages and reports the result.
-    On an irrelevant verdict it short-circuits before any extract call (the cost
-    lever, doc 19 §3.1) and reports ``skipped=True``.
+    The caller (the Celery task) owns the job-status bookkeeping + retry/dead-letter;
+    this function runs the stages and reports the result. It manages its **own**
+    transaction boundaries: every LLM stage runs with no transaction open (so a
+    pooled connection is never pinned across a network call under PgBouncer
+    transaction-mode pooling — doc 06 §4), and the relevance decision + candidate
+    writes commit together in one short, atomic transaction so a retry is
+    all-or-nothing. On an irrelevant verdict it short-circuits before any extract
+    call (the cost lever, doc 19 §3.1) and reports ``skipped=True``.
 
     The score stage (E6, doc 19 §6.2-§6.3) computes each candidate's banded
     confidence using ``confidence_config`` (the recipe-configurable thresholds +
@@ -978,17 +1016,29 @@ async def run_extraction_pipeline(
     gateway = gateway or get_gateway()
     classifier = classifier or RelevanceClassifier(gateway=gateway)
 
+    # Stage 1: fetch + parse. ``fetch_document`` only reads, so commit to release the
+    # pooled DB connection before the network-bound LLM stages. Under PgBouncer
+    # transaction-mode pooling an open transaction pins a server connection for the
+    # whole call (doc 06 §4), and this funnel makes several LLM calls — so each LLM
+    # stage runs with no transaction held, and the DB writes happen in the short
+    # atomic transaction at the end.
     doc, content = await fetch_document(session, storage, raw_document_id)
+    await session.commit()
     parsed = parse_document(doc, content, ocr_backend=ocr_backend)
 
+    # Stage 2: relevance gate. Run the LLM with ``session=None`` (writes nothing,
+    # holds no transaction); the decision is persisted below in the same transaction
+    # as the candidates, so a Celery retry of the task can never double-record it.
     verdict = await run_relevance_gate(
         classifier,
         parsed,
         prefilter=prefilter,
         workspace_id=workspace_id,
-        session=session,
+        session=None,
     )
     if not verdict_passes(verdict):
+        async with session.begin():
+            await record_relevance_decision(classifier, parsed, verdict, session=session)
         return PipelineResult(
             raw_document_id=raw_document_id,
             relevant=verdict.relevant,
@@ -997,6 +1047,9 @@ async def run_extraction_pipeline(
             signal_ids=[],
         )
 
+    # Stages 3-4: entity extraction + signal-type detection (LLM). extract_candidates
+    # releases its entity-linking reads before the signal-type LLM call internally,
+    # so no transaction is held across either network call.
     raw_candidates = await extract_candidates(
         gateway, parsed, workspace_id=workspace_id, session=session
     )
@@ -1014,16 +1067,34 @@ async def run_extraction_pipeline(
             recipe_id=parsed.recipe_id,
             rejected=rejected_count,
         )
-    _rows, signal_ids = await store_candidates(
-        session,
-        job_id=job_id,
-        raw_document_id=raw_document_id,
-        recipe_id=parsed.recipe_id,
-        candidates=survivors,
-        ocr_used=parsed.ocr_used,
-        ocr_truncated=parsed.ocr_truncated,
-    )
-    await embed_signals(session, signal_ids, gateway=gateway, workspace_id=workspace_id)
+    # Stages 5-6: persist the relevance decision + surviving candidates in ONE
+    # transaction (no LLM here) so the write is atomic — a retry is all-or-nothing.
+    async with session.begin():
+        await record_relevance_decision(classifier, parsed, verdict, session=session)
+        _rows, signal_ids = await store_candidates(
+            session,
+            job_id=job_id,
+            raw_document_id=raw_document_id,
+            recipe_id=parsed.recipe_id,
+            candidates=survivors,
+            ocr_used=parsed.ocr_used,
+            ocr_truncated=parsed.ocr_truncated,
+        )
+
+    # Stage 7 (embed, I1): best-effort, and now its own short transaction (no longer
+    # chained onto the whole pipeline). It must never raise — an embed failure must
+    # not fail the job and trigger a retry that re-stores the candidates;
+    # ``backfill_embeddings`` re-attempts NULL vectors instead (doc 19 §12.1).
+    try:
+        await embed_signals(session, signal_ids, gateway=gateway, workspace_id=workspace_id)
+    except Exception:  # best-effort: an embed failure never fails the extraction
+        log.warning(
+            "extraction.embed.unexpected_failure",
+            raw_document_id=str(raw_document_id),
+            signal_ids=[str(s) for s in signal_ids],
+            exc_info=True,
+        )
+        await session.rollback()
     return PipelineResult(
         raw_document_id=raw_document_id,
         relevant=True,

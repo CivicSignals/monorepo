@@ -40,16 +40,40 @@ from civicsignals_api.modules.extraction.relevance import RelevanceClassifier
 from civicsignals_api.modules.ingestion.services import StoredRawDocument
 
 
+class _FakeSessionTransaction:
+    """Async context manager mirroring ``AsyncSession.begin()`` — commits on exit
+    (rolls back if the block raised), recording the call on the owning session.
+    """
+
+    def __init__(self, session: _FakeSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> _FakeSessionTransaction:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        if exc_type is None:
+            await self._session.commit()
+        else:
+            await self._session.rollback()
+        return False
+
+
 class _FakeSession:
     """A minimal stand-in for AsyncSession recording added rows (no DB).
 
-    ``run_extraction_pipeline`` only calls ``add`` + ``flush`` on the session (the
-    relevance-decision record and the candidate rows). ``flush`` assigns ids so
-    the rows look persisted. We do not exercise ``get``/``execute`` here.
+    ``run_extraction_pipeline`` calls ``add`` + ``flush`` (the relevance-decision
+    record and the candidate rows) and manages its own transaction boundaries via
+    ``commit`` / ``rollback`` / ``begin`` — under PgBouncer transaction-mode pooling
+    it must never hold a transaction across an LLM call (doc 06 §4). The transaction
+    methods are no-ops here (no real DB); ``flush`` assigns ids so the rows look
+    persisted. We do not exercise ``get`` / ``execute``.
     """
 
     def __init__(self) -> None:
         self.added: list[object] = []
+        self.commits = 0
+        self.rollbacks = 0
 
     def add(self, obj: object) -> None:
         self.added.append(obj)
@@ -58,6 +82,15 @@ class _FakeSession:
         for obj in self.added:
             if getattr(obj, "id", None) is None and hasattr(obj, "__table__"):
                 obj.id = uuid.uuid4()  # type: ignore[attr-defined]
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def begin(self) -> _FakeSessionTransaction:
+        return _FakeSessionTransaction(self)
 
 
 class _FakeStorage:
@@ -232,6 +265,59 @@ async def test_pipeline_relevant_produces_candidates(
     assert promoted.signal_type == "rfp_posted"  # type: ignore[attr-defined]
     assert promoted.extraction_job_id == job_id  # type: ignore[attr-defined]
     assert promoted.source_candidate_id == candidate_rows[0].id  # type: ignore[attr-defined]
+
+
+async def test_pipeline_does_not_hold_txn_across_llm(
+    _patch_get_raw_document: StoredRawDocument,
+    _stub_promote: list[object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for the PgBouncer transaction-mode pooling fix (doc 06 §4).
+
+    A DB transaction must never be held across an LLM call. The relevance gate must
+    be invoked with ``session=None`` (so its LLM call holds no transaction), and the
+    document read must be committed (the pooled connection released) before it runs.
+    """
+    doc = _patch_get_raw_document
+    gw, _extract_be = _gateway(
+        relevance=json.dumps({"relevant": True, "categories": ["procurement"], "confidence": 0.9}),
+        extract=json.dumps(
+            {
+                "candidates": [
+                    {"signal_type": "rfp_posted", "confidence": 0.8, "fields": {"title": "ERP RFP"}}
+                ]
+            }
+        ),
+    )
+    classifier = RelevanceClassifier(gateway=gw)
+    session = _FakeSession()
+    storage = _FakeStorage(b"RFP for ERP modernization, due 2026-06-01")
+
+    captured: dict[str, object] = {}
+    real_gate = pipeline.run_relevance_gate
+
+    async def _spy_gate(*args: object, **kwargs: object) -> object:
+        captured["relevance_session"] = kwargs.get("session")
+        captured["commits_at_relevance"] = session.commits
+        return await real_gate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "run_relevance_gate", _spy_gate)
+
+    await pipeline.run_extraction_pipeline(
+        session,  # type: ignore[arg-type]
+        storage,  # type: ignore[arg-type]
+        job_id=uuid.uuid4(),
+        raw_document_id=doc.id,
+        classifier=classifier,
+        gateway=gw,
+        prefilter="classifier",
+    )
+
+    # The relevance LLM ran with no session (so it held no transaction) ...
+    assert captured["relevance_session"] is None
+    # ... and the document read was committed (connection released) before it.
+    assert isinstance(captured["commits_at_relevance"], int)
+    assert captured["commits_at_relevance"] >= 1
 
 
 async def test_pipeline_irrelevant_skips_extract(
