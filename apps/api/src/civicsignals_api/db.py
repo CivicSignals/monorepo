@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from civicsignals_api.config import get_settings
 
@@ -26,10 +27,13 @@ class Base(DeclarativeBase):
 _settings = get_settings()
 
 # Pooling is handled by PgBouncer (transaction mode), so disable SQLAlchemy's
-# own pooling on the app side to avoid double-pooling surprises.
+# own pooling on the app side to avoid double-pooling surprises. NullPool is also
+# what makes the engine safe to reuse across the per-task event loops that Celery
+# workers create (each task does its own ``asyncio.run``): a cached pool would bind
+# connections to a closed loop → "got Future attached to a different loop".
 engine = create_async_engine(
     _settings.database_url,
-    pool_pre_ping=True,
+    poolclass=NullPool,
     echo=False,
 )
 

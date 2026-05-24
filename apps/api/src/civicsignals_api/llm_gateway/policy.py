@@ -38,12 +38,15 @@ KNOWN_PROVIDERS: frozenset[str] = frozenset({"anthropic", "openai", "ollama"})
 # smart_search_summary uses Haiku (not Sonnet) because it is latency-sensitive
 # (user waits) and the synthesis is short — quality/cost balance favours Haiku.
 DEFAULT_TASK_MODELS: dict[str, ModelChoice] = {
-    TASK_CLASSIFY: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
-    TASK_EXTRACTION: ModelChoice("anthropic", "claude-3-5-sonnet-latest"),
-    TASK_SUMMARY: ModelChoice("anthropic", "claude-3-5-sonnet-latest"),
-    TASK_TRANSLATE: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
-    TASK_SMART_SEARCH_REWRITE: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
-    TASK_SMART_SEARCH_SUMMARY: ModelChoice("anthropic", "claude-3-5-haiku-latest"),
+    # Current Claude 4.x model IDs (the 3.5 family these shipped with is retired —
+    # Anthropic returns 404 for claude-3-5-*-latest). Cheap Haiku-class for the
+    # relevance gate / rewrites; Sonnet-class for extraction + summarization.
+    TASK_CLASSIFY: ModelChoice("anthropic", "claude-haiku-4-5-20251001"),
+    TASK_EXTRACTION: ModelChoice("anthropic", "claude-sonnet-4-6"),
+    TASK_SUMMARY: ModelChoice("anthropic", "claude-sonnet-4-6"),
+    TASK_TRANSLATE: ModelChoice("anthropic", "claude-haiku-4-5-20251001"),
+    TASK_SMART_SEARCH_REWRITE: ModelChoice("anthropic", "claude-haiku-4-5-20251001"),
+    TASK_SMART_SEARCH_SUMMARY: ModelChoice("anthropic", "claude-haiku-4-5-20251001"),
 }
 
 

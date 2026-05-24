@@ -86,11 +86,14 @@ class SignalPayload(BaseModel):
 
     ``title`` and ``summary`` are required for *all* signal types: the feed shows
     them and keyword scoring (doc 14 §6.2) runs over them, so a signal without
-    either is not useful and is rejected. ``extra="forbid"`` makes an unexpected
-    field from a drifting prompt a hard validation error (doc 19 §13.2).
+    either is not useful and is rejected. ``extra="ignore"`` drops superfluous
+    keys the extraction LLM commonly returns (e.g. ``amount_cents``/``due_at`` on a
+    ``news_mention``) rather than dead-lettering an otherwise-valid signal over
+    them; required fields + types are still validated strictly. Prompt drift is
+    caught by drift metrics (E7) + quality sampling (QA-7), not by hard-failing here.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     signal_type: SignalType
     title: str = Field(min_length=1, max_length=500)
