@@ -2,6 +2,7 @@
 // island (AuthNav, B1); the rest stays a server component.
 import Link from "next/link";
 import { AuthNav } from "@/components/auth/auth-nav";
+import { AppNav } from "@/components/app-nav";
 
 // Internal routes that exist in the App Router.
 const INTERNAL_LINKS = [
@@ -31,6 +32,8 @@ export function SiteHeader() {
         </Link>
 
         <ul className="flex items-center gap-1" role="list">
+          {/* Authed-app primary nav (Feed/Pipeline/…); renders nothing signed out. */}
+          <AppNav />
           {INTERNAL_LINKS.map(({ href, label }) => (
             <li key={href}>
               <Link

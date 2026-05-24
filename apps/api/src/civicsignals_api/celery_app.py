@@ -119,11 +119,22 @@ celery_app.conf.beat_schedule = {
     },
 }
 
-# Import module tasks so Celery registers them (filled in by later epics).
-celery_app.autodiscover_tasks(
-    packages=["civicsignals_api.modules"],
-    related_name="tasks",
-)
+# Import module tasks so Celery registers them. autodiscover looks for a
+# ``tasks`` submodule under each package it's given — so we must pass each
+# *module* package (``civicsignals_api.modules.<name>``), NOT the parent
+# ``civicsignals_api.modules`` (which has no ``tasks`` submodule and would
+# register nothing — leaving every enqueued task "unregistered"). Enumerate the
+# module subpackages dynamically so new modules are picked up automatically;
+# autodiscover silently skips any without a ``tasks.py``.
+import pkgutil  # noqa: E402
+
+from civicsignals_api import modules as _modules_pkg  # noqa: E402
+
+_task_packages = [
+    f"civicsignals_api.modules.{m.name}"
+    for m in pkgutil.iter_modules(_modules_pkg.__path__)
+]
+celery_app.autodiscover_tasks(packages=_task_packages, related_name="tasks")
 
 # Register the telemetry ping task (O6).  Done here, after autodiscover, so
 # the celery_app object is fully configured before the task is attached.

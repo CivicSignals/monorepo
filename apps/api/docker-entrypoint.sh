@@ -60,7 +60,9 @@ case "$PROC" in
     ;;
   scheduler)
     # Leader-elected singleton (doc 18 §6.1). Redis lock arrives with D14.
-    exec celery -A "$CELERY_APP" beat
+    # Write beat's schedule DB to a writable path: the process runs as non-root
+    # appuser and /app is a root-owned bind mount in dev (Errno 13 otherwise).
+    exec celery -A "$CELERY_APP" beat --schedule "${CELERYBEAT_SCHEDULE:-/tmp/celerybeat-schedule}"
     ;;
   init)
     # One-shot init for self-hosted deployments (TODO O2):

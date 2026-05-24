@@ -19,10 +19,29 @@ x-api-image: &api-image
   build:
     context: ../apps/api
     dockerfile: Dockerfile
+    # Build the lean `final` stage — NOT the Dockerfile's last stage (`worker`,
+    # which runs `playwright install` and is only for the headless ingest worker).
+    # `extraction` installs the LLM SDKs (anthropic/openai) the extract worker +
+    # smart-search need.
+    target: final
+    args:
+      EXTRAS: extraction
   env_file:
     - ../.env
+  environment:
+    # The recipes/ and recipe-schema live at the repo root — outside the apps/api
+    # build context/image — so mount them and point the runner at them (otherwise
+    # recipes_dir()/recipe_schema_dir() can't find the repo root in the container).
+    RECIPES_DIR: /recipes
+    RECIPE_SCHEMA_DIR: /recipe-schema
   volumes:
     - ../apps/api:/app
+    # Anonymous volume so the image's container-built venv at /app/.venv is NOT
+    # shadowed by a host-built apps/api/.venv (whose scripts have host-absolute
+    # shebangs the container can't execute → exit 126 "bad interpreter").
+    - /app/.venv
+    - ../recipes:/recipes:ro
+    - ../packages/recipe-schema/schema:/recipe-schema:ro
   restart: unless-stopped
 
 # Backing-service dependency block reused by every long-running API process.
@@ -63,6 +82,9 @@ services:
       DB_USER: ${POSTGRES_USER:-civic}
       DB_PASSWORD: ${POSTGRES_PASSWORD:-civic}
       DB_NAME: ${POSTGRES_DB:-civicsignals}
+      # edoburu/pgbouncer defaults to listening on 5432; the rest of the stack
+      # (healthcheck, port map, app DATABASE_URL=pgbouncer:6432) expects 6432.
+      LISTEN_PORT: "6432"
       POOL_MODE: transaction
       AUTH_TYPE: scram-sha-256
       MAX_CLIENT_CONN: "1000"
@@ -73,9 +95,9 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      # The image ships no psql/nc, but a TCP open on 6432 is enough to know the
-      # pooler is accepting connections before app processes dial in.
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/6432' || exit 1"]
+      # edoburu/pgbouncer ships `nc` (but NOT bash) — a TCP open on 6432 confirms
+      # the pooler is accepting connections before app processes dial in.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -183,7 +205,11 @@ services:
     build:
       context: ../apps/api
       dockerfile: Dockerfile
-      target: worker
+      # Headless browsing (D2/D9) is deferred — build the lean `final` stage (no
+      # Chromium download). The `ingestion` extra provides feedparser/httpx/bs4 for
+      # RSS/HTTP/Socrata/etc. To enable browser recipes later, switch to
+      # `target: worker` (which also runs `playwright install --with-deps chromium`).
+      target: final
       args:
         EXTRAS: ingestion
     command: ["worker_ingest"]
@@ -209,7 +235,9 @@ services:
     working_dir: /repo
     command: ["sh", "-c", "corepack enable && pnpm install && pnpm --filter @civicsignals/web dev"]
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+      # Overridable so the web can be exposed publicly (e.g. via Tailscale Funnel):
+      # set NEXT_PUBLIC_API_BASE_URL in .env to the public same-origin API URL.
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
     ports:
       - "3000:3000"
     volumes:
