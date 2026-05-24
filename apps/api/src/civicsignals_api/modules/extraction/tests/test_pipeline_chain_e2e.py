@@ -29,7 +29,6 @@ scoring via the wiring under test rather than a manual fan-out call.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import uuid
@@ -129,10 +128,18 @@ async def session() -> AsyncIterator[AsyncSession]:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         await conn.run_sync(Base.metadata.create_all)
+    # Rebind the global SessionLocal to this test-loop engine so task bodies that
+    # open their own session via SessionLocal (e.g. signals.tasks._score_signal_async)
+    # run on THIS event loop. Otherwise the import-time global engine is pinned to a
+    # foreign loop and the awaited task body raises "attached to a different loop"
+    # (mirrors the working pattern in test_drift_evaluation.py).
+    original_bind = db_module.SessionLocal.kw["bind"]
+    db_module.SessionLocal.configure(bind=engine)
     try:
         async with AsyncSession(engine, expire_on_commit=False) as sess:
             yield sess
     finally:
+        db_module.SessionLocal.configure(bind=original_bind)
         async with engine.begin() as conn:
             await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
             await conn.execute(text("CREATE SCHEMA public"))
@@ -351,26 +358,17 @@ async def test_full_pipeline_chain_crawl_to_feed(
     signal_id = signal.id
 
     # === Fix #2: drive scoring via the REAL trigger (the score-worker task body) ==
-    # NOT a direct score_signal_for_all_workspaces call — this is exactly what the
-    # extraction task enqueues onto the `score` queue (signals.score_signal).
-    #
-    # Run the **real** Celery task body (``signals.score_signal``), not a hand-written
-    # shortcut. That body wraps ``_score_signal_async`` in ``asyncio.run`` — exactly
-    # how ``worker_score`` executes it. ``asyncio.run`` can't run inside pytest-asyncio's
-    # already-running loop, and the task opens its session via the app's *global*
-    # ``SessionLocal``/engine (db.py), which would otherwise get pinned to whatever loop
-    # first touched it and then poison the next DB-backed test ("got Future attached to a
-    # different loop" → "Event loop is closed"). So drive it on a clean, dedicated loop in
-    # a worker thread (``asyncio.to_thread`` → fresh ``asyncio.run`` there), then dispose
-    # the global engine so no pooled connection bound to that throwaway loop survives.
-    # Our own assertions below keep using this test's per-fixture ``session`` engine.
+    # ``_score_signal_async`` is the exact async body that ``signals.score_signal``
+    # (enqueued by the extraction task onto the ``score`` queue) runs under
+    # ``asyncio.run`` in ``worker_score`` — NOT a hand-written
+    # ``score_signal_for_all_workspaces`` shortcut. We await it directly on the test's
+    # loop (the established pattern in test_drift_evaluation.py): the ``session``
+    # fixture has rebound the global ``SessionLocal`` to this test-loop engine, so the
+    # task body's ``SessionLocal()`` runs on the same loop (no "different loop" /
+    # "event loop is closed" cross-loop poisoning).
     assert result.signal_ids == [signal_id]
-    written = await asyncio.to_thread(signals_tasks.score_signal, str(signal_id))
+    written = await signals_tasks._score_signal_async(str(signal_id))
     assert written == 1, "scoring via the wiring must write one (matching) workspace row"
-
-    # Tear down the global engine the task body opened on its throwaway loop, so the
-    # next DB-backed test's fixture is unaffected (no cross-loop pool reuse).
-    await db_module.engine.dispose()
 
     # === Assert the workspace_score row + feed visibility =========================
     match_scores = (
