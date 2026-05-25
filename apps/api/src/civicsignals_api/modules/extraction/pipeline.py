@@ -366,6 +366,16 @@ def _normalize_whitespace(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _document_ref(parsed: ParsedDocument) -> DocumentRef:
+    """Build the E8 relevance :class:`DocumentRef` from a parsed document."""
+    return DocumentRef(
+        raw_document_id=str(parsed.raw_document_id),
+        recipe_id=parsed.recipe_id,
+        source=parsed.source_url,
+        text=parsed.text,
+    )
+
+
 async def run_relevance_gate(
     classifier: RelevanceClassifier,
     parsed: ParsedDocument,
@@ -379,17 +389,33 @@ async def run_relevance_gate(
     Thin adapter: builds the E8 :class:`DocumentRef` from the parsed document and
     delegates to the injected classifier, which persists the decision when a
     ``session`` is given. The caller decides whether the verdict passes the funnel
-    (see :func:`verdict_passes`).
+    (see :func:`verdict_passes`). The pipeline passes ``session=None`` here so the
+    relevance LLM call holds no open transaction, then records the decision via
+    :func:`record_relevance_decision` alongside the candidate writes.
     """
-    ref = DocumentRef(
-        raw_document_id=str(parsed.raw_document_id),
-        recipe_id=parsed.recipe_id,
-        source=parsed.source_url,
-        text=parsed.text,
-    )
     return await classifier.classify(
-        ref, prefilter=prefilter, workspace_id=workspace_id, session=session
+        _document_ref(parsed),
+        prefilter=prefilter,
+        workspace_id=workspace_id,
+        session=session,
     )
+
+
+async def record_relevance_decision(
+    classifier: RelevanceClassifier,
+    parsed: ParsedDocument,
+    verdict: RelevanceVerdict,
+    *,
+    session: AsyncSession,
+) -> None:
+    """Persist a relevance verdict computed earlier with no DB session (E8).
+
+    :func:`run_extraction_pipeline` runs the relevance LLM with ``session=None`` so
+    the network call holds no transaction (PgBouncer transaction-mode pooling — doc
+    06 §4), then records the decision here inside the same transaction that stores
+    the candidates, so a retried run never half-writes or double-records it.
+    """
+    await classifier.record_decision(session, _document_ref(parsed), verdict)
 
 
 def verdict_passes(verdict: RelevanceVerdict) -> bool:
@@ -474,6 +500,14 @@ async def extract_candidates(
             error=str(exc),
             exc_info=True,
         )
+
+    # Release the entity-linking reads before the (network-bound) signal-type LLM
+    # call: under PgBouncer transaction-mode pooling an open transaction pins a
+    # pooled connection for the whole call (doc 06 §4). The linking above is
+    # read-only, so committing here loses nothing. No-op when called session-less
+    # (e.g. the stage unit tests, which pass no session and skip entity linking).
+    if session is not None:
+        await session.commit()
 
     # --- Stage 4: signal-type detection (signal_extraction prompt) -----------
     document_text, _truncated = _truncate(parsed.text, MAX_EXTRACT_CHARS)
@@ -759,6 +793,7 @@ async def store_candidates(
     raw_document_id: uuid.UUID,
     recipe_id: str,
     candidates: list[CandidateRecord],
+    candidate_embeddings: list[list[float] | None] | None = None,
     ocr_used: bool = False,
     ocr_truncated: bool = False,
 ) -> tuple[list[ExtractionCandidate], list[uuid.UUID]]:
@@ -814,7 +849,7 @@ async def store_candidates(
 
     signal_ids: list[uuid.UUID] = []
     seen_signal_ids: set[uuid.UUID] = set()
-    for candidate, row in zip(candidates, rows, strict=True):
+    for index, (candidate, row) in enumerate(zip(candidates, rows, strict=True)):
         candidate_input = CandidateInput(
             signal_type=candidate.signal_type,
             # ``entity_name`` is a *convenience* key the extract stage injects into
@@ -840,6 +875,11 @@ async def store_candidates(
             band=_coerce_band(candidate.band),
             extraction_job_id=job_id,
             source_candidate_id=row.id,
+            # Vector embedded off-transaction by the orchestrator (doc 06 §4); stamped
+            # onto the new signal so fuzzy dedupe doesn't embed inside this txn.
+            precomputed_embedding=(
+                candidate_embeddings[index] if candidate_embeddings is not None else None
+            ),
         )
         try:
             signal = await signals_services.promote_candidate_to_signal(session, candidate_input)
@@ -884,6 +924,55 @@ async def embed_signals(
     return await signals_services.embed_signals(
         session, signal_ids, gateway=gateway, workspace_id=workspace_id
     )
+
+
+async def _precompute_candidate_embeddings(
+    candidates: list[CandidateRecord],
+    *,
+    gateway: LLMGateway,
+    workspace_id: str | None,
+) -> list[list[float] | None]:
+    """Embed each surviving candidate's signal text up front, off any transaction.
+
+    Returns one vector per candidate, aligned with ``candidates`` (``None`` where the
+    candidate fails the strict schema gate — it will be rejected at store — or where
+    the batch embed call fails). :func:`store_candidates` stamps each non-``None``
+    vector onto the new signal row, so neither fuzzy dedupe (doc 19 §7.4) nor the
+    smart-search embed runs the gateway *inside* the persist transaction (doc 06 §4).
+
+    The text is built from the validated payload (``parse_signal_payload`` is pure —
+    no DB), exactly as ``embedding_text_for_signal`` builds it for the stored row, so
+    the precomputed vector is identical to the on-demand one.
+    """
+    texts: list[str] = []
+    text_for_index: list[int] = []  # candidate index for each text in ``texts``
+    for index, candidate in enumerate(candidates):
+        try:
+            payload = signals_services.parse_signal_payload(
+                candidate.signal_type, candidate.fields
+            )
+        except SignalValidationError:
+            continue  # invalid candidate → no signal will be stored → no embedding
+        text = signals_services.build_embedding_text(
+            title=payload.title,
+            summary=payload.summary,
+            details=payload.model_dump(mode="json"),
+        )
+        if text.strip():
+            texts.append(text)
+            text_for_index.append(index)
+
+    embeddings: list[list[float] | None] = [None] * len(candidates)
+    if not texts:
+        return embeddings
+    vectors = await signals_services.embed_texts(
+        texts, gateway=gateway, workspace_id=workspace_id
+    )
+    if vectors is None:
+        return embeddings  # best-effort: leave NULL; backfill_embeddings re-attempts
+    for index, vector in zip(text_for_index, vectors, strict=True):
+        embeddings[index] = vector
+    return embeddings
 
 
 def _fields_for_payload(fields: dict[str, object]) -> dict[str, object]:
@@ -955,10 +1044,14 @@ async def run_extraction_pipeline(
     """Run the full funnel for one document (doc 19 §1; E1).
 
     fetch -> parse -> relevance gate -> extract -> score -> dedupe -> store -> embed.
-    The caller (the Celery task) owns the transaction *and* the job-status bookkeeping
-    + retry/dead-letter; this function just runs the stages and reports the result.
-    On an irrelevant verdict it short-circuits before any extract call (the cost
-    lever, doc 19 §3.1) and reports ``skipped=True``.
+    The caller (the Celery task) owns the job-status bookkeeping + retry/dead-letter;
+    this function runs the stages and reports the result. It manages its **own**
+    transaction boundaries: every LLM stage runs with no transaction open (so a
+    pooled connection is never pinned across a network call under PgBouncer
+    transaction-mode pooling — doc 06 §4), and the relevance decision + candidate
+    writes commit together in one short, atomic transaction so a retry is
+    all-or-nothing. On an irrelevant verdict it short-circuits before any extract
+    call (the cost lever, doc 19 §3.1) and reports ``skipped=True``.
 
     The score stage (E6, doc 19 §6.2-§6.3) computes each candidate's banded
     confidence using ``confidence_config`` (the recipe-configurable thresholds +
@@ -966,10 +1059,13 @@ async def run_extraction_pipeline(
     that lands in the ``rejected`` band is **dropped before store** — it is not
     surfaced (doc 19 §6.3) — so ``result.candidates`` is the survivors only.
 
-    The embed step (I1) runs after store: each promoted signal is embedded into its
-    ``signals_signal.vector_embedding`` pgvector column for fuzzy dedupe (doc 19 §7.4)
-    + smart search (doc 14 §6.2). It is **best-effort** — an embed failure is logged
-    and the column left NULL (the signal is never lost) — so it never fails the job.
+    The embed step (I1) runs **before** store: each surviving candidate's signal text
+    is embedded off-transaction and the vector is stamped onto its new
+    ``signals_signal.vector_embedding`` row at creation, powering fuzzy dedupe
+    (doc 19 §7.4) + smart search (doc 14 §6.2). Embedding before store keeps the
+    network call off an open PgBouncer connection (doc 06 §4). It is **best-effort** —
+    a failed batch leaves the vectors NULL (the signal is never lost) and
+    ``backfill_embeddings`` re-attempts — so it never fails the job.
 
     ``ocr_backend`` is injected for tests (overrides ``OCR_BACKEND`` env var) and
     forwarded to :func:`parse_document` so tests can use :class:`~.ocr.FakeOcrBackend`
@@ -978,17 +1074,30 @@ async def run_extraction_pipeline(
     gateway = gateway or get_gateway()
     classifier = classifier or RelevanceClassifier(gateway=gateway)
 
+    # Stage 1: fetch + parse. ``fetch_document`` only reads, so commit to release the
+    # pooled DB connection before the network-bound LLM stages. Under PgBouncer
+    # transaction-mode pooling an open transaction pins a server connection for the
+    # whole call (doc 06 §4), and this funnel makes several LLM calls — so each LLM
+    # stage runs with no transaction held, and the DB writes happen in the short
+    # atomic transaction at the end.
     doc, content = await fetch_document(session, storage, raw_document_id)
+    await session.commit()
     parsed = parse_document(doc, content, ocr_backend=ocr_backend)
 
+    # Stage 2: relevance gate. Run the LLM with ``session=None`` (writes nothing,
+    # holds no transaction); the decision is persisted below in the same transaction
+    # as the candidates, so a Celery retry of the task can never double-record it.
     verdict = await run_relevance_gate(
         classifier,
         parsed,
         prefilter=prefilter,
         workspace_id=workspace_id,
-        session=session,
+        session=None,
     )
     if not verdict_passes(verdict):
+        # Record the (negative) decision; flushed, not committed — the caller commits
+        # it together with the job-status update so the run stays atomic.
+        await record_relevance_decision(classifier, parsed, verdict, session=session)
         return PipelineResult(
             raw_document_id=raw_document_id,
             relevant=verdict.relevant,
@@ -997,6 +1106,9 @@ async def run_extraction_pipeline(
             signal_ids=[],
         )
 
+    # Stages 3-4: entity extraction + signal-type detection (LLM). extract_candidates
+    # releases its entity-linking reads before the signal-type LLM call internally,
+    # so no transaction is held across either network call.
     raw_candidates = await extract_candidates(
         gateway, parsed, workspace_id=workspace_id, session=session
     )
@@ -1014,16 +1126,31 @@ async def run_extraction_pipeline(
             recipe_id=parsed.recipe_id,
             rejected=rejected_count,
         )
+    # Stage 7 (embed, I1) is pulled *ahead* of store: embed the survivors now, off
+    # any open transaction (doc 06 §4), so the store stage can stamp each vector onto
+    # its new signal row. That keeps both the fuzzy-dedupe ANN embed (doc 19 §7.4) and
+    # the smart-search vector (doc 14 §6.2) off the transaction — no in-txn embed. The
+    # batch call is best-effort: a failure leaves the vectors NULL and
+    # ``backfill_embeddings`` fills them in later (doc 19 §12.1).
+    candidate_embeddings = await _precompute_candidate_embeddings(
+        survivors, gateway=gateway, workspace_id=workspace_id
+    )
+
+    # Stages 5-6: persist the relevance decision + surviving candidates (with their
+    # precomputed vectors). Flushed, not committed — the caller (the Celery task)
+    # commits once together with the job-status update, so the whole run is atomic:
+    # a retry is all-or-nothing and never half-writes or double-records (no LLM here).
+    await record_relevance_decision(classifier, parsed, verdict, session=session)
     _rows, signal_ids = await store_candidates(
         session,
         job_id=job_id,
         raw_document_id=raw_document_id,
         recipe_id=parsed.recipe_id,
         candidates=survivors,
+        candidate_embeddings=candidate_embeddings,
         ocr_used=parsed.ocr_used,
         ocr_truncated=parsed.ocr_truncated,
     )
-    await embed_signals(session, signal_ids, gateway=gateway, workspace_id=workspace_id)
     return PipelineResult(
         raw_document_id=raw_document_id,
         relevant=True,

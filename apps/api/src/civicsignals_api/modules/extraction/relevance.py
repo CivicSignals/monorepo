@@ -209,7 +209,7 @@ class RelevanceClassifier:
             verdict = await self._classify_with_llm(doc, workspace_id=workspace_id)
 
         if session is not None:
-            await self._record(session, doc, verdict)
+            await self.record_decision(session, doc, verdict)
         return verdict
 
     def _assume_relevant_verdict(self) -> RelevanceVerdict:
@@ -273,9 +273,17 @@ class RelevanceClassifier:
             truncated=truncated,
         )
 
-    async def _record(
+    async def record_decision(
         self, session: AsyncSession, doc: DocumentRef, verdict: RelevanceVerdict
     ) -> RelevanceDecision:
+        """Persist a relevance verdict (doc 19 §3.4).
+
+        Public so the extraction pipeline can run the relevance LLM with no DB
+        session (``classify(session=None)`` — keeping the network call off an open
+        transaction under PgBouncer transaction-mode pooling, doc 06 §4) and then
+        record the decision inside the same transaction that stores the candidates.
+        Flushes (not commits) so the caller controls the transaction boundary.
+        """
         row = RelevanceDecision(
             raw_document_id=doc.raw_document_id,
             recipe_id=doc.recipe_id,

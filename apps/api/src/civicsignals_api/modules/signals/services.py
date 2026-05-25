@@ -64,6 +64,7 @@ from .embedding import (
     backfill_embeddings,
     build_embedding_text,
     embed_signals,
+    embed_texts,
     embedding_text_for_signal,
 )
 from .fuzzy_dedupe import (
@@ -211,6 +212,12 @@ class CandidateInput:
     extraction_job_id: uuid.UUID | None = None
     source_candidate_id: uuid.UUID | None = None
     extra_raw_document_ids: list[uuid.UUID] = field(default_factory=list)
+    # Precomputed signal embedding (I1/E10). When set, :func:`store_signal` stamps it
+    # onto the new signal row at creation, so fuzzy dedupe (doc 19 §7.4) uses it
+    # instead of embedding on demand *inside* the transaction — keeping the embed
+    # network call off an open PgBouncer connection (doc 06 §4). ``None`` ⇒ on-demand
+    # embedding (a backfill / non-pipeline caller that didn't precompute).
+    precomputed_embedding: list[float] | None = None
 
 
 async def promote_candidate_to_signal(
@@ -324,6 +331,11 @@ async def store_signal(
         status=SIGNAL_STATUS_PENDING_REVIEW if review else SIGNAL_STATUS_NEW,
         is_degraded=degraded,
         review_required=review,
+        # Precomputed by the extraction pipeline off-transaction (doc 06 §4). When
+        # present, the fuzzy-dedupe path below reuses it instead of embedding the
+        # row on demand inside this transaction; left NULL, the on-demand embed
+        # still runs (a backfill / non-pipeline caller).
+        vector_embedding=candidate.precomputed_embedding,
     )
     session.add(row)
     await session.flush()  # assign id before fuzzy path needs it
@@ -2127,6 +2139,7 @@ __all__ = [
     "dedupe_key_for_candidate",
     "derive_signal_type_overrides",
     "embed_signals",
+    "embed_texts",
     "embedding_text_for_signal",
     "encode_cursor",
     "feedback_counts_by_signal_type",
