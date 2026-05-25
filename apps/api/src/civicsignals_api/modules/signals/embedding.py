@@ -175,6 +175,39 @@ async def embed_signals(
     return embedded
 
 
+async def embed_texts(
+    texts: list[str],
+    *,
+    gateway: LLMGateway | None = None,
+    workspace_id: str | None = None,
+) -> list[list[float]] | None:
+    """Embed a batch of texts via the gateway, with **no database access** (I1).
+
+    Returns one vector per input text (same order), or ``None`` if the gateway call
+    fails or the returned dimension doesn't match :data:`EMBEDDING_DIM` — best-effort,
+    callers leave the vectors NULL and ``backfill_embeddings`` fills them in later.
+
+    Because it touches no session, it is safe to call with no open transaction: the
+    extraction pipeline uses it to precompute a signal's embedding *before* opening
+    its persist transaction, so the embed network round-trip never pins a PgBouncer
+    server connection (transaction-mode pooling — doc 06 §4).
+    """
+    if not texts:
+        return []
+    gateway = gateway or get_gateway()
+    try:
+        result = await gateway.embed(texts, workspace_id=workspace_id)
+    except LLMError as exc:
+        log.warning("signals.embed_texts.failed", count=len(texts), error=str(exc))
+        return None
+    if result.dim != EMBEDDING_DIM:
+        log.warning(
+            "signals.embed_texts.dim_mismatch", got=result.dim, expected=EMBEDDING_DIM
+        )
+        return None
+    return [list(v) for v in result.vectors]
+
+
 async def backfill_embeddings(
     session: AsyncSession,
     *,

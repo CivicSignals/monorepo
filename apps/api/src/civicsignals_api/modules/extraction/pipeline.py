@@ -793,6 +793,7 @@ async def store_candidates(
     raw_document_id: uuid.UUID,
     recipe_id: str,
     candidates: list[CandidateRecord],
+    candidate_embeddings: list[list[float] | None] | None = None,
     ocr_used: bool = False,
     ocr_truncated: bool = False,
 ) -> tuple[list[ExtractionCandidate], list[uuid.UUID]]:
@@ -848,7 +849,7 @@ async def store_candidates(
 
     signal_ids: list[uuid.UUID] = []
     seen_signal_ids: set[uuid.UUID] = set()
-    for candidate, row in zip(candidates, rows, strict=True):
+    for index, (candidate, row) in enumerate(zip(candidates, rows, strict=True)):
         candidate_input = CandidateInput(
             signal_type=candidate.signal_type,
             # ``entity_name`` is a *convenience* key the extract stage injects into
@@ -874,6 +875,11 @@ async def store_candidates(
             band=_coerce_band(candidate.band),
             extraction_job_id=job_id,
             source_candidate_id=row.id,
+            # Vector embedded off-transaction by the orchestrator (doc 06 §4); stamped
+            # onto the new signal so fuzzy dedupe doesn't embed inside this txn.
+            precomputed_embedding=(
+                candidate_embeddings[index] if candidate_embeddings is not None else None
+            ),
         )
         try:
             signal = await signals_services.promote_candidate_to_signal(session, candidate_input)
@@ -918,6 +924,55 @@ async def embed_signals(
     return await signals_services.embed_signals(
         session, signal_ids, gateway=gateway, workspace_id=workspace_id
     )
+
+
+async def _precompute_candidate_embeddings(
+    candidates: list[CandidateRecord],
+    *,
+    gateway: LLMGateway,
+    workspace_id: str | None,
+) -> list[list[float] | None]:
+    """Embed each surviving candidate's signal text up front, off any transaction.
+
+    Returns one vector per candidate, aligned with ``candidates`` (``None`` where the
+    candidate fails the strict schema gate — it will be rejected at store — or where
+    the batch embed call fails). :func:`store_candidates` stamps each non-``None``
+    vector onto the new signal row, so neither fuzzy dedupe (doc 19 §7.4) nor the
+    smart-search embed runs the gateway *inside* the persist transaction (doc 06 §4).
+
+    The text is built from the validated payload (``parse_signal_payload`` is pure —
+    no DB), exactly as ``embedding_text_for_signal`` builds it for the stored row, so
+    the precomputed vector is identical to the on-demand one.
+    """
+    texts: list[str] = []
+    text_for_index: list[int] = []  # candidate index for each text in ``texts``
+    for index, candidate in enumerate(candidates):
+        try:
+            payload = signals_services.parse_signal_payload(
+                candidate.signal_type, candidate.fields
+            )
+        except SignalValidationError:
+            continue  # invalid candidate → no signal will be stored → no embedding
+        text = signals_services.build_embedding_text(
+            title=payload.title,
+            summary=payload.summary,
+            details=payload.model_dump(mode="json"),
+        )
+        if text.strip():
+            texts.append(text)
+            text_for_index.append(index)
+
+    embeddings: list[list[float] | None] = [None] * len(candidates)
+    if not texts:
+        return embeddings
+    vectors = await signals_services.embed_texts(
+        texts, gateway=gateway, workspace_id=workspace_id
+    )
+    if vectors is None:
+        return embeddings  # best-effort: leave NULL; backfill_embeddings re-attempts
+    for index, vector in zip(text_for_index, vectors, strict=True):
+        embeddings[index] = vector
+    return embeddings
 
 
 def _fields_for_payload(fields: dict[str, object]) -> dict[str, object]:
@@ -1004,10 +1059,13 @@ async def run_extraction_pipeline(
     that lands in the ``rejected`` band is **dropped before store** — it is not
     surfaced (doc 19 §6.3) — so ``result.candidates`` is the survivors only.
 
-    The embed step (I1) runs after store: each promoted signal is embedded into its
-    ``signals_signal.vector_embedding`` pgvector column for fuzzy dedupe (doc 19 §7.4)
-    + smart search (doc 14 §6.2). It is **best-effort** — an embed failure is logged
-    and the column left NULL (the signal is never lost) — so it never fails the job.
+    The embed step (I1) runs **before** store: each surviving candidate's signal text
+    is embedded off-transaction and the vector is stamped onto its new
+    ``signals_signal.vector_embedding`` row at creation, powering fuzzy dedupe
+    (doc 19 §7.4) + smart search (doc 14 §6.2). Embedding before store keeps the
+    network call off an open PgBouncer connection (doc 06 §4). It is **best-effort** —
+    a failed batch leaves the vectors NULL (the signal is never lost) and
+    ``backfill_embeddings`` re-attempts — so it never fails the job.
 
     ``ocr_backend`` is injected for tests (overrides ``OCR_BACKEND`` env var) and
     forwarded to :func:`parse_document` so tests can use :class:`~.ocr.FakeOcrBackend`
@@ -1037,8 +1095,9 @@ async def run_extraction_pipeline(
         session=None,
     )
     if not verdict_passes(verdict):
-        async with session.begin():
-            await record_relevance_decision(classifier, parsed, verdict, session=session)
+        # Record the (negative) decision; flushed, not committed — the caller commits
+        # it together with the job-status update so the run stays atomic.
+        await record_relevance_decision(classifier, parsed, verdict, session=session)
         return PipelineResult(
             raw_document_id=raw_document_id,
             relevant=verdict.relevant,
@@ -1067,34 +1126,31 @@ async def run_extraction_pipeline(
             recipe_id=parsed.recipe_id,
             rejected=rejected_count,
         )
-    # Stages 5-6: persist the relevance decision + surviving candidates in ONE
-    # transaction (no LLM here) so the write is atomic — a retry is all-or-nothing.
-    async with session.begin():
-        await record_relevance_decision(classifier, parsed, verdict, session=session)
-        _rows, signal_ids = await store_candidates(
-            session,
-            job_id=job_id,
-            raw_document_id=raw_document_id,
-            recipe_id=parsed.recipe_id,
-            candidates=survivors,
-            ocr_used=parsed.ocr_used,
-            ocr_truncated=parsed.ocr_truncated,
-        )
+    # Stage 7 (embed, I1) is pulled *ahead* of store: embed the survivors now, off
+    # any open transaction (doc 06 §4), so the store stage can stamp each vector onto
+    # its new signal row. That keeps both the fuzzy-dedupe ANN embed (doc 19 §7.4) and
+    # the smart-search vector (doc 14 §6.2) off the transaction — no in-txn embed. The
+    # batch call is best-effort: a failure leaves the vectors NULL and
+    # ``backfill_embeddings`` fills them in later (doc 19 §12.1).
+    candidate_embeddings = await _precompute_candidate_embeddings(
+        survivors, gateway=gateway, workspace_id=workspace_id
+    )
 
-    # Stage 7 (embed, I1): best-effort, and now its own short transaction (no longer
-    # chained onto the whole pipeline). It must never raise — an embed failure must
-    # not fail the job and trigger a retry that re-stores the candidates;
-    # ``backfill_embeddings`` re-attempts NULL vectors instead (doc 19 §12.1).
-    try:
-        await embed_signals(session, signal_ids, gateway=gateway, workspace_id=workspace_id)
-    except Exception:  # best-effort: an embed failure never fails the extraction
-        log.warning(
-            "extraction.embed.unexpected_failure",
-            raw_document_id=str(raw_document_id),
-            signal_ids=[str(s) for s in signal_ids],
-            exc_info=True,
-        )
-        await session.rollback()
+    # Stages 5-6: persist the relevance decision + surviving candidates (with their
+    # precomputed vectors). Flushed, not committed — the caller (the Celery task)
+    # commits once together with the job-status update, so the whole run is atomic:
+    # a retry is all-or-nothing and never half-writes or double-records (no LLM here).
+    await record_relevance_decision(classifier, parsed, verdict, session=session)
+    _rows, signal_ids = await store_candidates(
+        session,
+        job_id=job_id,
+        raw_document_id=raw_document_id,
+        recipe_id=parsed.recipe_id,
+        candidates=survivors,
+        candidate_embeddings=candidate_embeddings,
+        ocr_used=parsed.ocr_used,
+        ocr_truncated=parsed.ocr_truncated,
+    )
     return PipelineResult(
         raw_document_id=raw_document_id,
         relevant=True,

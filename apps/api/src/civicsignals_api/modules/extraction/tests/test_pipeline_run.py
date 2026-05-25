@@ -40,40 +40,20 @@ from civicsignals_api.modules.extraction.relevance import RelevanceClassifier
 from civicsignals_api.modules.ingestion.services import StoredRawDocument
 
 
-class _FakeSessionTransaction:
-    """Async context manager mirroring ``AsyncSession.begin()`` — commits on exit
-    (rolls back if the block raised), recording the call on the owning session.
-    """
-
-    def __init__(self, session: _FakeSession) -> None:
-        self._session = session
-
-    async def __aenter__(self) -> _FakeSessionTransaction:
-        return self
-
-    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
-        if exc_type is None:
-            await self._session.commit()
-        else:
-            await self._session.rollback()
-        return False
-
-
 class _FakeSession:
     """A minimal stand-in for AsyncSession recording added rows (no DB).
 
     ``run_extraction_pipeline`` calls ``add`` + ``flush`` (the relevance-decision
-    record and the candidate rows) and manages its own transaction boundaries via
-    ``commit`` / ``rollback`` / ``begin`` — under PgBouncer transaction-mode pooling
-    it must never hold a transaction across an LLM call (doc 06 §4). The transaction
-    methods are no-ops here (no real DB); ``flush`` assigns ids so the rows look
-    persisted. We do not exercise ``get`` / ``execute``.
+    record and the candidate rows) and ``commit`` to release the pooled connection
+    before each LLM stage — under PgBouncer transaction-mode pooling it must never
+    hold a transaction across a network call (doc 06 §4). The persist itself is
+    flushed (the caller commits), so ``commit`` here just counts releases; ``flush``
+    assigns ids so the rows look persisted. We do not exercise ``get`` / ``execute``.
     """
 
     def __init__(self) -> None:
         self.added: list[object] = []
         self.commits = 0
-        self.rollbacks = 0
 
     def add(self, obj: object) -> None:
         self.added.append(obj)
@@ -85,12 +65,6 @@ class _FakeSession:
 
     async def commit(self) -> None:
         self.commits += 1
-
-    async def rollback(self) -> None:
-        self.rollbacks += 1
-
-    def begin(self) -> _FakeSessionTransaction:
-        return _FakeSessionTransaction(self)
 
 
 class _FakeStorage:
