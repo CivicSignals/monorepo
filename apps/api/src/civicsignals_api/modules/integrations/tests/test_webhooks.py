@@ -600,3 +600,76 @@ def test_get_webhook_not_found_404(client: TestClient) -> None:
     resp = client.get(f"{WEBHOOKS}/{uuid.uuid4()}", headers=_hdr(token, ws["id"]))
     assert resp.status_code == 404, resp.text
     assert resp.json()["type"].endswith("/not_found")
+
+
+def test_retry_task_commits_before_each_delivery_http(
+    monkeypatch: Any,
+) -> None:
+    """A commit must precede every delivery's HTTP POST.
+
+    Under PgBouncer transaction-mode pooling an open transaction pins a pooled
+    server connection (doc 06 §4). The subscription read opens a transaction, so
+    the sweep must commit (release the connection) *before* calling the delivery
+    helper that performs the network POST — not just once at the end of the batch.
+    We instrument the (stubbed) delivery to record the commit count at the moment
+    it is invoked and assert a commit preceded every attempt, which would fail if
+    the read transaction were held idle across the HTTP call.
+    """
+    from civicsignals_api.modules.integrations import tasks as webhook_tasks
+
+    class _Delivery:
+        def __init__(self) -> None:
+            self.subscription_id = uuid.uuid4()
+
+    deliveries = [_Delivery(), _Delivery(), _Delivery()]
+
+    class _Session:
+        def __init__(self) -> None:
+            self.commits = 0
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+        async def commit(self) -> None:
+            self.commits += 1
+
+    session = _Session()
+
+    class _Http:
+        async def aclose(self) -> None:
+            pass
+
+    async def _return(value: Any) -> Any:
+        return value
+
+    # Record the session's commit count at the instant each delivery's HTTP call
+    # would run, so we can assert the read transaction was already released.
+    commits_at_delivery: list[int] = []
+
+    async def _record_delivery(_session: Any, **_kwargs: Any) -> None:
+        commits_at_delivery.append(session.commits)
+
+    monkeypatch.setattr("civicsignals_api.db.SessionLocal", lambda: session)
+    monkeypatch.setattr(
+        services, "due_failed_webhook_deliveries", lambda _s: _return(deliveries)
+    )
+    monkeypatch.setattr(
+        services, "get_webhook_subscription_unscoped", lambda _s, _id: _return(object())
+    )
+    monkeypatch.setattr(services, "execute_webhook_delivery", _record_delivery)
+    monkeypatch.setattr(services, "default_http_client", lambda: _Http())
+
+    attempted = asyncio.run(webhook_tasks._retry_failed_webhook_deliveries_async())
+
+    assert attempted == 3
+    assert len(commits_at_delivery) == 3
+    # A commit released the connection before the first HTTP call ...
+    assert commits_at_delivery[0] >= 1
+    # ... and before every subsequent one — strictly increasing (non-decreasing
+    # and all distinct), i.e. not a single batch-wide transaction held open across
+    # all the network round-trips.
+    assert commits_at_delivery == sorted(commits_at_delivery)
+    assert len(set(commits_at_delivery)) == len(commits_at_delivery)

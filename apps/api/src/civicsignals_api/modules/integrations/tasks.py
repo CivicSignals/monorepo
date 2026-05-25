@@ -100,6 +100,12 @@ async def _retry_failed_webhook_deliveries_async() -> int:
     attempted = 0
     async with SessionLocal() as session:
         due = await services.due_failed_webhook_deliveries(session)
+        # Release the read transaction before the network-bound retry loop: under
+        # PgBouncer transaction-mode pooling an open transaction pins a pooled server
+        # connection (doc 06 §4), so one left open across a delivery's HTTP POST keeps
+        # that connection checked out for the whole round-trip — and batch after batch
+        # that exhausts the pool, hanging every DB-backed request.
+        await session.commit()
         http = services.default_http_client()
         try:
             for delivery in due:
@@ -108,6 +114,12 @@ async def _retry_failed_webhook_deliveries_async() -> int:
                 )
                 if sub is None:  # pragma: no cover - cascade should prevent
                     continue
+                # Commit the subscription read BEFORE the HTTP POST so no transaction
+                # is held across the network call. execute_webhook_delivery's only DB
+                # write is the final status flush, which opens its own short
+                # transaction; the loaded rows stay usable after commit (SessionLocal
+                # sets expire_on_commit=False).
+                await session.commit()
                 await services.execute_webhook_delivery(
                     session,
                     subscription=sub,
@@ -115,8 +127,11 @@ async def _retry_failed_webhook_deliveries_async() -> int:
                     http_client=http,
                     settings=settings,
                 )
+                # Persist this delivery's result; the next iteration's read + commit
+                # then frees the connection again. Per-delivery commits also stop one
+                # failure from rolling back already-delivered rows.
+                await session.commit()
                 attempted += 1
-            await session.commit()
         finally:
             await http.aclose()
 
