@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 # ---- base: Node 22 LTS + pnpm via corepack ----
-FROM node:22-bookworm-slim AS base
+FROM node:25-bookworm-slim AS base
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
 RUN corepack enable
@@ -29,7 +29,7 @@ COPY . .
 RUN pnpm --filter @civicsignals/web build
 
 # ---- runtime: minimal image with only the standalone bundle ----
-FROM node:22-bookworm-slim AS runner
+FROM node:25-bookworm-slim AS runner
 
 # Non-root user matching the Next.js docker convention (uid 1001)
 RUN groupadd --gid 1001 nodejs && \
